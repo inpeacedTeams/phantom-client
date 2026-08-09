@@ -34,8 +34,12 @@
 //   - the module supplies each delay through a callback, so all
 //     the pattern logic stays where it belongs
 //
-// The click itself goes out through SendInput, which the game
-// reads as an ordinary hardware mouse event.
+// SHARED FLOOR
+// More than one module wants to click: the autoclicker on its own
+// rhythm, hit-select on a specific tick. Left uncoordinated they
+// stack and produce sub-20ms gaps, which no hand can make and every
+// anticheat looks for. Every click in the client goes through here
+// and is refused if it lands too soon after the last one.
 // =================================================================
 
 class ClickScheduler {
@@ -55,7 +59,13 @@ private:
     inline static HWND s_window = nullptr;
     inline static std::atomic<long long> s_lastGap{ 0 };
 
-    static void SendClick(bool right) {
+    // Shared across every click source in the client
+    inline static std::mutex s_clickMutex;
+    inline static std::chrono::steady_clock::time_point s_lastClick;
+    inline static std::atomic<int> s_floorMs{ 22 };
+    inline static std::atomic<long long> s_rejected{ 0 };
+
+    static void RawClick(bool right) {
         INPUT in[2] = {};
         in[0].type = INPUT_MOUSE;
         in[1].type = INPUT_MOUSE;
@@ -117,16 +127,35 @@ private:
             if (!s_running.load(std::memory_order_relaxed)) break;
             if (!s_active.load(std::memory_order_relaxed))  continue;
 
-            SendClick(s_rightButton.load(std::memory_order_relaxed));
-            s_lastGap.store(delay, std::memory_order_relaxed);
+            if (Emit(s_rightButton.load(std::memory_order_relaxed)))
+                s_lastGap.store(delay, std::memory_order_relaxed);
         }
 
         timeEndPeriod(1);
     }
 
+    // The single place a click leaves the client. Returns false when
+    // the floor rejected it.
+    static bool Emit(bool right) {
+        auto now = std::chrono::steady_clock::now();
+        {
+            std::lock_guard<std::mutex> lock(s_clickMutex);
+            auto since = std::chrono::duration_cast<std::chrono::milliseconds>(
+                now - s_lastClick).count();
+            if (since < s_floorMs.load(std::memory_order_relaxed)) {
+                s_rejected.fetch_add(1, std::memory_order_relaxed);
+                return false;
+            }
+            s_lastClick = now;
+        }
+        RawClick(right);
+        return true;
+    }
+
 public:
     static void Start() {
         if (s_running.exchange(true)) return;
+        s_lastClick = std::chrono::steady_clock::now();
         s_thread = std::thread(Loop);
     }
 
@@ -153,8 +182,20 @@ public:
         s_provider = nullptr;
     }
 
+    // One-off click from a module that is not the autoclicker.
+    // Goes through the same floor, so it can never stack into an
+    // impossible interval.
+    static bool RequestClick(bool right = false) {
+        if (s_window && GetForegroundWindow() != s_window) return false;
+        return Emit(right);
+    }
+
     static void SetActive(bool on)     { s_active.store(on); }
     static bool IsActive()             { return s_active.load(); }
     static void SetRightButton(bool r) { s_rightButton.store(r); }
     static long long LastGap()         { return s_lastGap.load(); }
+
+    static void SetFloor(int ms)       { s_floorMs.store(ms < 1 ? 1 : ms); }
+    static int  GetFloor()             { return s_floorMs.load(); }
+    static long long Rejected()        { return s_rejected.load(); }
 };
