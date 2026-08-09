@@ -14,10 +14,13 @@
 // =================================================================
 // Attacks entities in range automatically.
 //
-// This is the loudest module in the client. It combines rotation,
-// range and timing signals, which is exactly the combination every
-// modern anticheat is built to catch. Keep it off on Polar, AGC
-// and Grim. It exists for weak or unprotected servers.
+// This is the loudest module here. It combines rotation, range and
+// timing signals, which is exactly what every modern anticheat is
+// built to catch. Leave it off on Polar, AGC and Grim. It exists
+// for unprotected servers.
+//
+// EntityList only ever returns players, so there is no mob filter:
+// the target set is players by construction.
 // =================================================================
 
 class KillAura : public Module {
@@ -25,20 +28,18 @@ private:
     float m_range        = 3.4f;
     int   m_minCPS       = 10;
     int   m_maxCPS       = 14;
-    bool  m_playersOnly  = true;
     bool  m_rotate       = true;
     bool  m_multiTarget  = false;
     int   m_maxTargets   = 3;
-    bool  m_requireClick = false;   // Only swing while LMB is held
-    int   m_targetMode   = 0;       // 0 = closest, 1 = lowest HP
+    bool  m_requireClick = false;
+    int   m_targetMode   = 0;   // 0 closest, 1 lowest HP
 
     std::chrono::steady_clock::time_point m_lastAttack;
     long long m_nextDelayMs = 100;
     std::mt19937 m_rng{ std::random_device{}() };
 
-    // JNI
-    jmethodID m_attackEntity = nullptr;  // PlayerControllerMP.attackEntity(EntityPlayer, Entity)
-    jmethodID m_swingItem    = nullptr;  // EntityLivingBase.swingItem()
+    jmethodID m_attackEntity = nullptr;  // PlayerControllerMP.attackEntity
+    jmethodID m_swingItem    = nullptr;  // EntityLivingBase.swingItem
     bool m_resolved = false;
 
     void ResolveJNI(JNIEnv* env) {
@@ -58,15 +59,16 @@ private:
         }
 
         m_resolved = true;
-        printf("[KillAura] attack=%p swing=%p\n", (void*)m_attackEntity, (void*)m_swingItem);
+        printf("[KillAura] attack=%p swing=%p\n",
+            (void*)m_attackEntity, (void*)m_swingItem);
     }
 
     long long RollDelay() {
-        std::uniform_int_distribution<int> cps(m_minCPS, m_maxCPS);
-        int c = cps(m_rng);
-        if (c < 1) c = 1;
+        int lo = m_minCPS < 1 ? 1 : m_minCPS;
+        int hi = m_maxCPS < lo ? lo : m_maxCPS;
+        std::uniform_int_distribution<int> cps(lo, hi);
         std::uniform_int_distribution<int> jitter(-18, 18);
-        long long d = (1000 / c) + jitter(m_rng);
+        long long d = (1000 / cps(m_rng)) + jitter(m_rng);
         return d < 30 ? 30 : d;
     }
 
@@ -86,9 +88,19 @@ private:
     }
 
 public:
-    KillAura() : Module("Kill Aura", "Auto-attack entities in range",
-                        ModuleCategory::COMBAT, 'K') {
+    KillAura() : Module("Kill Aura", "Auto-attack players in range",
+                        ModuleCategory::COMBAT, 'K')
+    {
         m_lastAttack = std::chrono::steady_clock::now();
+
+        Bind("Range", &m_range);
+        Bind("Min CPS", &m_minCPS);
+        Bind("Max CPS", &m_maxCPS);
+        Bind("Rotate", &m_rotate);
+        Bind("Multi Target", &m_multiTarget);
+        Bind("Max Targets", &m_maxTargets);
+        Bind("Only While Clicking", &m_requireClick);
+        Bind("Target Mode", &m_targetMode);
     }
 
     void OnTick(JNIEnv* env) override {
@@ -110,11 +122,10 @@ public:
         if (ents.empty()) return;
 
         int hit = 0;
-        int limit = m_multiTarget ? m_maxTargets : 1;
 
         if (m_multiTarget) {
             for (auto& e : ents) {
-                if (hit >= limit) break;
+                if (hit >= m_maxTargets) break;
                 if (e.distanceToPlayer > m_range) continue;
                 Attack(env, player, e.ref);
                 hit++;
@@ -155,7 +166,6 @@ public:
         ImGui::Combo("Target", &m_targetMode, modes, 2);
 
         ImGui::Checkbox("Rotate To Target", &m_rotate);
-        ImGui::Checkbox("Players Only", &m_playersOnly);
         ImGui::Checkbox("Only While Clicking", &m_requireClick);
         ImGui::Checkbox("Multi Target", &m_multiTarget);
         if (m_multiTarget) ImGui::SliderInt("Max Targets", &m_maxTargets, 2, 8);
