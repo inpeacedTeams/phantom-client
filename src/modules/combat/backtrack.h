@@ -15,24 +15,30 @@
 // =================================================================
 // Backtrack
 // =================================================================
-// Makes enemies render and take hits at a position they occupied a
-// short while ago. You aim where they WERE; the server's lag
-// compensation still counts it. Your reach value is never touched.
+// Makes enemies sit at a position they occupied a short while ago.
+// You aim where they WERE; the server's lag compensation still
+// counts the hit. Your reach value is never touched.
 //
-// HOW THIS VERSION WORKS
+// HOW IT WORKS
+// Minecraft raytraces attacks against the entity's posX/Y/Z fields.
+// Write an older position into those fields and the swing lands
+// there. No packet hook required.
 //
-// The previous design waited on a Netty packet hook that was never
-// written, so the module did nothing. This one needs no hook.
+// ORDER OF OPERATIONS (this is the whole trick)
+//   1. RestoreBeforeScan runs first, before anything reads entities.
+//      Every rewound entity goes back to its true position.
+//   2. EntityList scans, so every other module and the ESP see the
+//      real world rather than our fiction.
+//   3. OnTick records the true positions and rewinds again.
 //
-// Every tick we record each nearby player's real position, then
-// write an older recorded position back into the entity. Minecraft
-// raytraces attacks against whatever is in those fields, so the
-// swing lands on the rewound position. The next position packet
-// overwrites our value, and we re-apply on the following tick.
+// An earlier version skipped step 1 and tried to guess whether a
+// position packet had landed by comparing the live field to the
+// cached one. Both came from the same scan, so the comparison was
+// always equal and the true position never updated: targets froze
+// in place. Restoring first removes the guesswork entirely.
 //
-// prevPos is rewritten alongside pos, otherwise the renderer
-// interpolates between the old and new spots and the target smears
-// across the screen.
+// Targets are held as GLOBAL refs. Local refs die with the tick's
+// frame, and the restore has to run before the new frame's scan.
 //
 // WHY NAIVE BACKTRACK GETS CAUGHT
 //   1. A constant delay gives a hit-distance distribution with zero
@@ -41,14 +47,6 @@
 //      while holding left click.
 //   3. Delay that survives a lagback, compounding the desync.
 //   4. Hits landing outside the server's compensation window.
-//
-// WHAT THIS DOES ABOUT IT
-//   - per-target random delay inside a band, never a constant
-//   - pulse mode: rewind in short bursts, run clean between them
-//   - range window: only active where backtrack actually helps
-//   - ping-aware cap so ping + delay stays inside the window
-//   - restores true positions on damage, on flag, and on disable
-//   - ramp-in so the delay grows over several ticks
 // =================================================================
 
 class Backtrack : public Module {
@@ -59,11 +57,12 @@ private:
     };
 
     struct Target {
+        jobject ref = nullptr;        // global, owned by us
         std::deque<Sample> history;
         bool   rewound = false;
         double trueX = 0, trueY = 0, trueZ = 0;
         int    delayMs = 0;
-        int    lastSeen = 0;
+        unsigned long long lastSeen = 0;
     };
 
     // ---- Settings ----
@@ -99,9 +98,9 @@ private:
     int  m_pauseCounter = 0;
     int  m_rampCounter  = 0;
     int  m_lastHurtTime = 0;
-    int  m_tickCounter  = 0;
     int  m_activeCount  = 0;
     int  m_measuredPing = 30;
+    unsigned long long m_tick = 0;
 
     // ---- JNI ----
     jmethodID m_getEntityId = nullptr;
@@ -131,8 +130,6 @@ private:
             m_fPrevZ = JvmtiUtil::FindField(env, e, { "field_70166_s", "prevPosZ" });
         }
         m_resolved = true;
-        printf("[Backtrack] id=%p posX=%p prevX=%p\n",
-            (void*)m_getEntityId, (void*)m_fPosX, (void*)m_fPrevX);
     }
 
     bool Ready() const {
@@ -150,26 +147,17 @@ private:
 
     int RollDelay() {
         int base = Rand(m_delayMinMs, m_delayMaxMs);
-
         if (m_perTargetJitter > 0.f) {
             float r = base * (m_perTargetJitter / 100.f);
             std::uniform_real_distribution<float> d(-r, r);
             base += (int)d(m_rng);
         }
-        if (m_rampTicks > 0 && m_rampCounter < m_rampTicks) {
+        if (m_rampTicks > 0 && m_rampCounter < m_rampTicks)
             base = (int)(base * ((float)m_rampCounter / (float)m_rampTicks));
-        }
 
         int cap = EffectiveCap();
         if (base > cap) base = cap;
         return base < 0 ? 0 : base;
-    }
-
-    int EntityId(JNIEnv* env, jobject ent) {
-        if (!m_getEntityId) return -1;
-        jint id = env->CallIntMethod(ent, m_getEntityId);
-        if (env->ExceptionCheck()) { env->ExceptionClear(); return -1; }
-        return (int)id;
     }
 
     void WritePos(JNIEnv* env, jobject ent, double x, double y, double z) {
@@ -183,19 +171,8 @@ private:
         if (m_fPrevZ) env->SetDoubleField(ent, m_fPrevZ, z);
     }
 
-    // Put every rewound entity back where the server thinks it is
-    void RestoreAll(JNIEnv* env) {
-        if (!Ready()) { m_targets.clear(); return; }
-
-        auto ents = EntityList::GetPlayers(env, 64.0f);
-        for (auto& e : ents) {
-            int id = EntityId(env, e.ref);
-            auto it = m_targets.find(id);
-            if (it == m_targets.end() || !it->second.rewound) continue;
-            WritePos(env, e.ref, it->second.trueX, it->second.trueY, it->second.trueZ);
-            it->second.rewound = false;
-        }
-        m_activeCount = 0;
+    void DropTarget(JNIEnv* env, Target& t) {
+        if (t.ref) { env->DeleteGlobalRef(t.ref); t.ref = nullptr; }
     }
 
 public:
@@ -223,8 +200,28 @@ public:
         Bind("Per Target Jitter", &m_perTargetJitter);
     }
 
+    // -------------------------------------------------------------
+    // Step 1. ModuleManager calls this at the very top of the tick,
+    // before EntityList scans. Puts every entity back where the
+    // server says it is, so nothing else in the client ever sees a
+    // rewound position.
+    //
+    // Safe to call when disabled: that is exactly how a freshly
+    // toggled-off module cleans up.
+    // -------------------------------------------------------------
+    void RestoreBeforeScan(JNIEnv* env) {
+        if (!Ready() || m_targets.empty()) return;
+
+        for (auto& kv : m_targets) {
+            Target& t = kv.second;
+            if (!t.rewound || !t.ref) continue;
+            WritePos(env, t.ref, t.trueX, t.trueY, t.trueZ);
+            t.rewound = false;
+        }
+        m_activeCount = 0;
+    }
+
     void OnEnable(JNIEnv*) override {
-        m_targets.clear();
         m_rampCounter  = 0;
         m_pulseCounter = 0;
         m_pulseTarget  = Rand(m_pulseOnMin, m_pulseOnMax);
@@ -234,13 +231,14 @@ public:
     }
 
     void OnDisable(JNIEnv* env) override {
-        RestoreAll(env);
+        RestoreBeforeScan(env);
+        for (auto& kv : m_targets) DropTarget(env, kv.second);
         m_targets.clear();
     }
 
     // Call from the S08 position-reset handler once one exists
     void OnServerCorrection(JNIEnv* env) {
-        RestoreAll(env);
+        RestoreBeforeScan(env);
         m_pauseCounter = m_pauseAfterFlagTicks;
         m_rewinding = false;
     }
@@ -254,24 +252,23 @@ public:
 
         jobject player = Minecraft::GetPlayer(env);
         if (!player) return;
-        if (Minecraft::IsInGui(env)) { RestoreAll(env); return; }
+        if (Minecraft::IsInGui(env)) return;   // already restored above
 
-        m_tickCounter++;
+        m_tick++;
         if (m_rampCounter < m_rampTicks) m_rampCounter++;
 
         // ---- Frozen after a server correction ----
         if (m_pauseCounter > 0) {
             if (--m_pauseCounter == 0) m_rampCounter = 0;
-            RestoreAll(env);
             return;
         }
 
-        // ---- Taking a hit means the desync has to go, now ----
+        // ---- Taking a hit means the desync has to go now ----
         if (m_restoreOnDamage) {
             int hurt = Minecraft::GetHurtTime(env, player);
             bool justHit = (hurt > 0 && m_lastHurtTime == 0);
             m_lastHurtTime = hurt;
-            if (justHit) { RestoreAll(env); return; }
+            if (justHit) return;
         }
 
         // ---- Pulse cycling ----
@@ -281,8 +278,7 @@ public:
                 m_pulseCounter = 0;
                 m_pulseTarget = m_rewinding ? Rand(m_pulseOnMin, m_pulseOnMax)
                                             : Rand(m_pulseOffMin, m_pulseOffMax);
-                if (!m_rewinding) { RestoreAll(env); return; }
-                m_rampCounter = 0;
+                if (m_rewinding) m_rampCounter = 0;
             }
         } else {
             m_rewinding = true;
@@ -291,36 +287,31 @@ public:
         bool clicking = (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0;
         bool active = m_rewinding && (!m_onlyWhileClicking || clicking);
 
-        if (!active) { RestoreAll(env); return; }
-
         auto now = std::chrono::steady_clock::now();
+
+        // Positions read here are server truth: RestoreBeforeScan ran
+        // ahead of the scan that filled this list.
         auto ents = EntityList::GetPlayers(env, m_rangeMax + 8.0f);
-        m_activeCount = 0;
+
+        double pX = Minecraft::GetPosX(env, player);
+        double pY = Minecraft::GetPosY(env, player);
+        double pZ = Minecraft::GetPosZ(env, player);
 
         for (auto& e : ents) {
-            int id = EntityId(env, e.ref);
-            if (id < 0) continue;
+            jint id = env->CallIntMethod(e.ref, m_getEntityId);
+            if (env->ExceptionCheck()) { env->ExceptionClear(); continue; }
 
-            Target& t = m_targets[id];
-            t.lastSeen = m_tickCounter;
+            Target& t = m_targets[(int)id];
+            t.lastSeen = m_tick;
 
-            // The live fields hold a rewound value from last tick
-            // unless a packet has landed since, so read the snapshot
-            // EntityList took rather than the fields themselves.
-            double curX = e.posX, curY = e.posY, curZ = e.posZ;
-            if (t.rewound) {
-                // Nothing new arrived: our own write is still there
-                double lx = env->GetDoubleField(e.ref, m_fPosX);
-                double lz = env->GetDoubleField(e.ref, m_fPosZ);
-                bool untouched =
-                    std::fabs(lx - curX) < 1e-6 && std::fabs(lz - curZ) < 1e-6;
-                if (untouched) { curX = t.trueX; curY = t.trueY; curZ = t.trueZ; }
-            }
+            // Promote to a global ref so the restore pass can reach
+            // this entity next tick, after the local frame is gone.
+            if (!t.ref) t.ref = env->NewGlobalRef(e.ref);
 
-            t.trueX = curX; t.trueY = curY; t.trueZ = curZ;
-            t.history.push_back({ curX, curY, curZ, now });
+            t.trueX = e.posX; t.trueY = e.posY; t.trueZ = e.posZ;
+            t.history.push_back({ e.posX, e.posY, e.posZ, now });
 
-            // Keep a second of history, no more
+            // A second of history is plenty and bounds the memory
             while (t.history.size() > 40) t.history.pop_front();
             while (!t.history.empty()) {
                 auto age = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -329,23 +320,13 @@ public:
                 t.history.pop_front();
             }
 
-            // Distance is measured against the real position, not
-            // the rewound one, or the window would drift.
-            double dx = curX - Minecraft::GetPosX(env, player);
-            double dy = curY - Minecraft::GetPosY(env, player);
-            double dz = curZ - Minecraft::GetPosZ(env, player);
+            if (!active) continue;
+
+            double dx = e.posX - pX, dy = e.posY - pY, dz = e.posZ - pZ;
             double dist = std::sqrt(dx*dx + dy*dy + dz*dz);
 
-            bool inWindow = !m_useRangeWindow
-                         || (dist >= m_rangeMin && dist <= m_rangeMax);
-
-            if (!inWindow) {
-                if (t.rewound) {
-                    WritePos(env, e.ref, t.trueX, t.trueY, t.trueZ);
-                    t.rewound = false;
-                }
+            if (m_useRangeWindow && (dist < m_rangeMin || dist > m_rangeMax))
                 continue;
-            }
 
             if (m_mode == 2) {
                 // Adaptive: further targets get more of the budget
@@ -354,14 +335,14 @@ public:
                 if (f < 0.f) f = 0.f;
                 if (f > 1.f) f = 1.f;
                 t.delayMs = m_delayMinMs + (int)((EffectiveCap() - m_delayMinMs) * f);
-            } else if (t.delayMs == 0 || (m_tickCounter % 10) == 0) {
-                // Re-roll occasionally so the delay is not a constant
+            } else if (t.delayMs == 0 || (m_tick % 10) == 0) {
+                // Re-roll now and then so the delay is not a constant
                 t.delayMs = RollDelay();
             }
 
             if (t.delayMs <= 0) continue;
 
-            // Pick the newest sample at least delayMs old
+            // Newest sample that is at least delayMs old
             const Sample* chosen = nullptr;
             for (auto it = t.history.rbegin(); it != t.history.rend(); ++it) {
                 auto age = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -375,10 +356,14 @@ public:
             m_activeCount++;
         }
 
-        // Forget players who left
+        // Forget players who left, releasing their global refs
         for (auto it = m_targets.begin(); it != m_targets.end(); ) {
-            if (m_tickCounter - it->second.lastSeen > 40) it = m_targets.erase(it);
-            else ++it;
+            if (m_tick - it->second.lastSeen > 40) {
+                DropTarget(env, it->second);
+                it = m_targets.erase(it);
+            } else {
+                ++it;
+            }
         }
     }
 
@@ -441,5 +426,9 @@ public:
         ImGui::TextDisabled("Rewound: %d | tracked: %d | %s",
             m_activeCount, (int)m_targets.size(),
             m_rewinding ? "active" : "clean");
+        ImGui::TextWrapped(
+            "Rewinds only between your ticks. On a low-ping duel server "
+            "there is little natural jitter to hide inside, so keep the "
+            "band short.");
     }
 };
