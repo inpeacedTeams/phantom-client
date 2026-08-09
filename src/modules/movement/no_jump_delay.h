@@ -2,50 +2,57 @@
 #include "../module.h"
 #include "../../mc/minecraft.h"
 #include "../../jni/class_resolver.h"
+#include "../../jni/jvmti_util.h"
 #include <imgui.h>
 
 // =================================================================
 // No Jump Delay
 // =================================================================
-// Removes the 10-tick (0.5s) cooldown between jumps.
-// In vanilla, after jumping you must wait 10 ticks before
-// jumping again. This module sets jumpTicks to 0 every tick.
+// Vanilla forces a 10-tick wait between jumps via
+// EntityLivingBase.jumpTicks. Zeroing it every tick removes that.
 //
-// Useful for: speed bridging, combo PvP, general movement.
-// Works by setting EntityLivingBase.jumpTicks = 0 via JNI.
+// Worth knowing: jump frequency is one of the cheapest things for a
+// prediction anticheat to check, because the vanilla minimum is a
+// hard constant. This is safe on unprotected servers and nowhere
+// else.
 // =================================================================
 
 class NoJumpDelay : public Module {
 private:
     jfieldID m_fJumpTicks = nullptr;
-    bool m_jniResolved = false;
+    bool m_resolved = false;
 
-    void ResolveJNI(JNIEnv* env) {
-        if (m_jniResolved) return;
+    void Resolve(JNIEnv* env) {
+        if (m_resolved) return;
         if (ClassResolver::entityLivingBase) {
-            m_fJumpTicks = env->GetFieldID(ClassResolver::entityLivingBase, "field_70773_bE", "I");
-            if (env->ExceptionCheck()) {
-                env->ExceptionClear();
-                m_fJumpTicks = env->GetFieldID(ClassResolver::entityLivingBase, "jumpTicks", "I");
-                if (env->ExceptionCheck()) env->ExceptionClear();
-            }
+            m_fJumpTicks = JvmtiUtil::FindField(env, ClassResolver::entityLivingBase,
+                { "field_70773_bE", "jumpTicks" });
         }
-        m_jniResolved = true;
+        m_resolved = true;
     }
 
 public:
-    NoJumpDelay() : Module("No Jump Delay", "Remove cooldown between jumps",
+    NoJumpDelay() : Module("No Jump Delay", "Remove the cooldown between jumps",
                            ModuleCategory::MOVEMENT, 0) {}
 
     void OnTick(JNIEnv* env) override {
-        ResolveJNI(env);
+        Resolve(env);
+        if (!m_fJumpTicks) return;
+
         jobject player = Minecraft::GetPlayer(env);
-        if (!player || !m_fJumpTicks) return;
+        if (!player) return;
+        if (Minecraft::IsInGui(env)) return;
 
         env->SetIntField(player, m_fJumpTicks, 0);
     }
 
     void RenderSettings() override {
         ImGui::TextWrapped("Removes the 10-tick delay between jumps.");
+        ImGui::TextColored(ImVec4(1.f, 0.5f, 0.35f, 1.f),
+            "Jump frequency is trivially checked. Unprotected servers only.");
+        if (!m_fJumpTicks) {
+            ImGui::TextColored(ImVec4(1.f, 0.8f, 0.3f, 1.f),
+                "jumpTicks unresolved: module inactive");
+        }
     }
 };
