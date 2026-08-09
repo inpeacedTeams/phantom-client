@@ -6,6 +6,7 @@
 #include "jni/class_resolver.h"
 #include "hooks/gl_hook.h"
 #include "mc/minecraft.h"
+#include "mc/entity_list.h"
 #include "modules/module_manager.h"
 
 FILE* g_console = nullptr;
@@ -35,11 +36,18 @@ void MainThread(HMODULE hModule) {
     Minecraft::Init(JNIHelper::GetEnv());
     printf("[Phantom] Minecraft instance acquired\n");
 
-    // 4. Register modules
+    // 4. Init EntityList (may fail if not in-game yet, will retry later)
+    if (EntityList::Init(JNIHelper::GetEnv())) {
+        printf("[Phantom] EntityList initialized\n");
+    } else {
+        printf("[Phantom] EntityList deferred (not in-game yet)\n");
+    }
+
+    // 5. Register modules
     ModuleManager::Init();
     printf("[Phantom] %d modules registered\n", ModuleManager::GetModuleCount());
 
-    // 5. Hook wglSwapBuffers for ImGui overlay
+    // 6. Hook wglSwapBuffers for ImGui overlay
     if (!GLHook::Install()) {
         printf("[Phantom] FATAL: Could not hook wglSwapBuffers\n");
         FreeLibraryAndExitThread(hModule, 1);
@@ -52,7 +60,7 @@ void MainThread(HMODULE hModule) {
     while (!GetAsyncKeyState(VK_DELETE)) {
         // Tick enabled modules
         ModuleManager::Tick(JNIHelper::GetEnv());
-        Sleep(1); // ~1000 tps internal loop
+        Sleep(1);
     }
 
     // Cleanup
