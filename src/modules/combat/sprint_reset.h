@@ -1,6 +1,7 @@
 #pragma once
 #include "../module.h"
 #include "../../mc/minecraft.h"
+#include "../../mc/keybinds.h"
 #include "../../jni/class_resolver.h"
 #include "../../jni/jvmti_util.h"
 #include <imgui.h>
@@ -12,18 +13,20 @@
 // =================================================================
 // Every hit while sprinting deals extra knockback, but the server
 // cancels your sprint after the first one (MC-69459). The client
-// still thinks it is sprinting, so every hit after that lands with
-// reduced knockback without you noticing.
+// still believes it is sprinting, so every hit after that lands
+// with reduced knockback and you never see why.
 //
-// Sprint resetting means dropping and re-applying sprint so each
-// hit counts as a fresh sprint hit.
+// Sprint resetting drops and re-applies sprint so each hit counts
+// as a fresh sprint hit.
 //
 // IMPLEMENTATION
-// We toggle real KeyBindings rather than writing moveForward or
-// calling setSprinting directly. Our thread is not synchronised
-// with the game tick, so writing movement fields is a race we lose
-// half the time. Releasing keyBindForward is exactly what a human
-// w-tap does, and Minecraft picks it up during its own input pass.
+// Everything goes through KeyBinds. Two reasons:
+//
+//   1. setSprinting() alone does not hold. onLivingUpdate recomputes
+//      the sprint state from the keys every tick and overwrites us.
+//   2. KeyBinds tracks which keys we forced, so ReleaseAll() can
+//      free them on disconnect or eject. A key set behind its back
+//      would stay stuck down with no way for the player to clear it.
 //
 // METHODS
 //   0 W-Tap     release forward for a tick
@@ -31,7 +34,7 @@
 //   2 Blockhit  hold use-item, which also resets sprint
 //   3 Sneak Tap tap sneak, no speed loss
 //   4 Ctrl Spam re-press the sprint key
-//   5 Packet    setSprinting(false) then (true) in one tick
+//   5 Packet    setSprinting false then true inside one tick
 // =================================================================
 
 class SprintReset : public Module {
@@ -44,12 +47,12 @@ private:
     int   m_hitDelay        = 0;
 
     // State
-    bool m_isResetting     = false;
+    bool m_resetting       = false;
     int  m_resetCountdown  = 0;
     int  m_delayCountdown  = 0;
     bool m_waitingForDelay = false;
     bool m_lastLMB         = false;
-    bool m_keyWasSet       = false;
+    int  m_activeMethod    = 0;   // method used to start the current reset
 
     jmethodID m_setSprinting = nullptr;
     bool m_resolved = false;
@@ -76,80 +79,90 @@ private:
         m_resolved = true;
     }
 
+    void SetSprintFlag(JNIEnv* env, jobject player, bool on) {
+        if (!m_setSprinting || !player) return;
+        env->CallVoidMethod(player, m_setSprinting, (jboolean)on);
+        if (env->ExceptionCheck()) env->ExceptionClear();
+    }
+
+    // Undo whatever the reset did. Uses m_activeMethod, not m_method,
+    // so changing the method mid-reset cannot strand a key.
     void EndReset(JNIEnv* env, jobject player) {
-        switch (m_method) {
-            case 0: Minecraft::SetKeyPressed(env, GameKey::Forward, true);  break;
-            case 1: Minecraft::SetKeyPressed(env, GameKey::Back,    false); break;
-            case 2: Minecraft::SetKeyPressed(env, GameKey::UseItem, false); break;
-            case 3: Minecraft::SetKeyPressed(env, GameKey::Sneak,   false); break;
-            case 4: Minecraft::SetKeyPressed(env, GameKey::Sprint,  true);  break;
+        switch (m_activeMethod) {
+            case 0: KeyBinds::ReleaseForward(env); break;
+            case 1: KeyBinds::ReleaseBack(env);    break;
+            case 2: KeyBinds::ReleaseUseItem(env); break;
+            case 3: KeyBinds::ReleaseSneak(env);   break;
+            case 4: KeyBinds::ReleaseSprint(env);  break;
             default: break;
         }
 
-        // Re-apply sprint for the methods that dropped it outright
-        if (m_setSprinting && player &&
-            (m_method == 0 || m_method == 1 || m_method == 4)) {
-            env->CallVoidMethod(player, m_setSprinting, (jboolean)true);
-            if (env->ExceptionCheck()) env->ExceptionClear();
-        }
+        if (m_activeMethod == 0 || m_activeMethod == 1 || m_activeMethod == 4)
+            SetSprintFlag(env, player, true);
 
-        m_isResetting = false;
-        m_keyWasSet   = false;
+        m_resetting = false;
     }
 
     void BeginReset(JNIEnv* env, jobject player) {
+        m_activeMethod = m_method;
+
         switch (m_method) {
-            case 0: Minecraft::SetKeyPressed(env, GameKey::Forward, false); break;
-            case 1: Minecraft::SetKeyPressed(env, GameKey::Back,    true);  break;
-            case 2: Minecraft::SetKeyPressed(env, GameKey::UseItem, true);  break;
-            case 3: Minecraft::SetKeyPressed(env, GameKey::Sneak,   true);  break;
-            case 4: Minecraft::SetKeyPressed(env, GameKey::Sprint,  false); break;
+            case 0: KeyBinds::SetForward(env, false); break;
+            case 1: KeyBinds::SetBack(env, true);     break;
+            case 2: KeyBinds::SetUseItem(env, true);  break;
+            case 3: KeyBinds::SetSneak(env, true);    break;
+            case 4: KeyBinds::SetSprint(env, false);  break;
             case 5:
-                if (m_setSprinting) {
-                    env->CallVoidMethod(player, m_setSprinting, (jboolean)false);
-                    if (env->ExceptionCheck()) env->ExceptionClear();
-                    env->CallVoidMethod(player, m_setSprinting, (jboolean)true);
-                    if (env->ExceptionCheck()) env->ExceptionClear();
-                }
+                SetSprintFlag(env, player, false);
+                SetSprintFlag(env, player, true);
                 return;   // instant, nothing to unwind
         }
 
-        if (m_setSprinting && (m_method == 0 || m_method == 1 || m_method == 4)) {
-            env->CallVoidMethod(player, m_setSprinting, (jboolean)false);
-            if (env->ExceptionCheck()) env->ExceptionClear();
-        }
+        if (m_method == 0 || m_method == 1 || m_method == 4)
+            SetSprintFlag(env, player, false);
 
-        m_isResetting    = true;
-        m_keyWasSet      = true;
+        m_resetting      = true;
         m_resetCountdown = RandTicks();
     }
 
 public:
     SprintReset()
         : Module("Sprint Reset", "Reset sprint on every hit for full knockback",
-                 ModuleCategory::COMBAT, 0) {}
+                 ModuleCategory::COMBAT, 0)
+    {
+        Bind("Method", &m_method);
+        Bind("Chance", &m_chance);
+        Bind("Reset Ticks Min", &m_resetTicksMin);
+        Bind("Reset Ticks Max", &m_resetTicksMax);
+        Bind("Only While Moving", &m_onlyWhileMoving);
+        Bind("Hit Delay", &m_hitDelay);
+    }
 
     void OnTick(JNIEnv* env) override {
         Resolve(env);
 
-        if (!Minecraft::HasKeyBinds() && m_method != 5) return;
+        // Packet mode is the only one that does not need keybinds
+        if (!KeyBinds::Init(env) && m_method != 5) return;
 
         jobject player = Minecraft::GetPlayer(env);
         if (!player) return;
 
         if (Minecraft::IsInGui(env)) {
-            if (m_isResetting) EndReset(env, player);
+            if (m_resetting) EndReset(env, player);
             return;
         }
 
-        // Finish an in-flight reset first
-        if (m_isResetting) {
+        // Always finish an in-flight reset before starting another
+        if (m_resetting) {
             if (m_resetCountdown <= 0) EndReset(env, player);
             else m_resetCountdown--;
             return;
         }
 
-        if (m_onlyWhileMoving && !(GetAsyncKeyState('W') & 0x8000)) return;
+        // Read the game's own forward state, not the physical W key.
+        // The player may have rebound movement, and other modules may
+        // be driving forward themselves.
+        if (m_onlyWhileMoving && !KeyBinds::GetForward(env)) return;
 
         if (m_waitingForDelay) {
             if (m_delayCountdown > 0) { m_delayCountdown--; return; }
@@ -173,11 +186,13 @@ public:
     }
 
     void OnDisable(JNIEnv* env) override {
-        if (!m_keyWasSet && !m_isResetting) return;
-        jobject player = Minecraft::GetPlayer(env);
-        EndReset(env, player);
+        if (m_resetting) {
+            jobject player = Minecraft::GetPlayer(env);
+            EndReset(env, player);
+        }
         m_waitingForDelay = false;
         m_resetCountdown  = 0;
+        m_delayCountdown  = 0;
     }
 
     void RenderSettings() override {
@@ -209,9 +224,9 @@ public:
             case 5: ImGui::TextWrapped("Toggles sprint within a single tick. Fastest, but detectable."); break;
         }
 
-        if (!Minecraft::HasKeyBinds()) {
+        if (!KeyBinds::HasMovement()) {
             ImGui::TextColored(ImVec4(1.f, 0.8f, 0.3f, 1.f),
-                "KeyBindings unresolved: only Packet mode works");
+                "Keybinds unresolved: only Packet mode works");
         }
     }
 };
