@@ -1,6 +1,7 @@
 #pragma once
 #include "../module.h"
 #include "../../mc/minecraft.h"
+#include "../../mc/keybinds.h"
 #include "../../mc/entity_list.h"
 #include "../../jni/class_resolver.h"
 #include "../../jni/jvmti_util.h"
@@ -13,18 +14,17 @@
 // Auto Blockhit
 // =================================================================
 // Blocking with a sword in 1.8 halves incoming damage and resets
-// sprint. Blocking a lot is not itself suspicious: real blockhitters
-// keep RMB down for most of a fight. What gets flagged is HOW the
-// block is produced.
+// sprint. Blocking a lot is not suspicious on its own: real
+// blockhitters keep right click down for most of a fight. What
+// gets flagged is HOW the block is produced.
 //
-//   BAD  -> block/unblock pairs with identical tick gaps
-//   BAD  -> blocking while not holding a sword
-//   BAD  -> toggling faster than the item-use cooldown allows
-//   GOOD -> RMB held with human micro-releases
+//   BAD  block/unblock pairs with identical tick gaps
+//   BAD  blocking without a sword in hand
+//   BAD  toggling faster than the item-use cooldown allows
+//   GOOD right click held, with human micro-releases
 //
-// We drive GameSettings.keyBindUseItem.pressed, so Minecraft emits
-// exactly the packet sequence a real right-click hold produces. No
-// synthetic packets, no impossible timings.
+// We drive keyBindUseItem, so Minecraft emits the same packets a
+// real right-click hold produces.
 //
 // PERFECT mode aims for near-total coverage, releasing only for the
 // tick a swing needs plus randomized micro-gaps.
@@ -32,8 +32,7 @@
 
 class AutoBlockhit : public Module {
 private:
-    // 0=Normal 1=Timed 2=Fake 3=Smart 4=Perfect
-    int   m_mode = 4;
+    int   m_mode = 4;   // 0 Normal 1 Timed 2 Fake 3 Smart 4 Perfect
 
     float m_chance          = 100.0f;
     int   m_blockTicksMin   = 1;
@@ -44,7 +43,6 @@ private:
     int   m_hitIntervalMin  = 1;
     int   m_hitIntervalMax  = 3;
 
-    // Perfect mode
     float m_coverage        = 94.0f;
     int   m_swingGapTicks   = 1;
     bool  m_microRelease    = true;
@@ -62,24 +60,25 @@ private:
     bool  m_pauseOnFlag     = true;
     int   m_flagPauseTicks  = 20;
 
-    // Internal
-    bool  m_isBlocking       = false;
-    int   m_blockCountdown   = 0;
-    int   m_unblockCountdown = 0;
-    int   m_hitCounter       = 0;
-    int   m_nextBlockAt      = 1;
-    bool  m_lastLMB          = false;
-    int   m_flagPause        = 0;
-    int   m_ticksBlocked     = 0;
-    int   m_ticksTotal       = 0;
+    // State
+    bool m_blocking         = false;
+    int  m_blockCountdown   = 0;
+    int  m_unblockCountdown = 0;
+    int  m_hitCounter       = 0;
+    int  m_nextBlockAt      = 1;
+    bool m_lastLMB          = false;
+    int  m_flagPause        = 0;
+    int  m_ticksBlocked     = 0;
+    int  m_ticksTotal       = 0;
 
-    // JNI
-    jobject   m_keyBind    = nullptr;  // global ref to keyBindUseItem
-    jfieldID  m_fPressed   = nullptr;
+    // Sword check is walked once per second, not per tick
+    bool m_swordCached      = true;
+    int  m_swordCheckTimer  = 0;
+
     jfieldID  m_fInventory = nullptr;
     jmethodID m_mCurItem   = nullptr;
     jmethodID m_mGetItem   = nullptr;
-    jclass    m_itemSword  = nullptr;  // global ref
+    jclass    m_itemSword  = nullptr;
     bool      m_resolved   = false;
 
     std::mt19937 m_rng{ std::random_device{}() };
@@ -101,7 +100,7 @@ private:
         return v < 0 ? 0 : v;
     }
 
-    // ItemSword is obfuscated, so locate it by the field it declares.
+    // ItemSword is obfuscated, so find it by the field it declares
     jclass FindItemSword(JNIEnv* env) {
         jvmtiEnv* jvmti = JvmtiUtil::Get(env);
         if (!jvmti) return nullptr;
@@ -124,17 +123,6 @@ private:
     void ResolveJNI(JNIEnv* env) {
         if (m_resolved) return;
 
-        // keyBindUseItem -> KeyBinding.pressed
-        jobject kb = Minecraft::GetKeyBindUseItem(env);
-        if (kb) {
-            m_keyBind = env->NewGlobalRef(kb);
-            jclass kbCls = env->GetObjectClass(kb);
-            m_fPressed = JvmtiUtil::FindField(env, kbCls, { "field_74513_e", "pressed" });
-            env->DeleteLocalRef(kbCls);
-            env->DeleteLocalRef(kb);
-        }
-
-        // held item chain: EntityPlayer.inventory -> getCurrentItem() -> getItem()
         if (ClassResolver::entityPlayer) {
             m_fInventory = JvmtiUtil::FindField(env, ClassResolver::entityPlayer,
                 { "field_71071_by", "inventory" });
@@ -148,29 +136,24 @@ private:
                     m_mCurItem = JvmtiUtil::FindMethod(env, invCls,
                         { "func_70448_g", "getCurrentItem" }, 0);
                     env->DeleteLocalRef(invCls);
-                    env->DeleteLocalRef(inv);
                 }
-                env->DeleteLocalRef(player);
             }
         }
-
         if (!m_itemSword) m_itemSword = FindItemSword(env);
 
         m_resolved = true;
-        printf("[AutoBlock] keybind=%p pressed=%p inv=%p curItem=%p sword=%p\n",
-            (void*)m_keyBind, (void*)m_fPressed, (void*)m_fInventory,
-            (void*)m_mCurItem, (void*)m_itemSword);
+        printf("[AutoBlock] inv=%p curItem=%p sword=%p\n",
+            (void*)m_fInventory, (void*)m_mCurItem, (void*)m_itemSword);
     }
 
-    bool HoldingSword(JNIEnv* env, jobject player) {
+    bool CheckSword(JNIEnv* env, jobject player) {
         if (!m_onlySword) return true;
-        if (!m_fInventory || !m_mCurItem || !m_itemSword) return true; // unknown, allow
+        if (!m_fInventory || !m_mCurItem || !m_itemSword) return true;
 
         jobject inv = env->GetObjectField(player, m_fInventory);
         if (!inv) return false;
 
         jobject stack = env->CallObjectMethod(inv, m_mCurItem);
-        env->DeleteLocalRef(inv);
         if (env->ExceptionCheck()) { env->ExceptionClear(); return false; }
         if (!stack) return false;
 
@@ -179,64 +162,86 @@ private:
             m_mGetItem = JvmtiUtil::FindMethod(env, sc, { "func_77973_b", "getItem" }, 0);
             env->DeleteLocalRef(sc);
         }
-        if (!m_mGetItem) { env->DeleteLocalRef(stack); return false; }
+        if (!m_mGetItem) return false;
 
         jobject item = env->CallObjectMethod(stack, m_mGetItem);
-        env->DeleteLocalRef(stack);
         if (env->ExceptionCheck()) { env->ExceptionClear(); return false; }
         if (!item) return false;
 
-        bool isSword = env->IsInstanceOf(item, m_itemSword);
-        env->DeleteLocalRef(item);
-        return isSword;
+        return env->IsInstanceOf(item, m_itemSword) != 0;
     }
 
     void SetBlock(JNIEnv* env, bool on) {
-        if (m_keyBind && m_fPressed) {
-            env->SetBooleanField(m_keyBind, m_fPressed, (jboolean)on);
-        }
-        m_isBlocking = on;
+        if (m_blocking == on) return;
+        KeyBinds::SetUseItem(env, on);
+        m_blocking = on;
     }
 
     bool EnemyInRange(JNIEnv* env) {
         if (!EntityList::Init(env)) return false;
-        auto ents = EntityList::GetPlayers(env, m_predictRange);
-        return !ents.empty();
+        return !EntityList::GetPlayers(env, m_predictRange).empty();
     }
 
 public:
     AutoBlockhit()
         : Module("Auto Blockhit", "Sword block with near-total coverage",
-                 ModuleCategory::COMBAT, 0) {}
+                 ModuleCategory::COMBAT, 0)
+    {
+        Bind("Mode", &m_mode);
+        Bind("Chance", &m_chance);
+        Bind("Block Ticks Min", &m_blockTicksMin);
+        Bind("Block Ticks Max", &m_blockTicksMax);
+        Bind("Only Sword", &m_onlySword);
+        Bind("Only While Moving", &m_onlyWhileMoving);
+        Bind("Hit Interval Min", &m_hitIntervalMin);
+        Bind("Hit Interval Max", &m_hitIntervalMax);
+        Bind("Coverage", &m_coverage);
+        Bind("Swing Gap", &m_swingGapTicks);
+        Bind("Micro Release", &m_microRelease);
+        Bind("Micro Chance", &m_microChance);
+        Bind("Micro Len Min", &m_microLenMin);
+        Bind("Micro Len Max", &m_microLenMax);
+        Bind("Predictive", &m_predictive);
+        Bind("Predict Range", &m_predictRange);
+        Bind("Hold Between Hits", &m_holdBetweenHits);
+        Bind("Reblock Delay Min", &m_reblockDelayMin);
+        Bind("Reblock Delay Max", &m_reblockDelayMax);
+        Bind("Vary Release Timing", &m_varyReleaseTiming);
+        Bind("Timing Noise", &m_timingNoise);
+        Bind("Pause On Flag", &m_pauseOnFlag);
+        Bind("Flag Pause Ticks", &m_flagPauseTicks);
+    }
 
     void OnTick(JNIEnv* env) override {
+        if (!KeyBinds::Init(env)) return;
         ResolveJNI(env);
-        if (!m_keyBind || !m_fPressed) return;   // cannot block without the keybind
 
         jobject player = Minecraft::GetPlayer(env);
         if (!player) return;
 
-        if (Minecraft::IsInGui(env)) { if (m_isBlocking) SetBlock(env, false); return; }
+        if (Minecraft::IsInGui(env)) { SetBlock(env, false); return; }
 
         if (m_flagPause > 0) {
             m_flagPause--;
-            if (m_isBlocking) SetBlock(env, false);
+            SetBlock(env, false);
             return;
         }
 
-        if (m_onlyWhileMoving && !(GetAsyncKeyState('W') & 0x8000)) {
-            if (m_isBlocking) SetBlock(env, false);
+        if (m_onlyWhileMoving && !KeyBinds::GetForward(env)) {
+            SetBlock(env, false);
             return;
         }
 
-        // Blocking without a sword is an obvious tell, so bail out.
-        if (!HoldingSword(env, player)) {
-            if (m_isBlocking) SetBlock(env, false);
-            return;
+        // Walking the inventory every tick is wasteful, and the held
+        // item rarely changes mid-swing.
+        if (--m_swordCheckTimer <= 0) {
+            m_swordCached = CheckSword(env, player);
+            m_swordCheckTimer = 10;
         }
+        if (!m_swordCached) { SetBlock(env, false); return; }
 
         m_ticksTotal++;
-        if (m_isBlocking) m_ticksBlocked++;
+        if (m_blocking) m_ticksBlocked++;
         if (m_ticksTotal > 400) { m_ticksTotal /= 2; m_ticksBlocked /= 2; }
 
         bool lmb = (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0;
@@ -258,7 +263,7 @@ public:
             }
             if (m_blockCountdown > 0) { m_blockCountdown--; return; }
 
-            if (m_microRelease && m_isBlocking && Roll(m_microChance)) {
+            if (m_microRelease && m_blocking && Roll(m_microChance)) {
                 float actual = m_ticksTotal > 0
                     ? (100.f * m_ticksBlocked / m_ticksTotal) : 0.f;
                 if (actual > m_coverage) {
@@ -268,18 +273,18 @@ public:
                 }
             }
 
-            if (m_predictive && !m_isBlocking && EnemyInRange(env)) {
+            if (m_predictive && !m_blocking && EnemyInRange(env)) {
                 SetBlock(env, true);
                 return;
             }
-            if (m_holdBetweenHits && !m_isBlocking && Roll(m_chance)) {
+            if (m_holdBetweenHits && !m_blocking && Roll(m_chance)) {
                 SetBlock(env, true);
             }
             return;
         }
 
         // ---------------- LEGACY 0-3 ----------------
-        if (m_isBlocking) {
+        if (m_blocking) {
             if (m_blockCountdown <= 0) SetBlock(env, false);
             else { m_blockCountdown--; return; }
         }
@@ -304,12 +309,11 @@ public:
         if (!shouldBlock || !Roll(m_chance)) return;
 
         m_blockCountdown = Noisy(Rand(m_blockTicksMin, m_blockTicksMax));
-        if (m_mode != 2) SetBlock(env, true);
-        else m_isBlocking = true;
+        if (m_mode != 2) SetBlock(env, true);   // Fake never sends the block
     }
 
     void OnDisable(JNIEnv* env) override {
-        if (m_isBlocking) SetBlock(env, false);
+        SetBlock(env, false);
         m_blockCountdown = 0;
         m_unblockCountdown = 0;
     }
@@ -373,10 +377,13 @@ public:
         ImGui::Checkbox("Pause On Flag", &m_pauseOnFlag);
         if (m_pauseOnFlag) ImGui::SliderInt("Flag Pause Ticks", &m_flagPauseTicks, 5, 60);
 
-        if (!m_keyBind) {
-            ImGui::Separator();
+        if (m_onlySword && !m_itemSword) {
             ImGui::TextColored(ImVec4(1.f, 0.8f, 0.3f, 1.f),
-                "keyBindUseItem unresolved: module inactive");
+                "ItemSword unresolved: sword check skipped");
+        }
+        if (!KeyBinds::HasUseItem()) {
+            ImGui::TextColored(ImVec4(1.f, 0.8f, 0.3f, 1.f),
+                "Use-item keybind unresolved: module inactive");
         }
     }
 };
