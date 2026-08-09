@@ -1,69 +1,12 @@
 # Phantom Client
 
-Internal DLL for Lunar Client 1.8.9. JNI + OpenGL hook + ImGui overlay.
-
-## Architecture
-
-```
-src/
-├── dllmain.cpp              # DLL entry, JVM attach, main loop
-├── jni/
-│   ├── jni_helper.h         # JVM attach via JNI_GetCreatedJavaVMs
-│   └── class_resolver.h     # JVMTI class enumeration (bypasses Lunar's classloader)
-├── mappings/
-│   └── mcp189.h             # MCP 1.8.9 SRG/Notch field & method names
-├── mc/
-│   └── minecraft.h          # JNI wrapper: player pos, rotation, motion, etc.
-├── hooks/
-│   └── gl_hook.h            # wglSwapBuffers hook via MinHook + ImGui init
-├── modules/
-│   ├── module.h             # Base module class
-│   ├── module_manager.h     # Registry, keybind handler, tick loop
-│   ├── combat/
-│   │   ├── aim_assist.h     # Smooth aim correction (FOV, speed, target mode)
-│   │   ├── kill_aura.h      # Auto-attack with randomized CPS
-│   │   └── velocity.h       # Knockback reduction (reduce/cancel/reverse)
-│   ├── movement/
-│   │   ├── speed.h          # Strafe/BHop speed boost
-│   │   ├── sprint.h         # Always sprint + omni-sprint
-│   │   └── fly.h            # Vanilla fly with anti-kick
-│   └── visual/
-│       ├── esp.h            # Player ESP (box, health, distance)
-│       └── fullbright.h     # Gamma override
-└── gui/
-    └── menu.h               # ImGui menu with dark theme, HUD overlay
-```
-
-## How it works
-
-1. **DLL Injection**: Inject into `javaw.exe` (Lunar Client) via any injector
-2. **JVM Attach**: `JNI_GetCreatedJavaVMs` from `jvm.dll` to get the running JVM
-3. **Class Resolution**: JVMTI `GetLoadedClasses` to enumerate all classes (Lunar's custom classloader prevents `FindClass`)
-4. **Field Identification**: Match classes by their unique fields (e.g. Minecraft has `thePlayer`)
-5. **OpenGL Hook**: MinHook on `wglSwapBuffers` to create a second GL context for ImGui rendering
-6. **WndProc Hook**: Intercept input for ImGui when menu is open
-
-## Keybinds
-
-| Key | Action |
-|-----|--------|
-| INSERT | Toggle menu |
-| DELETE | Eject DLL |
-| R | Aim Assist |
-| K | Kill Aura |
-| B | Velocity |
-| F | Speed |
-| CTRL | Sprint |
-| G | Fly |
-| X | ESP |
-| H | Fullbright |
+Internal DLL for Lunar Client 1.8.9. C++ / JNI / JVMTI with an ImGui overlay
+rendered through a `wglSwapBuffers` hook.
 
 ## Build
 
-Requirements:
-- Visual Studio 2022 with C++ workload
-- CMake 3.20+
-- JDK 8 (for JNI headers)
+Requirements: Visual Studio 2022 (C++ workload), CMake 3.20+, JDK 8 for the
+`jni.h` and `jvmti.h` headers.
 
 ```bash
 mkdir build && cd build
@@ -71,24 +14,90 @@ cmake .. -DJDK_PATH="C:/Program Files/Java/jdk1.8.0_202"
 cmake --build . --config Release
 ```
 
-Output: `build/Release/PhantomClient.dll`
+Output: `build/Release/PhantomClient.dll`. Inject into `javaw.exe`.
+MinHook and Dear ImGui are fetched automatically.
 
-## Dependencies (auto-fetched by CMake)
+Every module is a header-only class, so the client compiles as a single
+translation unit. The per-module `.cpp` files in the tree are legacy stubs and
+are not part of the build.
 
-- [MinHook](https://github.com/TsudaKageWorker/minhook) - trampoline hooking
-- [Dear ImGui](https://github.com/ocornut/imgui) - GUI framework
+## Keybinds
 
-## TODO
+| Key | Action |
+|-----|--------|
+| INSERT | Toggle menu |
+| DELETE | Eject |
+| B | Velocity |
+| R | Aim Assist |
+| K | Kill Aura |
+| F | Speed |
+| G | Fly |
+| CTRL | Sprint |
+| X | ESP |
+| H | Fullbright |
 
-- [ ] Entity list iteration via `world.playerEntities` JNI List
-- [ ] ESP screen projection (gluProject)
-- [ ] KillAura attack packets via `PlayerControllerMP.attackEntity()`
-- [ ] Packet-level Velocity (hook S12PacketEntityVelocity)
-- [ ] Config save/load system
-- [ ] More modules: Reach, AutoClicker, Criticals, NoFall, Scaffold
+## How it works
 
-## Mapping notes
+1. **JVM attach.** `JNI_GetCreatedJavaVMs` from `jvm.dll`, then
+   `AttachCurrentThread` on our client thread.
+2. **Class resolution.** Lunar uses a custom classloader, so `FindClass` cannot
+   see Minecraft classes. We enumerate every loaded class through JVMTI and
+   identify them by the fields they declare.
+3. **Field lookup.** `GetFieldID` needs an exact signature, and Minecraft's are
+   obfuscated (`thePlayer` is `Lbew;`, not the readable name). `JvmtiUtil` reads
+   the real signature from JVMTI and builds the ID from that, so lookups work
+   across Lunar builds.
+4. **Overlay.** MinHook on `wglSwapBuffers`. We create a second GL context,
+   share lists with the game's, draw ImGui, then restore the original context.
+5. **Client loop.** Runs at 20 TPS to match Minecraft, since every module
+   expresses its delays in ticks.
 
-Lunar 1.8.9 can use Notch, SRG, or MCP names depending on the build. The class resolver tries SRG first, then MCP, then Notch. If fields aren't found, use `ClassResolver::DumpAllClasses()` to print all loaded class signatures and reverse-engineer the correct names.
+## Threading
 
-For generating fresh C++ mapping headers, see [hiraeeth/mcp-generator](https://github.com/hiraeeth/mcp-generator).
+One rule: **JNI only ever runs on the client thread.**
+
+`ModuleManager::Tick` wraps each tick in a JNI local frame, so the reference
+table cannot overflow. The render thread draws the menu and ESP but never calls
+JNI. Menu toggles are queued and applied on the client thread, because
+`OnEnable`/`OnDisable` need a valid `JNIEnv`. ESP publishes a plain-data
+snapshot under a mutex for the renderer to read.
+
+## Module status
+
+| Module | Category | State |
+|--------|----------|-------|
+| Velocity | Combat | Working. Direct + legit modes |
+| Sprint Reset | Combat | Working. 6 techniques |
+| Auto Blockhit | Combat | Working. Drives the real `keyBindUseItem` |
+| Aim Assist | Combat | Working |
+| Hit Select | Combat | Working |
+| Click Assist | Combat | Working. Butterfly / drag / jitter |
+| Kill Aura | Combat | Working. Loud, detected everywhere |
+| **Backtrack** | Combat | **Inert.** Needs a Netty packet hook |
+| Bridge Assist | Movement | Working |
+| Sprint | Movement | Working |
+| No Jump Delay | Movement | Working |
+| Speed | Movement | Working. Detected by prediction ACs |
+| Fly | Movement | Working. Detected by prediction ACs |
+| ESP | Visual | Working. Own view-projection, not GL matrices |
+| Fullbright | Visual | Working |
+
+## Known gaps
+
+- **Backtrack** has no packet hook, so it does nothing. The tuning layer and
+  the safety logic are written and waiting; the interception is not.
+- **Config profiles** under `src/config/` are documented constants. Nothing
+  loads them into the modules yet.
+- **Health** is read through `getHealth()`. If a Lunar build strips that method
+  the ESP health bar falls back to full.
+- Fly and Speed will not survive a prediction-based anticheat. They exist for
+  unprotected servers.
+
+## Troubleshooting
+
+The DLL opens a console. If class resolution fails it dumps every loaded class
+signature so you can find the obfuscated names by hand, then extend the
+candidate lists in `src/mappings/mcp189.h`.
+
+Injecting at the main menu is fine: startup retries for 60 seconds while it
+waits for the game to finish loading.
