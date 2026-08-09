@@ -7,25 +7,27 @@
 #include <random>
 
 // ==========================================================
-// Velocity — Multi-mode knockback reduction
+// Velocity — Reduce INCOMING knockback
 // ==========================================================
-// Modes 0-2: Direct motion modification (works on weak ACs)
+// Direct modes (weak ACs / non-Polar servers):
 //   0 = Reduce  — scale motion by horizontal/vertical %
 //   1 = Cancel  — zero out all motion on hit
 //   2 = Reverse — reverse horizontal motion
 //
-// Modes 3-6: Legit methods (safe for Polar / strict ACs)
-//   3 = Jump Reset    — jump on hit to reset vertical KB
-//   4 = Sprint Reset  — W-tap / S-tap to reduce travel
-//   5 = Strafe        — redirect movement toward attacker
-//   6 = Combined      — Jump Reset + Sprint Reset + Strafe
+// Legit modes (safe for Polar):
+//   3 = Jump Reset — jump on hit to reset vertical KB
+//   4 = Strafe     — redirect movement toward attacker
+//   5 = Combined   — Jump Reset + Strafe
+//
+// Sprint Reset (More KB) is a SEPARATE module that increases
+// OUTGOING knockback. See sprint_reset.h
 // ==========================================================
 
 class Velocity : public Module {
 private:
-    int m_mode = 6; // Combined (legit) by default
+    int m_mode = 5; // Combined (legit) by default
 
-    // === Reduce mode settings ===
+    // === Direct mode settings ===
     float m_horizontal = 85.0f;
     float m_vertical = 100.0f;
 
@@ -36,11 +38,6 @@ private:
     bool m_jumpOnlyGround = true;
     int m_hitsUntilJump = 1;
 
-    // === Sprint Reset settings ===
-    int m_sprintResetTicks = 1;
-    bool m_useSTap = false;
-    float m_sprintResetChance = 70.0f;
-
     // === Strafe settings ===
     float m_strafeStrength = 0.8f;
     int m_strafeDelay = 1;
@@ -49,24 +46,18 @@ private:
     // === Internal state ===
     int m_lastHurtTime = 0;
     int m_hitsTaken = 0;
-    int m_ticksSinceHit = 999;
     bool m_shouldJump = false;
     int m_jumpCountdown = 0;
-    bool m_isSprintResetting = false;
-    int m_sprintResetCountdown = 0;
-    int m_ticksSinceAttack = 999;
     bool m_shouldStrafe = false;
     int m_strafeCountdown = 0;
 
     // JNI cached
-    jmethodID m_setSprinting = nullptr;
-    jfieldID m_fMoveFwd = nullptr;
     jfieldID m_fMoveStrafe = nullptr;
     bool m_jniResolved = false;
 
     std::mt19937 m_rng{ std::random_device{}() };
 
-    bool RollChance(float pct) {
+    bool Roll(float pct) {
         std::uniform_real_distribution<float> d(0.f, 100.f);
         return d(m_rng) < pct;
     }
@@ -79,22 +70,10 @@ private:
 
     void ResolveJNI(JNIEnv* env) {
         if (m_jniResolved) return;
-        if (ClassResolver::entity) {
-            m_setSprinting = env->GetMethodID(ClassResolver::entity, "func_70031_b", "(Z)V");
+        if (ClassResolver::entityLivingBase) {
+            m_fMoveStrafe = env->GetFieldID(ClassResolver::entityLivingBase, "field_70702_br", "F");
             if (env->ExceptionCheck()) {
                 env->ExceptionClear();
-                m_setSprinting = env->GetMethodID(ClassResolver::entity, "setSprinting", "(Z)V");
-                if (env->ExceptionCheck()) env->ExceptionClear();
-            }
-        }
-        if (ClassResolver::entityLivingBase) {
-            m_fMoveFwd = env->GetFieldID(ClassResolver::entityLivingBase, "field_70701_bs", "F");
-            if (env->ExceptionCheck()) { env->ExceptionClear();
-                m_fMoveFwd = env->GetFieldID(ClassResolver::entityLivingBase, "moveForward", "F");
-                if (env->ExceptionCheck()) env->ExceptionClear();
-            }
-            m_fMoveStrafe = env->GetFieldID(ClassResolver::entityLivingBase, "field_70702_br", "F");
-            if (env->ExceptionCheck()) { env->ExceptionClear();
                 m_fMoveStrafe = env->GetFieldID(ClassResolver::entityLivingBase, "moveStrafing", "F");
                 if (env->ExceptionCheck()) env->ExceptionClear();
             }
@@ -102,14 +81,12 @@ private:
         m_jniResolved = true;
     }
 
-    // ---------- Legit helpers ----------
     bool IsLegitMode() const { return m_mode >= 3; }
-    bool UsesJumpReset() const { return m_mode == 3 || m_mode == 6; }
-    bool UsesSprintReset() const { return m_mode == 4 || m_mode == 6; }
-    bool UsesStrafe() const { return m_mode == 5 || m_mode == 6; }
+    bool UsesJumpReset() const { return m_mode == 3 || m_mode == 5; }
+    bool UsesStrafe() const { return m_mode == 4 || m_mode == 5; }
 
 public:
-    Velocity() : Module("Velocity", "Reduce knockback (direct or legit modes)",
+    Velocity() : Module("Velocity", "Reduce incoming knockback",
                         ModuleCategory::COMBAT, 'B') {}
 
     void OnTick(JNIEnv* env) override {
@@ -121,14 +98,10 @@ public:
 
         int hurtTime = Minecraft::GetHurtTime(env, player);
         bool onGround = Minecraft::IsOnGround(env, player);
-
-        m_ticksSinceHit++;
-        m_ticksSinceAttack++;
-
         bool justHit = (hurtTime > 0 && m_lastHurtTime == 0);
 
         // =============================================
-        // DIRECT MODES (0 = Reduce, 1 = Cancel, 2 = Reverse)
+        // DIRECT MODES (0-2)
         // =============================================
         if (!IsLegitMode() && justHit) {
             double mx = Minecraft::GetMotionX(env, player);
@@ -156,118 +129,63 @@ public:
         }
 
         // =============================================
-        // LEGIT MODES (3-6)
+        // LEGIT MODES (3-5)
         // =============================================
-        if (IsLegitMode()) {
+        if (IsLegitMode() && justHit) {
+            m_hitsTaken++;
 
-            // --- On-hit triggers ---
-            if (justHit) {
-                m_hitsTaken++;
-                m_ticksSinceHit = 0;
-
-                // Jump Reset trigger
-                if (UsesJumpReset() && m_hitsTaken >= m_hitsUntilJump) {
-                    if (RollChance(m_jumpChance)) {
-                        m_jumpCountdown = RandRange(m_jumpDelayMin, m_jumpDelayMax);
-                        m_shouldJump = true;
-                    }
-                    m_hitsTaken = 0;
+            // Jump Reset trigger
+            if (UsesJumpReset() && m_hitsTaken >= m_hitsUntilJump) {
+                if (Roll(m_jumpChance)) {
+                    m_jumpCountdown = RandRange(m_jumpDelayMin, m_jumpDelayMax);
+                    m_shouldJump = true;
                 }
-
-                // Strafe trigger
-                if (UsesStrafe()) {
-                    m_strafeCountdown = m_strafeDelay;
-                    m_shouldStrafe = true;
-                }
+                m_hitsTaken = 0;
             }
 
-            // --- Execute Jump Reset ---
-            if (m_shouldJump) {
-                if (m_jumpCountdown <= 0) {
-                    if ((!m_jumpOnlyGround || onGround) && onGround) {
-                        // Vanilla jump: motionY = 0.42
-                        Minecraft::SetMotionY(env, player, 0.42);
-                    }
-                    m_shouldJump = false;
-                } else {
-                    m_jumpCountdown--;
-                }
+            // Strafe trigger
+            if (UsesStrafe()) {
+                m_strafeCountdown = m_strafeDelay;
+                m_shouldStrafe = true;
             }
+        }
 
-            // --- Execute Sprint Reset ---
-            if (UsesSprintReset()) {
-                // Finishing a reset: re-enable sprint
-                if (m_isSprintResetting) {
-                    if (m_sprintResetCountdown <= 0) {
-                        if (m_setSprinting) {
-                            env->CallVoidMethod(player, m_setSprinting, (jboolean)true);
-                            if (env->ExceptionCheck()) env->ExceptionClear();
-                        }
-                        if (m_fMoveFwd && m_useSTap)
-                            env->SetFloatField(player, m_fMoveFwd, 1.0f);
-                        m_isSprintResetting = false;
-                    } else {
-                        m_sprintResetCountdown--;
-                    }
+        // --- Execute Jump Reset ---
+        if (m_shouldJump) {
+            if (m_jumpCountdown <= 0) {
+                if ((!m_jumpOnlyGround || onGround) && onGround) {
+                    Minecraft::SetMotionY(env, player, 0.42);
                 }
-
-                // Start a new reset while attacking
-                bool attacking = (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0;
-                bool moving    = (GetAsyncKeyState('W') & 0x8000) != 0;
-
-                if (attacking && moving && !m_isSprintResetting && m_ticksSinceAttack > 3) {
-                    if (RollChance(m_sprintResetChance)) {
-                        if (m_setSprinting) {
-                            env->CallVoidMethod(player, m_setSprinting, (jboolean)false);
-                            if (env->ExceptionCheck()) env->ExceptionClear();
-                        }
-                        if (m_useSTap && m_fMoveFwd)
-                            env->SetFloatField(player, m_fMoveFwd, -0.98f);
-
-                        m_isSprintResetting = true;
-                        m_sprintResetCountdown = m_sprintResetTicks;
-                        m_ticksSinceAttack = 0;
-                    }
-                }
+                m_shouldJump = false;
+            } else {
+                m_jumpCountdown--;
             }
+        }
 
-            // --- Execute Strafe ---
-            if (m_shouldStrafe) {
-                if (m_strafeCountdown <= 0) {
-                    if (m_fMoveStrafe) {
-                        float dir = (m_rng() % 2 == 0) ? 1.f : -1.f;
-                        env->SetFloatField(player, m_fMoveStrafe, dir * m_strafeStrength);
-                    }
-                    m_shouldStrafe = false;
-                } else {
-                    m_strafeCountdown--;
+        // --- Execute Strafe ---
+        if (m_shouldStrafe) {
+            if (m_strafeCountdown <= 0) {
+                if (m_fMoveStrafe) {
+                    float dir = (m_rng() % 2 == 0) ? 1.f : -1.f;
+                    env->SetFloatField(player, m_fMoveStrafe, dir * m_strafeStrength);
                 }
+                m_shouldStrafe = false;
+            } else {
+                m_strafeCountdown--;
             }
         }
 
         m_lastHurtTime = hurtTime;
     }
 
-    void OnDisable(JNIEnv* env) override {
-        if (m_isSprintResetting) {
-            jobject player = Minecraft::GetPlayer(env);
-            if (player && m_setSprinting) {
-                env->CallVoidMethod(player, m_setSprinting, (jboolean)true);
-                if (env->ExceptionCheck()) env->ExceptionClear();
-            }
-            m_isSprintResetting = false;
-        }
-    }
-
     void RenderSettings() override {
         const char* modes[] = {
-            "Reduce", "Cancel", "Reverse",           // 0-2: direct
-            "Jump Reset", "Sprint Reset", "Strafe",  // 3-5: legit single
-            "Combined (Legit)"                        // 6:   legit all
+            "Reduce", "Cancel", "Reverse",      // 0-2: direct
+            "Jump Reset", "Strafe",              // 3-4: legit single
+            "Combined (Legit)"                    // 5:   legit all
         };
-        ImGui::Combo("Mode", &m_mode, modes, 7);
+        ImGui::Combo("Mode", &m_mode, modes, 6);
 
-        // Warn if using direct modes on strict ACs
         if (!IsLegitMode()) {
             ImGui::TextColored(ImVec4(1.f, 0.4f, 0.4f, 1.f),
                 "! Direct modes flag on Polar / strict ACs");
@@ -275,39 +193,30 @@ public:
 
         ImGui::Separator();
 
-        // --- Direct mode settings ---
+        // Direct
         if (m_mode == 0) {
             ImGui::SliderFloat("Horizontal", &m_horizontal, 0.f, 100.f, "%.0f%%");
             ImGui::SliderFloat("Vertical",   &m_vertical,   0.f, 100.f, "%.0f%%");
         }
 
-        // --- Jump Reset settings ---
+        // Jump Reset
         if (UsesJumpReset()) {
             ImGui::TextColored(ImVec4(0.5f, 0.8f, 1.f, 1.f), "Jump Reset");
-            ImGui::SliderFloat("Jump Chance",    &m_jumpChance, 10.f, 100.f, "%.0f%%");
-            ImGui::SliderInt("Delay Min (ticks)", &m_jumpDelayMin, 0, 5);
-            ImGui::SliderInt("Delay Max (ticks)", &m_jumpDelayMax, 0, 5);
+            ImGui::SliderFloat("Jump Chance",     &m_jumpChance, 10.f, 100.f, "%.0f%%");
+            ImGui::SliderInt("Delay Min (ticks)",  &m_jumpDelayMin, 0, 5);
+            ImGui::SliderInt("Delay Max (ticks)",  &m_jumpDelayMax, 0, 5);
             if (m_jumpDelayMin > m_jumpDelayMax) m_jumpDelayMin = m_jumpDelayMax;
-            ImGui::SliderInt("Hits Until Jump",  &m_hitsUntilJump, 1, 5);
-            ImGui::Checkbox("Only On Ground",    &m_jumpOnlyGround);
+            ImGui::SliderInt("Hits Until Jump",   &m_hitsUntilJump, 1, 5);
+            ImGui::Checkbox("Only On Ground",     &m_jumpOnlyGround);
             ImGui::Spacing();
         }
 
-        // --- Sprint Reset settings ---
-        if (UsesSprintReset()) {
-            ImGui::TextColored(ImVec4(1.f, 0.6f, 0.4f, 1.f), "Sprint Reset");
-            ImGui::SliderFloat("Reset Chance",   &m_sprintResetChance, 10.f, 100.f, "%.0f%%");
-            ImGui::SliderInt("Reset Ticks",       &m_sprintResetTicks, 1, 3);
-            ImGui::Checkbox("Use S-Tap",          &m_useSTap);
-            ImGui::Spacing();
-        }
-
-        // --- Strafe settings ---
+        // Strafe
         if (UsesStrafe()) {
             ImGui::TextColored(ImVec4(0.4f, 1.f, 0.6f, 1.f), "Strafe");
-            ImGui::SliderFloat("Strength",       &m_strafeStrength, 0.1f, 1.f, "%.1f");
-            ImGui::SliderInt("Strafe Delay",     &m_strafeDelay, 0, 5);
-            ImGui::Checkbox("Only Facing",        &m_strafeOnlyFacing);
+            ImGui::SliderFloat("Strength",     &m_strafeStrength, 0.1f, 1.f, "%.1f");
+            ImGui::SliderInt("Strafe Delay",   &m_strafeDelay, 0, 5);
+            ImGui::Checkbox("Only Facing",      &m_strafeOnlyFacing);
         }
     }
 };
