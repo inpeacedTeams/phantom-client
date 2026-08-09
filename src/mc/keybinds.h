@@ -15,7 +15,7 @@
 // tick EntityPlayerSP.onLivingUpdate() recomputes the sprint state
 // from the movement keys and the sprint keybind, so our write is
 // overwritten before the packet goes out. The same applies to
-// sneaking and item use.
+// sneaking, and to writing moveForward / moveStrafing by hand.
 //
 // Driving GameSettings.keyBind*.pressed puts us upstream of that
 // logic. The game then produces exactly the packet sequence a real
@@ -26,14 +26,19 @@
 //   pressed    is the key down right now
 //   pressTime  queued press events, consumed by isPressed()
 // We only touch pressed, which is what movement and item use read.
+//
+// IMPORTANT
+// A key we force down stays down until we clear it. Every module
+// that holds one must release it in OnDisable, and ReleaseAll()
+// exists as the backstop for eject and disconnect.
 // =================================================================
 
 class KeyBinds {
 private:
     struct Bind {
-        jobject  obj  = nullptr;   // global ref to the KeyBinding
+        jobject  obj = nullptr;      // global ref to the KeyBinding
         jfieldID pressed = nullptr;
-        bool     overridden = false;
+        bool     overridden = false; // we are the ones holding it
         bool     wanted = false;
     };
 
@@ -44,9 +49,30 @@ private:
     inline static jfieldID s_fPressed = nullptr;
     inline static bool s_ready = false;
 
+    static Bind* All(int& count) {
+        static Bind* table[] = {
+            &s_forward, &s_back, &s_left, &s_right,
+            &s_jump, &s_sneak, &s_sprint, &s_useItem, &s_attack
+        };
+        count = (int)(sizeof(table) / sizeof(table[0]));
+        // Returning the array of pointers through a Bind* would be
+        // wrong, so callers use AllPtrs() instead.
+        return nullptr;
+    }
+
+    static Bind** AllPtrs(int& count) {
+        static Bind* table[] = {
+            &s_forward, &s_back, &s_left, &s_right,
+            &s_jump, &s_sneak, &s_sprint, &s_useItem, &s_attack
+        };
+        count = (int)(sizeof(table) / sizeof(table[0]));
+        return table;
+    }
+
     static void Load(JNIEnv* env, jobject gs, Bind& out,
                      const char* srg, const char* mcp)
     {
+        if (out.obj) return;                    // already resolved
         if (!ClassResolver::gameSettings) return;
 
         jfieldID f = JvmtiUtil::FindField(env, ClassResolver::gameSettings, { srg, mcp });
@@ -76,37 +102,42 @@ public:
         jobject gs = Minecraft::GetGameSettings(env);
         if (!gs) return false;
 
-        Load(env, gs, s_forward,  "field_74351_w", "keyBindForward");
-        Load(env, gs, s_back,     "field_74368_y", "keyBindBack");
-        Load(env, gs, s_left,     "field_74370_x", "keyBindLeft");
-        Load(env, gs, s_right,    "field_74366_z", "keyBindRight");
-        Load(env, gs, s_jump,     "field_74314_A", "keyBindJump");
-        Load(env, gs, s_sneak,    "field_74311_E", "keyBindSneak");
-        Load(env, gs, s_sprint,   "field_151444_V", "keyBindSprint");
-        Load(env, gs, s_useItem,  "field_74313_G", "keyBindUseItem");
-        Load(env, gs, s_attack,   "field_74312_F", "keyBindAttack");
+        Load(env, gs, s_forward, "field_74351_w",  "keyBindForward");
+        Load(env, gs, s_back,    "field_74368_y",  "keyBindBack");
+        Load(env, gs, s_left,    "field_74370_x",  "keyBindLeft");
+        Load(env, gs, s_right,   "field_74366_z",  "keyBindRight");
+        Load(env, gs, s_jump,    "field_74314_A",  "keyBindJump");
+        Load(env, gs, s_sneak,   "field_74311_E",  "keyBindSneak");
+        Load(env, gs, s_sprint,  "field_151444_V", "keyBindSprint");
+        Load(env, gs, s_useItem, "field_74313_G",  "keyBindUseItem");
+        Load(env, gs, s_attack,  "field_74312_F",  "keyBindAttack");
 
         s_ready = (s_forward.obj != nullptr && s_fPressed != nullptr);
 
-        printf("[KeyBinds] ready=%d fwd=%p back=%p sneak=%p jump=%p use=%p sprint=%p\n",
-            (int)s_ready, (void*)s_forward.obj, (void*)s_back.obj,
-            (void*)s_sneak.obj, (void*)s_jump.obj,
-            (void*)s_useItem.obj, (void*)s_sprint.obj);
-
+        if (s_ready) {
+            printf("[KeyBinds] resolved fwd=%p back=%p sneak=%p jump=%p use=%p sprint=%p\n",
+                (void*)s_forward.obj, (void*)s_back.obj, (void*)s_sneak.obj,
+                (void*)s_jump.obj, (void*)s_useItem.obj, (void*)s_sprint.obj);
+        }
         return s_ready;
     }
 
     static void Shutdown(JNIEnv* env) {
-        Bind* all[] = { &s_forward, &s_back, &s_left, &s_right,
-                        &s_jump, &s_sneak, &s_sprint, &s_useItem, &s_attack };
-        for (Bind* b : all) {
-            if (b->obj) { env->DeleteGlobalRef(b->obj); b->obj = nullptr; }
-            b->overridden = false;
+        if (env) ReleaseAll(env);
+
+        int n = 0;
+        Bind** all = AllPtrs(n);
+        for (int i = 0; i < n; i++) {
+            if (all[i]->obj && env) env->DeleteGlobalRef(all[i]->obj);
+            all[i]->obj = nullptr;
+            all[i]->pressed = nullptr;
+            all[i]->overridden = false;
         }
+        s_fPressed = nullptr;
         s_ready = false;
     }
 
-    // ---- Raw state ----
+    // ---- Raw ----
     static bool Get(JNIEnv* env, Bind& b) {
         if (!b.obj || !b.pressed) return false;
         return env->GetBooleanField(b.obj, b.pressed) != 0;
@@ -115,18 +146,27 @@ public:
     static void Set(JNIEnv* env, Bind& b, bool down) {
         if (!b.obj || !b.pressed) return;
         env->SetBooleanField(b.obj, b.pressed, (jboolean)down);
-        b.overridden = true;
+        b.overridden = down;
         b.wanted = down;
     }
 
-    // Hand a key back to the player's real input
     static void Release(JNIEnv* env, Bind& b) {
         if (!b.obj || !b.pressed || !b.overridden) return;
         env->SetBooleanField(b.obj, b.pressed, (jboolean)false);
         b.overridden = false;
     }
 
-    // ---- Named accessors ----
+    // Drop every key we are still holding. Safe to call at any time;
+    // keys the player is physically holding are untouched because we
+    // only clear the ones we set ourselves.
+    static void ReleaseAll(JNIEnv* env) {
+        if (!env || !s_fPressed) return;
+        int n = 0;
+        Bind** all = AllPtrs(n);
+        for (int i = 0; i < n; i++) Release(env, *all[i]);
+    }
+
+    // ---- Named ----
     static void SetForward(JNIEnv* e, bool v) { Set(e, s_forward, v); }
     static void SetBack(JNIEnv* e, bool v)    { Set(e, s_back, v); }
     static void SetLeft(JNIEnv* e, bool v)    { Set(e, s_left, v); }
@@ -156,9 +196,10 @@ public:
     static void ReleaseSprint(JNIEnv* e)  { Release(e, s_sprint); }
     static void ReleaseUseItem(JNIEnv* e) { Release(e, s_useItem); }
 
-    // True when the module can actually drive movement keys
+    // ---- Availability ----
     static bool HasMovement() { return s_forward.obj && s_back.obj; }
     static bool HasSneak()    { return s_sneak.obj != nullptr; }
     static bool HasJump()     { return s_jump.obj != nullptr; }
     static bool HasUseItem()  { return s_useItem.obj != nullptr; }
+    static bool HasSprint()   { return s_sprint.obj != nullptr; }
 };
