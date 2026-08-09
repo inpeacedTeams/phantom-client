@@ -9,20 +9,20 @@
 // =================================================================
 // Hit Select
 // =================================================================
-// Fires your click on the exact tick you receive knockback.
-// Landing a hit on the same tick you take one makes the server
-// apply your attacker's knockback against your own outgoing swing,
-// shaving off part of the push. Strong players do this by feel.
+// Fires a click on the exact tick you take knockback. Landing a hit
+// on the same tick you receive one makes the server weigh your
+// outgoing swing against the incoming push, shaving part of it off.
+// Strong players do this by feel.
 //
-// This is pure click timing, so there is nothing for a server-side
-// anticheat to see beyond a well-timed player.
+// Pure click timing, so there is nothing for a server-side anticheat
+// to see beyond a well-timed player.
 // =================================================================
 
 class HitSelect : public Module {
 private:
-    int   m_hurtTimeTarget = 9;     // 10 = hit tick, 9 = one tick later
+    int   m_hurtTimeTarget = 9;   // 10 is the hit tick, 9 is one later
     float m_chance         = 90.0f;
-    bool  m_requireTarget  = true;  // Only fire with someone in reach
+    bool  m_requireTarget  = true;
     float m_targetRange    = 3.6f;
 
     int m_lastHurtTime = 0;
@@ -35,7 +35,13 @@ private:
 
 public:
     HitSelect() : Module("Hit Select", "Click on the tick you take knockback",
-                         ModuleCategory::COMBAT, 0) {}
+                         ModuleCategory::COMBAT, 0)
+    {
+        Bind("HurtTime Target", &m_hurtTimeTarget);
+        Bind("Chance", &m_chance);
+        Bind("Require Target", &m_requireTarget);
+        Bind("Target Range", &m_targetRange);
+    }
 
     void OnTick(JNIEnv* env) override {
         jobject player = Minecraft::GetPlayer(env);
@@ -43,7 +49,8 @@ public:
         if (Minecraft::IsInGui(env)) return;
 
         int hurtTime = Minecraft::GetHurtTime(env, player);
-        bool onTargetTick = (hurtTime == m_hurtTimeTarget && m_lastHurtTime != m_hurtTimeTarget);
+        bool onTargetTick = (hurtTime == m_hurtTimeTarget
+                          && m_lastHurtTime != m_hurtTimeTarget);
         m_lastHurtTime = hurtTime;
 
         if (!onTargetTick) return;
@@ -51,8 +58,7 @@ public:
 
         if (m_requireTarget) {
             if (!EntityList::Init(env)) return;
-            auto ents = EntityList::GetPlayers(env, m_targetRange);
-            if (ents.empty()) return;
+            if (EntityList::GetPlayers(env, m_targetRange).empty()) return;
         }
 
         if (!Roll(m_chance)) return;
