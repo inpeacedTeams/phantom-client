@@ -3,42 +3,53 @@
 #include "../../mc/minecraft.h"
 #include "../../mc/entity_list.h"
 #include <imgui.h>
+#include <Windows.h>
 #include <cmath>
 #include <random>
+#include <algorithm>
 
 // =================================================================
-// Aim Assist — Smooth rotation toward target player
+// Aim Assist
 // =================================================================
-// Uses EntityList to find actual players in the world.
-// Target selection: closest to crosshair, closest distance, or lowest HP.
-// Smooth rotation with randomized speed for legit appearance.
+// Nudges your crosshair toward a target instead of snapping to it.
+// Speed scales down as the crosshair closes in, which removes the
+// tell-tale overshoot-and-correct wobble a naive lerp produces.
+//
+// Randomization and aim breaks exist to keep the rotation delta
+// distribution away from anything a GCD or entropy check can lock
+// onto. Turning them off makes the module far easier to detect.
 // =================================================================
 
 class AimAssist : public Module {
 private:
-    float m_speed = 4.2f;        // Rotation speed (higher = faster snap)
-    float m_fov = 120.0f;        // FOV cone in degrees
-    float m_maxRange = 4.5f;     // Max targeting range
-    bool m_visibleOnly = true;   // Only visible players (TODO: raycast)
-    int m_targetMode = 2;        // 0=closest dist, 1=lowest HP, 2=crosshair
-    bool m_onlyWhileAttacking = false; // Only when LMB held
-    bool m_smoothYaw = true;
-    bool m_smoothPitch = true;
-    float m_pitchSpeed = 3.0f;   // Separate pitch speed (usually slower)
-    float m_randomization = 15.0f; // % random jitter for legit
-    bool m_breakAim = true;      // Occasional aim breaks for legit
-    float m_breakChance = 5.0f;
+    float m_speed             = 4.2f;
+    float m_pitchSpeed        = 3.0f;
+    float m_fov               = 120.0f;
+    float m_maxRange          = 4.5f;
+    int   m_targetMode        = 2;      // 0=closest 1=lowest HP 2=crosshair
+    bool  m_onlyWhileAttacking = false;
+    bool  m_smoothYaw         = true;
+    bool  m_smoothPitch       = true;
+    float m_randomization     = 15.0f;
+    bool  m_breakAim          = true;
+    float m_breakChance       = 5.0f;
+    float m_aimHeight         = 1.0f;   // Where on the body to aim
 
     std::mt19937 m_rng{ std::random_device{}() };
 
-    float WrapAngle(float angle) {
-        while (angle > 180.f)  angle -= 360.f;
-        while (angle < -180.f) angle += 360.f;
-        return angle;
+    static float WrapAngle(float a) {
+        while (a > 180.f)  a -= 360.f;
+        while (a < -180.f) a += 360.f;
+        return a;
+    }
+
+    bool Roll(float pct) {
+        std::uniform_real_distribution<float> d(0.f, 100.f);
+        return d(m_rng) < pct;
     }
 
 public:
-    AimAssist() : Module("Aim Assist", "Smooth aim correction to nearest player",
+    AimAssist() : Module("Aim Assist", "Smooth aim correction toward the nearest player",
                          ModuleCategory::COMBAT, 'R') {}
 
     void OnTick(JNIEnv* env) override {
@@ -46,85 +57,60 @@ public:
         if (!player) return;
         if (Minecraft::IsInGui(env)) return;
 
-        // Only when attacking (optional)
-        if (m_onlyWhileAttacking && !(GetAsyncKeyState(VK_LBUTTON) & 0x8000))
-            return;
+        if (m_onlyWhileAttacking && !(GetAsyncKeyState(VK_LBUTTON) & 0x8000)) return;
 
-        // Aim break: occasionally skip a tick
-        if (m_breakAim) {
-            std::uniform_real_distribution<float> d(0.f, 100.f);
-            if (d(m_rng) < m_breakChance) return;
-        }
+        // Skipping the occasional tick produces the small misses a
+        // human makes, instead of perfect frame-by-frame tracking.
+        if (m_breakAim && Roll(m_breakChance)) return;
 
-        // Init entity list
-        EntityList::Init(env);
+        if (!EntityList::Init(env)) return;
 
-        // Get all players in range
         auto entities = EntityList::GetPlayers(env, m_maxRange);
         if (entities.empty()) return;
 
-        // Find target based on mode
         EntityInfo* target = nullptr;
-
         switch (m_targetMode) {
-            case 0: // Closest distance
-                target = EntityList::FindClosest(entities, m_maxRange);
-                break;
-            case 1: // Lowest HP
-                target = EntityList::FindLowestHP(entities, m_maxRange);
-                break;
-            case 2: // Closest to crosshair
-                target = EntityList::FindClosestToCrosshair(env, entities, m_fov, m_maxRange);
-                break;
+            case 0:  target = EntityList::FindClosest(entities, m_maxRange); break;
+            case 1:  target = EntityList::FindLowestHP(entities, m_maxRange); break;
+            default: target = EntityList::FindClosestToCrosshair(env, entities,
+                                    m_fov, m_maxRange); break;
         }
-
         if (!target) return;
 
-        // Current rotation
-        float playerYaw = Minecraft::GetYaw(env, player);
-        float playerPitch = Minecraft::GetPitch(env, player);
+        float curYaw   = Minecraft::GetYaw(env, player);
+        float curPitch = Minecraft::GetPitch(env, player);
 
-        // Target rotation (aim at target's eye height)
-        auto rot = Minecraft::GetRotationsTo(env, player, target->ref);
+        auto rot = Minecraft::GetRotationsToPos(env, player,
+            target->posX, target->posY + m_aimHeight, target->posZ);
 
-        float yawDiff = WrapAngle(rot.yaw - playerYaw);
-        float pitchDiff = rot.pitch - playerPitch;
+        float yawDiff   = WrapAngle(rot.yaw - curYaw);
+        float pitchDiff = rot.pitch - curPitch;
 
-        // Check if target is within FOV
-        float totalAngle = std::sqrt(yawDiff * yawDiff + pitchDiff * pitchDiff);
-        if (totalAngle > m_fov / 2.0f) return;
+        float angle = std::sqrt(yawDiff * yawDiff + pitchDiff * pitchDiff);
+        if (angle > m_fov * 0.5f) return;
 
-        // Smooth rotation with speed
-        float yawSpeed = m_speed * 0.015f;   // Normalize to reasonable range
-        float pitSpeed = m_pitchSpeed * 0.015f;
+        float yawStep   = m_speed      * 0.015f;
+        float pitchStep = m_pitchSpeed * 0.015f;
 
-        // Add randomization for legit appearance
-        if (m_randomization > 0) {
-            float randRange = m_randomization * 0.01f;
-            std::uniform_real_distribution<float> rd(-randRange, randRange);
-            yawSpeed *= (1.0f + rd(m_rng));
-            pitSpeed *= (1.0f + rd(m_rng));
+        if (m_randomization > 0.f) {
+            float r = m_randomization * 0.01f;
+            std::uniform_real_distribution<float> d(-r, r);
+            yawStep   *= (1.0f + d(m_rng));
+            pitchStep *= (1.0f + d(m_rng));
         }
 
-        // Distance-based speed: faster when far from target angle,
-        // slower when close (prevents jitter)
-        float yawFactor = std::min(1.0f, std::abs(yawDiff) / 30.0f);
-        float pitchFactor = std::min(1.0f, std::abs(pitchDiff) / 20.0f);
+        // Ease off as the crosshair closes in, so the aim settles
+        // instead of oscillating around the target.
+        float yawEase   = std::min(1.0f, std::fabs(yawDiff)   / 30.0f);
+        float pitchEase = std::min(1.0f, std::fabs(pitchDiff) / 20.0f);
 
-        float newYaw = playerYaw;
-        float newPitch = playerPitch;
+        float newYaw   = curYaw;
+        float newPitch = curPitch;
+        if (m_smoothYaw)   newYaw   = curYaw   + yawDiff   * yawStep   * yawEase;
+        if (m_smoothPitch) newPitch = curPitch + pitchDiff * pitchStep * pitchEase;
 
-        if (m_smoothYaw) {
-            newYaw = playerYaw + yawDiff * yawSpeed * yawFactor;
-        }
-        if (m_smoothPitch) {
-            newPitch = playerPitch + pitchDiff * pitSpeed * pitchFactor;
-        }
+        newPitch = std::max(-90.0f, std::min(90.0f, newPitch));
 
-        // Clamp pitch
-        newPitch = std::max(-90.f, std::min(90.f, newPitch));
-
-        // Apply
         Minecraft::SetYaw(env, player, newYaw);
         Minecraft::SetPitch(env, player, newPitch);
     }
@@ -132,14 +118,14 @@ public:
     void RenderSettings() override {
         ImGui::SliderFloat("Yaw Speed", &m_speed, 0.5f, 10.0f, "%.1f");
         ImGui::SliderFloat("Pitch Speed", &m_pitchSpeed, 0.5f, 10.0f, "%.1f");
-        ImGui::SliderFloat("FOV", &m_fov, 30.0f, 360.0f, "%.0f");
+        ImGui::SliderFloat("FOV", &m_fov, 20.0f, 360.0f, "%.0f");
         ImGui::SliderFloat("Range", &m_maxRange, 1.0f, 6.0f, "%.1f");
+        ImGui::SliderFloat("Aim Height", &m_aimHeight, 0.0f, 1.8f, "%.2f");
 
         const char* modes[] = { "Closest", "Lowest HP", "Crosshair" };
         ImGui::Combo("Target", &m_targetMode, modes, 3);
 
         ImGui::Separator();
-
         ImGui::Checkbox("Only While Clicking", &m_onlyWhileAttacking);
         ImGui::Checkbox("Smooth Yaw", &m_smoothYaw);
         ImGui::Checkbox("Smooth Pitch", &m_smoothPitch);
@@ -148,8 +134,12 @@ public:
         ImGui::TextDisabled("Anti-detection");
         ImGui::SliderFloat("Randomization", &m_randomization, 0.f, 40.f, "%.0f%%");
         ImGui::Checkbox("Aim Breaks", &m_breakAim);
-        if (m_breakAim) {
-            ImGui::SliderFloat("Break Chance", &m_breakChance, 1.f, 20.f, "%.0f%%");
+        if (m_breakAim)
+            ImGui::SliderFloat("Break Chance", &m_breakChance, 1.f, 25.f, "%.0f%%");
+
+        if (m_randomization < 5.f || !m_breakAim) {
+            ImGui::TextColored(ImVec4(1.f, 0.7f, 0.3f, 1.f),
+                "Low randomization is easy to fingerprint");
         }
     }
 };
