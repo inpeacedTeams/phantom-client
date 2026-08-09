@@ -1,5 +1,10 @@
 #pragma once
 #include <Windows.h>
+// WIN32_LEAN_AND_MEAN keeps mmsystem.h out of Windows.h, which is
+// where timeBeginPeriod normally lives. Pull in the timer API on
+// its own so the build does not fail on an undeclared identifier.
+#include <timeapi.h>
+
 #include <thread>
 #include <atomic>
 #include <mutex>
@@ -13,37 +18,36 @@
 // =================================================================
 // WHY THIS EXISTS
 //
-// Click timing was driven from the 20 TPS module loop, so the
-// smallest gap it could produce was one tick: 50ms. Every
+// Click timing used to be driven from the 20 TPS module loop, so
+// the smallest gap it could produce was one tick: 50ms. Every
 // "click after 27ms" request landed on the next 50ms boundary.
 //
-// The result was the exact opposite of the intent: a perfectly
-// flat 20 CPS stream with a standard deviation near zero, which
-// is the clearest possible machine signature. Butterfly pairs
-// (22-38ms apart) could not exist at all.
+// The result was the opposite of the intent: a perfectly flat
+// 20 CPS stream with a standard deviation near zero, which is the
+// clearest possible machine signature. Butterfly pairs, which sit
+// 22-38ms apart, could not exist at all.
 //
-// This runs clicks on their own thread at 1ms resolution:
-//   - timeBeginPeriod(1) raises the system timer resolution,
-//     otherwise Sleep() rounds up to ~15.6ms
-//   - a spin-wait covers the last 2ms, where Sleep is unreliable
-//   - the module supplies the next delay through a callback, so
-//     all the pattern logic stays where it belongs
+// Clicks now run on their own thread at 1ms resolution:
+//   - timeBeginPeriod(1) raises the system timer resolution;
+//     without it Sleep() rounds up to roughly 15.6ms
+//   - a short spin covers the last 2ms, where Sleep overshoots
+//   - the module supplies each delay through a callback, so all
+//     the pattern logic stays where it belongs
 //
-// The click itself goes out via SendInput, which the game reads
-// as a normal hardware mouse event.
+// The click itself goes out through SendInput, which the game
+// reads as an ordinary hardware mouse event.
 // =================================================================
 
 class ClickScheduler {
 public:
     // Returns the delay in ms before the next click.
-    // Return 0 to stop clicking until Resume() is called again.
     using DelayProvider = std::function<long long()>;
 
 private:
-    inline static std::thread        s_thread;
-    inline static std::atomic<bool>  s_running{ false };
-    inline static std::atomic<bool>  s_active{ false };   // emitting or idle
-    inline static std::atomic<bool>  s_rightButton{ false };
+    inline static std::thread       s_thread;
+    inline static std::atomic<bool> s_running{ false };
+    inline static std::atomic<bool> s_active{ false };
+    inline static std::atomic<bool> s_rightButton{ false };
 
     inline static DelayProvider s_provider;
     inline static std::mutex    s_providerMutex;
@@ -65,9 +69,9 @@ private:
         SendInput(2, in, sizeof(INPUT));
     }
 
-    // Sleep for most of it, then spin the remainder. Sleep alone
-    // overshoots by several ms even at 1ms timer resolution, which
-    // would flatten the distribution all over again.
+    // Sleep for most of the wait, then spin the remainder. Sleep on
+    // its own overshoots by several ms even at 1ms resolution, which
+    // would flatten the interval distribution all over again.
     static void PreciseWait(long long ms) {
         if (ms <= 0) return;
 
@@ -130,6 +134,8 @@ public:
         if (!s_running.exchange(false)) return;
         s_active.store(false);
         if (s_thread.joinable()) s_thread.join();
+        // Only clear the callback once the thread is joined: it
+        // captures a module pointer that is about to be destroyed.
         std::lock_guard<std::mutex> lock(s_providerMutex);
         s_provider = nullptr;
     }
@@ -147,8 +153,8 @@ public:
         s_provider = nullptr;
     }
 
-    static void SetActive(bool on)   { s_active.store(on); }
-    static bool IsActive()           { return s_active.load(); }
+    static void SetActive(bool on)     { s_active.store(on); }
+    static bool IsActive()             { return s_active.load(); }
     static void SetRightButton(bool r) { s_rightButton.store(r); }
-    static long long LastGap()       { return s_lastGap.load(); }
+    static long long LastGap()         { return s_lastGap.load(); }
 };
