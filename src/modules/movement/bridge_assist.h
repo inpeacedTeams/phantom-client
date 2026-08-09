@@ -1,107 +1,92 @@
 #pragma once
 #include "../module.h"
 #include "../../mc/minecraft.h"
-#include "../../jni/class_resolver.h"
-#include "../../jni/jvmti_util.h"
+#include "../../mc/keybinds.h"
 #include <imgui.h>
 #include <Windows.h>
 #include <cmath>
-#include <random>
 
 // =================================================================
 // Bridge Assist (AutoEagle)
 // =================================================================
-// Holds sneak when you reach the edge of the block you are standing
-// on, so you can bridge backwards without looking down or falling.
+// Holds sneak when you reach the edge of the block under you, so
+// you can bridge backwards without looking down or falling.
 //
-// Sneaking is a vanilla input. The packet stream is identical to a
-// player tapping shift, so there is nothing here for a server-side
-// anticheat to flag.
+// Driving keyBindSneak rather than setSneaking matters: the entity
+// flag is recomputed from the key every tick, so writing it直接
+// achieves nothing. Holding the key is also what makes this
+// undetectable, since the packet stream is a plain shift hold.
 //
 // MODES
 //   0 Eagle     sneak at the edge, release once clear
-//   1 Godbridge rapid sneak/unsneak for faster bridging
+//   1 Godbridge rapid sneak toggling for speed
 //   2 Breezily  single-tick sneak, fastest and least forgiving
 //   3 Safewalk  sneak at any edge, in any direction
 // =================================================================
 
 class BridgeAssist : public Module {
 private:
-    int   m_mode              = 0;
-    bool  m_onlyBackward      = true;
-    bool  m_onlyHoldingBlocks = false;  // needs the held-item chain
-    float m_edgeDistance      = 0.30f;
-    int   m_sneakTicks        = 2;
-    int   m_unsneakTicks      = 1;
+    int   m_mode         = 0;
+    bool  m_onlyBackward = true;
+    float m_edgeDistance = 0.30f;
+    int   m_sneakTicks   = 2;
+    int   m_unsneakTicks = 1;
 
-    bool  m_isSneaking  = false;
-    int   m_sneakCounter = 0;
-    bool  m_atEdge      = false;
+    bool m_sneaking     = false;
+    int  m_sneakCounter = 0;
+    bool m_atEdge       = false;
 
-    jmethodID m_setSneaking = nullptr;
-    bool m_resolved = false;
-
-    void ResolveJNI(JNIEnv* env) {
-        if (m_resolved) return;
-        if (ClassResolver::entity) {
-            // setSneaking(boolean) has a primitive signature, but go
-            // through JVMTI anyway so obfuscated names still resolve.
-            m_setSneaking = JvmtiUtil::FindMethod(env, ClassResolver::entity,
-                { "func_70095_a", "setSneaking" }, 1);
-        }
-        m_resolved = true;
+    void SetSneak(JNIEnv* env, bool on) {
+        if (m_sneaking == on) return;
+        KeyBinds::SetSneak(env, on);
+        m_sneaking = on;
     }
 
-    void SetSneak(JNIEnv* env, jobject player, bool on) {
-        if (!m_setSneaking) return;
-        env->CallVoidMethod(player, m_setSneaking, (jboolean)on);
-        if (env->ExceptionCheck()) env->ExceptionClear();
-        m_isSneaking = on;
-    }
-
-    // How far into the current block the player is. Being close to a
-    // boundary means the next step could take us off the edge.
+    // How deep into the current block we are. Sitting near a
+    // boundary means the next step could walk us off it.
     bool IsAtEdge(JNIEnv* env, jobject player) {
         double x = Minecraft::GetPosX(env, player);
         double z = Minecraft::GetPosZ(env, player);
-
         double fx = x - std::floor(x);
         double fz = z - std::floor(z);
-
         double d = (double)m_edgeDistance;
-        bool nearX = (fx < d) || (fx > 1.0 - d);
-        bool nearZ = (fz < d) || (fz > 1.0 - d);
-        return nearX || nearZ;
+        return (fx < d) || (fx > 1.0 - d) || (fz < d) || (fz > 1.0 - d);
     }
 
 public:
     BridgeAssist()
         : Module("Bridge Assist", "Auto-sneak at block edges while bridging",
-                 ModuleCategory::MOVEMENT, 0) {}
+                 ModuleCategory::MOVEMENT, 0)
+    {
+        Bind("Mode", &m_mode);
+        Bind("Only Backward", &m_onlyBackward);
+        Bind("Edge Distance", &m_edgeDistance);
+        Bind("Sneak Ticks", &m_sneakTicks);
+        Bind("Unsneak Ticks", &m_unsneakTicks);
+    }
 
     void OnTick(JNIEnv* env) override {
-        ResolveJNI(env);
+        if (!KeyBinds::Init(env)) return;
 
         jobject player = Minecraft::GetPlayer(env);
         if (!player) return;
-        if (Minecraft::IsInGui(env)) { if (m_isSneaking) SetSneak(env, player, false); return; }
 
-        // Sneaking mid-air looks wrong and does nothing useful
+        if (Minecraft::IsInGui(env)) { SetSneak(env, false); return; }
+
+        // Sneaking mid-air looks wrong and buys nothing
         if (!Minecraft::IsOnGround(env, player)) {
-            if (m_isSneaking) SetSneak(env, player, false);
+            SetSneak(env, false);
             m_sneakCounter = 0;
             return;
         }
 
-        bool backward = (GetAsyncKeyState('S') & 0x8000) != 0;
-        bool anyDir = backward
-                   || (GetAsyncKeyState('W') & 0x8000)
-                   || (GetAsyncKeyState('A') & 0x8000)
-                   || (GetAsyncKeyState('D') & 0x8000);
+        bool back = KeyBinds::GetBack(env);
+        bool any  = back || KeyBinds::GetForward(env)
+                 || KeyBinds::GetLeft(env) || KeyBinds::GetRight(env);
 
-        bool active = m_onlyBackward ? backward : anyDir;
+        bool active = m_onlyBackward ? back : any;
         if (!active) {
-            if (m_isSneaking) SetSneak(env, player, false);
+            SetSneak(env, false);
             m_sneakCounter = 0;
             return;
         }
@@ -110,37 +95,29 @@ public:
 
         switch (m_mode) {
             case 1: {   // Godbridge
-                if (!m_atEdge) {
-                    if (m_isSneaking) SetSneak(env, player, false);
-                    m_sneakCounter = 0;
-                    break;
-                }
+                if (!m_atEdge) { SetSneak(env, false); m_sneakCounter = 0; break; }
                 m_sneakCounter++;
-                int limit = m_isSneaking ? m_sneakTicks : m_unsneakTicks;
+                int limit = m_sneaking ? m_sneakTicks : m_unsneakTicks;
                 if (m_sneakCounter >= limit) {
-                    SetSneak(env, player, !m_isSneaking);
+                    SetSneak(env, !m_sneaking);
                     m_sneakCounter = 0;
                 }
                 break;
             }
-            case 2: {   // Breezily: one tick only
-                if (m_atEdge) SetSneak(env, player, !m_isSneaking);
-                else if (m_isSneaking) SetSneak(env, player, false);
+            case 2: {   // Breezily
+                if (m_atEdge) SetSneak(env, !m_sneaking);
+                else          SetSneak(env, false);
                 break;
             }
-            default: {  // Eagle and Safewalk share the same logic
-                if (m_atEdge && !m_isSneaking)       SetSneak(env, player, true);
-                else if (!m_atEdge && m_isSneaking)  SetSneak(env, player, false);
+            default: {  // Eagle and Safewalk
+                SetSneak(env, m_atEdge);
                 break;
             }
         }
     }
 
     void OnDisable(JNIEnv* env) override {
-        if (!m_isSneaking) return;
-        jobject player = Minecraft::GetPlayer(env);
-        if (player) SetSneak(env, player, false);
-        m_isSneaking = false;
+        SetSneak(env, false);
         m_sneakCounter = 0;
     }
 
@@ -158,17 +135,16 @@ public:
 
         ImGui::Separator();
         switch (m_mode) {
-            case 0: ImGui::TextWrapped("Eagle: sneak at the edge, release once clear."); break;
-            case 1: ImGui::TextWrapped("Godbridge: rapid sneak toggling for speed."); break;
-            case 2: ImGui::TextWrapped("Breezily: single-tick sneak. Fastest, least forgiving."); break;
-            case 3: ImGui::TextWrapped("Safewalk: sneak at any edge, any direction."); break;
+            case 0: ImGui::TextWrapped("Sneak at the edge, release once clear."); break;
+            case 1: ImGui::TextWrapped("Rapid sneak toggling for faster bridging."); break;
+            case 2: ImGui::TextWrapped("Single-tick sneak. Fastest, least forgiving."); break;
+            case 3: ImGui::TextWrapped("Sneak at any edge, any direction."); break;
         }
-
         ImGui::TextDisabled(m_atEdge ? "At edge" : "Clear");
 
-        if (!m_setSneaking) {
+        if (!KeyBinds::HasSneak()) {
             ImGui::TextColored(ImVec4(1.f, 0.8f, 0.3f, 1.f),
-                "setSneaking unresolved: module inactive");
+                "Sneak keybind unresolved: module inactive");
         }
     }
 };
