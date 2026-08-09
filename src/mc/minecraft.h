@@ -8,25 +8,17 @@
 #include "../jni/jvmti_util.h"
 
 // =================================================================
-// Minecraft — JNI wrapper around the game singleton and entities
+// Minecraft — the game singleton and entity accessors
 // =================================================================
-// Field lookups go through JvmtiUtil so obfuscated signatures do not
-// matter. Candidate names are listed SRG first, then MCP.
+// Field lookups go through JvmtiUtil, because GetFieldID needs an
+// exact signature and Minecraft's are obfuscated (thePlayer is
+// Lbew;, not anything guessable). JVMTI hands us the real signature
+// so the same code works across Lunar builds.
 //
-// KEYBINDINGS
-// Our client thread is not synchronised with Minecraft's tick, so
-// writing moveForward / moveStrafing directly is a race: the game
-// overwrites those fields from its own input pass every tick and we
-// have no idea whether we landed before or after it.
-//
-// Driving KeyBinding.pressed instead is both reliable and safer.
-// Minecraft reads the keybind during its own input pass and emits
-// exactly the packets a real key hold produces.
+// KeyBindings deliberately live in mc/keybinds.h, not here. That
+// class tracks which keys we overrode so it can hand them back to
+// the player cleanly.
 // =================================================================
-
-enum class GameKey {
-    Forward, Back, Left, Right, Jump, Sneak, Sprint, UseItem, Attack
-};
 
 class Minecraft {
 private:
@@ -55,38 +47,12 @@ private:
     // Timer
     inline static jfieldID fRenderPartialTicks = nullptr;
 
-    // KeyBinding.pressed
-    inline static jfieldID fKeyPressed = nullptr;
-
-    // Cached KeyBinding globals
-    inline static jobject gKeyForward = nullptr;
-    inline static jobject gKeyBack    = nullptr;
-    inline static jobject gKeyLeft    = nullptr;
-    inline static jobject gKeyRight   = nullptr;
-    inline static jobject gKeyJump    = nullptr;
-    inline static jobject gKeySneak   = nullptr;
-    inline static jobject gKeySprint  = nullptr;
-    inline static jobject gKeyUseItem = nullptr;
-    inline static jobject gKeyAttack  = nullptr;
-
     inline static jmethodID mGetMinecraft = nullptr;
 
     inline static jobject gMinecraft    = nullptr;
     inline static jobject gGameSettings = nullptr;
 
     inline static bool s_ready = false;
-
-    static jobject CacheKey(JNIEnv* env, jobject gs,
-                           std::initializer_list<const char*> names) {
-        if (!gs || !ClassResolver::gameSettings) return nullptr;
-        jfieldID f = JvmtiUtil::FindField(env, ClassResolver::gameSettings, names);
-        if (!f) return nullptr;
-        jobject kb = env->GetObjectField(gs, f);
-        if (!kb) return nullptr;
-        jobject g = env->NewGlobalRef(kb);
-        env->DeleteLocalRef(kb);
-        return g;
-    }
 
 public:
     static bool IsReady() { return s_ready; }
@@ -137,13 +103,8 @@ public:
                 { "field_74281_c", "renderPartialTicks" });
         }
 
-        if (ClassResolver::keyBinding) {
-            fKeyPressed = JvmtiUtil::FindField(env, ClassResolver::keyBinding,
-                { "field_74513_e", "pressed" });
-        }
-
-        // Cache the singleton so accessors stop allocating a local ref
-        // on every call.
+        // Cache the singleton so accessors stop allocating a local
+        // ref on every call.
         jobject inst = FetchInstance(env);
         if (inst) {
             gMinecraft = env->NewGlobalRef(inst);
@@ -153,17 +114,6 @@ public:
                 jobject gs = env->GetObjectField(gMinecraft, fGameSettings);
                 if (gs) {
                     gGameSettings = env->NewGlobalRef(gs);
-
-                    gKeyForward = CacheKey(env, gs, { "field_74351_w", "keyBindForward" });
-                    gKeyBack    = CacheKey(env, gs, { "field_74368_y", "keyBindBack" });
-                    gKeyLeft    = CacheKey(env, gs, { "field_74370_x", "keyBindLeft" });
-                    gKeyRight   = CacheKey(env, gs, { "field_74366_z", "keyBindRight" });
-                    gKeyJump    = CacheKey(env, gs, { "field_74314_A", "keyBindJump" });
-                    gKeySneak   = CacheKey(env, gs, { "field_74311_E", "keyBindSneak" });
-                    gKeySprint  = CacheKey(env, gs, { "field_151444_V", "keyBindSprint" });
-                    gKeyUseItem = CacheKey(env, gs, { "field_74313_G", "keyBindUseItem" });
-                    gKeyAttack  = CacheKey(env, gs, { "field_74312_F", "keyBindAttack" });
-
                     env->DeleteLocalRef(gs);
                 }
             }
@@ -171,27 +121,19 @@ public:
 
         s_ready = (gMinecraft != nullptr && fThePlayer != nullptr);
 
-        printf("[MC] ready=%d player=%p screen=%p posX=%p yaw=%p keys=%p/%p/%p\n",
-            (int)s_ready, (void*)fThePlayer, (void*)fCurrentScreen,
-            (void*)fPosX, (void*)fYaw,
-            (void*)gKeyForward, (void*)gKeyJump, (void*)gKeySneak);
+        printf("[MC] ready=%d player=%p world=%p screen=%p posX=%p yaw=%p hurt=%p\n",
+            (int)s_ready, (void*)fThePlayer, (void*)fTheWorld, (void*)fCurrentScreen,
+            (void*)fPosX, (void*)fYaw, (void*)fHurtTime);
 
         if (!fCurrentScreen)
             printf("[MC] WARN: currentScreen unresolved, GUI checks disabled\n");
-        if (!fKeyPressed)
-            printf("[MC] WARN: KeyBinding.pressed unresolved, input modules inactive\n");
 
         return s_ready;
     }
 
     static void Shutdown(JNIEnv* env) {
-        jobject* refs[] = { &gMinecraft, &gGameSettings,
-                            &gKeyForward, &gKeyBack, &gKeyLeft, &gKeyRight,
-                            &gKeyJump, &gKeySneak, &gKeySprint,
-                            &gKeyUseItem, &gKeyAttack };
-        for (jobject* r : refs) {
-            if (*r) { env->DeleteGlobalRef(*r); *r = nullptr; }
-        }
+        if (gMinecraft)    { env->DeleteGlobalRef(gMinecraft);    gMinecraft = nullptr; }
+        if (gGameSettings) { env->DeleteGlobalRef(gGameSettings); gGameSettings = nullptr; }
         s_ready = false;
     }
 
@@ -213,40 +155,7 @@ public:
         return env->GetObjectField(gMinecraft, fPlayerController);
     }
 
-    // ---- Key bindings ----
-    static jobject GetKeyBind(GameKey k) {
-        switch (k) {
-            case GameKey::Forward: return gKeyForward;
-            case GameKey::Back:    return gKeyBack;
-            case GameKey::Left:    return gKeyLeft;
-            case GameKey::Right:   return gKeyRight;
-            case GameKey::Jump:    return gKeyJump;
-            case GameKey::Sneak:   return gKeySneak;
-            case GameKey::Sprint:  return gKeySprint;
-            case GameKey::UseItem: return gKeyUseItem;
-            case GameKey::Attack:  return gKeyAttack;
-        }
-        return nullptr;
-    }
-
-    static bool HasKeyBinds() { return fKeyPressed != nullptr && gKeyForward != nullptr; }
-
-    static void SetKeyPressed(JNIEnv* env, GameKey k, bool pressed) {
-        jobject kb = GetKeyBind(k);
-        if (!kb || !fKeyPressed) return;
-        env->SetBooleanField(kb, fKeyPressed, (jboolean)pressed);
-    }
-
-    static bool IsKeyPressed(JNIEnv* env, GameKey k) {
-        jobject kb = GetKeyBind(k);
-        if (!kb || !fKeyPressed) return false;
-        return env->GetBooleanField(kb, fKeyPressed) != 0;
-    }
-
-    // Backwards-compatible alias used by AutoBlockhit
-    static jobject GetKeyBindUseItem(JNIEnv*) { return gKeyUseItem; }
-
-    // ---- Position / rotation ----
+    // ---- Position and rotation ----
     static double GetPosX(JNIEnv* env, jobject e) { return fPosX ? env->GetDoubleField(e, fPosX) : 0.0; }
     static double GetPosY(JNIEnv* env, jobject e) { return fPosY ? env->GetDoubleField(e, fPosY) : 0.0; }
     static double GetPosZ(JNIEnv* env, jobject e) { return fPosZ ? env->GetDoubleField(e, fPosZ) : 0.0; }
@@ -319,9 +228,9 @@ public:
     }
 
     // ---- State ----
-    // Returns true only when a screen is actually open. If the field
-    // could not be resolved we return false so modules still run,
-    // rather than silently disabling the whole client.
+    // True only when a screen is actually open. If the field could
+    // not be resolved we return false so modules still run, rather
+    // than silently disabling the whole client.
     static bool IsInGui(JNIEnv* env) {
         if (!gMinecraft || !fCurrentScreen) return false;
         jobject screen = env->GetObjectField(gMinecraft, fCurrentScreen);
