@@ -5,6 +5,7 @@
 #include <imgui.h>
 #include <imgui_impl_opengl2.h>
 #include <imgui_impl_win32.h>
+#include <atomic>
 #include <cstdio>
 
 #include "../gui/menu.h"
@@ -14,23 +15,47 @@ extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND, UINT, WPARAM,
 
 typedef BOOL(WINAPI* fnWglSwapBuffers)(HDC);
 
+// =================================================================
+// GLHook
+// =================================================================
+// Hooks wglSwapBuffers, creates a second GL context that shares the
+// game's objects, draws ImGui into it, then restores the original
+// context before letting the real swap through.
+//
+// EJECT IS THE DANGEROUS PART
+// The render thread runs this hook while the client thread tears
+// everything down. Previously Remove() just slept 120ms and hoped:
+// if a frame was still inside Menu::Render() when ModuleManager
+// cleared its module list, the render thread walked freed memory
+// and the game crashed on eject.
+//
+// Now there is a shutdown flag plus an in-flight counter. Remove()
+// raises the flag, waits for the counter to reach zero, and only
+// then destroys anything.
+// =================================================================
+
 class GLHook {
 private:
     inline static fnWglSwapBuffers oSwapBuffers = nullptr;
-    inline static WNDPROC  oWndProc     = nullptr;
-    inline static HWND     gameWindow   = nullptr;
-    inline static HGLRC    imguiContext = nullptr;
-    inline static bool     initialized  = false;
-    inline static bool     menuOpen     = false;
-    inline static void*    pSwapBuffers = nullptr;
+    inline static WNDPROC oWndProc     = nullptr;
+    inline static HWND    gameWindow   = nullptr;
+    inline static HGLRC   imguiContext = nullptr;
+    inline static void*   pSwapBuffers = nullptr;
+
+    inline static std::atomic<bool> s_ready{ false };
+    inline static std::atomic<bool> s_shuttingDown{ false };
+    inline static std::atomic<int>  s_inFlight{ 0 };
+    inline static std::atomic<bool> s_menuOpen{ false };
 
     static LRESULT CALLBACK HookedWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
-        if (msg == WM_KEYDOWN && wParam == VK_INSERT) {
-            menuOpen = !menuOpen;
+        if (msg == WM_KEYDOWN && wParam == VK_INSERT && !s_shuttingDown.load()) {
+            s_menuOpen.store(!s_menuOpen.load());
             return 0;
         }
 
-        if (initialized && menuOpen) {
+        // Never touch ImGui once teardown has started: the context
+        // may already be gone.
+        if (s_ready.load() && !s_shuttingDown.load() && s_menuOpen.load()) {
             ImGui_ImplWin32_WndProcHandler(hWnd, msg, wParam, lParam);
 
             ImGuiIO& io = ImGui::GetIO();
@@ -57,16 +82,15 @@ private:
         gameWindow = WindowFromDC(hdc);
         if (!gameWindow) return false;
 
-        // Create our own context and share the game's objects with it.
-        // wglShareLists must run BEFORE the new context is ever made
-        // current, otherwise it fails.
+        // wglShareLists has to run before the new context is ever
+        // made current, otherwise it fails.
         imguiContext = wglCreateContext(hdc);
         if (!imguiContext) {
             printf("[GLHook] wglCreateContext failed (%lu)\n", GetLastError());
             return false;
         }
         if (!wglShareLists(gameCtx, imguiContext)) {
-            printf("[GLHook] wglShareLists failed (%lu), continuing anyway\n", GetLastError());
+            printf("[GLHook] wglShareLists failed (%lu), continuing\n", GetLastError());
         }
 
         if (!wglMakeCurrent(hdc, imguiContext)) {
@@ -82,6 +106,9 @@ private:
 
         if (!ImGui_ImplWin32_Init(gameWindow) || !ImGui_ImplOpenGL2_Init()) {
             printf("[GLHook] ImGui backend init failed\n");
+            ImGui::DestroyContext();
+            wglDeleteContext(imguiContext);
+            imguiContext = nullptr;
             return false;
         }
 
@@ -90,7 +117,7 @@ private:
         oWndProc = (WNDPROC)SetWindowLongPtrA(gameWindow, GWLP_WNDPROC,
                                               (LONG_PTR)HookedWndProc);
 
-        // Keybinds should only fire while this window is focused
+        // Keybinds only fire while this window has focus
         ModuleManager::SetGameWindow(gameWindow);
 
         printf("[GLHook] ImGui ready (hwnd %p)\n", (void*)gameWindow);
@@ -98,38 +125,48 @@ private:
     }
 
     static BOOL WINAPI HookedSwapBuffers(HDC hdc) {
+        // Teardown in progress: pass straight through, touch nothing
+        if (s_shuttingDown.load()) return oSwapBuffers(hdc);
+
         HGLRC gameCtx = wglGetCurrentContext();
         HDC   gameDC  = wglGetCurrentDC();
-
         if (!gameCtx) return oSwapBuffers(hdc);
 
-        if (!initialized) {
-            if (!InitImGui(hdc, gameCtx)) {
-                wglMakeCurrent(gameDC, gameCtx);
-                return oSwapBuffers(hdc);
-            }
-            initialized = true;
-        }
+        s_inFlight.fetch_add(1);
 
-        if (!wglMakeCurrent(hdc, imguiContext)) {
+        // Re-check: Remove() may have raised the flag between the
+        // first check and the counter going up.
+        if (s_shuttingDown.load()) {
+            s_inFlight.fetch_sub(1);
             return oSwapBuffers(hdc);
         }
 
-        ImGui_ImplOpenGL2_NewFrame();
-        ImGui_ImplWin32_NewFrame();
-        ImGui::NewFrame();
+        if (!s_ready.load()) {
+            if (!InitImGui(hdc, gameCtx)) {
+                wglMakeCurrent(gameDC, gameCtx);
+                s_inFlight.fetch_sub(1);
+                return oSwapBuffers(hdc);
+            }
+            s_ready.store(true);
+        }
 
-        // World overlays draw every frame; the menu only when open.
-        Menu::RenderOverlays();
-        Menu::RenderHUD();
-        if (menuOpen) Menu::Render();
+        if (wglMakeCurrent(hdc, imguiContext)) {
+            ImGui_ImplOpenGL2_NewFrame();
+            ImGui_ImplWin32_NewFrame();
+            ImGui::NewFrame();
 
-        ImGui::Render();
-        ImGui_ImplOpenGL2_RenderDrawData(ImGui::GetDrawData());
+            Menu::RenderOverlays();          // world overlays, every frame
+            Menu::RenderHUD();
+            if (s_menuOpen.load()) Menu::Render();
 
-        // Hand the game back exactly the context it had
-        wglMakeCurrent(gameDC, gameCtx);
+            ImGui::Render();
+            ImGui_ImplOpenGL2_RenderDrawData(ImGui::GetDrawData());
 
+            // Give the game back exactly the context it had
+            wglMakeCurrent(gameDC, gameCtx);
+        }
+
+        s_inFlight.fetch_sub(1);
         return oSwapBuffers(hdc);
     }
 
@@ -148,7 +185,7 @@ public:
 
         pSwapBuffers = (void*)GetProcAddress(hGL, "wglSwapBuffers");
         if (!pSwapBuffers) {
-            printf("[GLHook] wglSwapBuffers not found\n");
+            printf("[GLHook] wglSwapBuffers not exported\n");
             return false;
         }
 
@@ -166,22 +203,33 @@ public:
         return true;
     }
 
+    // Safe to call from the client thread while the render thread is
+    // still drawing. Returns only once no frame is inside the hook.
     static void Remove() {
+        s_shuttingDown.store(true);
+
         if (pSwapBuffers) MH_DisableHook(pSwapBuffers);
 
-        // Let any in-flight frame finish before tearing ImGui down
-        Sleep(120);
+        // Wait out any frame already past the flag check. A stuck
+        // render thread should not hang the eject, so cap the wait.
+        for (int i = 0; i < 200 && s_inFlight.load() > 0; i++) Sleep(5);
+
+        if (s_inFlight.load() > 0) {
+            printf("[GLHook] WARN: a frame is still in flight, skipping ImGui teardown\n");
+            MH_Uninitialize();
+            return;   // leaking the context beats crashing the game
+        }
 
         if (gameWindow && oWndProc) {
             SetWindowLongPtrA(gameWindow, GWLP_WNDPROC, (LONG_PTR)oWndProc);
             oWndProc = nullptr;
         }
 
-        if (initialized) {
+        if (s_ready.load()) {
             ImGui_ImplOpenGL2_Shutdown();
             ImGui_ImplWin32_Shutdown();
             ImGui::DestroyContext();
-            initialized = false;
+            s_ready.store(false);
         }
 
         if (imguiContext) {
@@ -192,7 +240,7 @@ public:
         MH_Uninitialize();
     }
 
-    static bool IsMenuOpen() { return menuOpen; }
-    static void SetMenuOpen(bool v) { menuOpen = v; }
+    static bool IsMenuOpen() { return s_menuOpen.load(); }
+    static void SetMenuOpen(bool v) { s_menuOpen.store(v); }
     static HWND GetWindow() { return gameWindow; }
 };
