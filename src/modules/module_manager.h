@@ -6,6 +6,8 @@
 #include <functional>
 #include <Windows.h>
 #include "module.h"
+#include "../mc/keybinds.h"
+#include "../input/click_scheduler.h"
 
 // Combat
 #include "combat/aim_assist.h"
@@ -42,6 +44,11 @@
 //
 // Every tick runs inside a JNI local frame. Without it the local
 // reference table fills up within seconds and the JVM aborts.
+//
+// KEY SAFETY
+// Modules hold real keybinds down. If the world goes away or we
+// eject while a key is held, the player is left walking into a wall
+// with no way to stop, so every exit path releases them.
 // =================================================================
 
 class ModuleManager {
@@ -54,6 +61,7 @@ private:
 
     inline static HWND s_gameWindow = nullptr;
     inline static std::shared_ptr<ESP> s_esp;
+    inline static bool s_wasInGame = false;
 
 public:
     static void Init() {
@@ -78,9 +86,17 @@ public:
         s_esp = std::make_shared<ESP>();
         s_modules.push_back(s_esp);
         s_modules.push_back(std::make_shared<Fullbright>());
+
+        // Click emission runs on its own 1ms-resolution thread; the
+        // 20 TPS loop cannot express a 27ms gap.
+        ClickScheduler::Start();
     }
 
-    static void SetGameWindow(HWND hwnd) { s_gameWindow = hwnd; }
+    static void SetGameWindow(HWND hwnd) {
+        s_gameWindow = hwnd;
+        ClickScheduler::SetWindow(hwnd);
+    }
+
     static std::shared_ptr<ESP> GetESP() { return s_esp; }
 
     template <typename T>
@@ -104,8 +120,19 @@ public:
         QueueAction([mod](JNIEnv* env) { mod->Toggle(env); });
     }
 
+    // Disconnecting mid-fight used to leave forward or sneak held,
+    // which follows you into the next game. Modules stay enabled;
+    // only the physical key state is dropped.
+    static void OnLeaveWorld(JNIEnv* env) {
+        if (!s_wasInGame) return;
+        s_wasInGame = false;
+        ClickScheduler::SetActive(false);
+        if (env) KeyBinds::ReleaseAll(env);
+    }
+
     static void Tick(JNIEnv* env) {
         if (!env) return;
+        s_wasInGame = true;
 
         // Room for the refs this tick allocates. PopLocalFrame frees
         // every one of them, including anything the modules made.
@@ -154,11 +181,19 @@ public:
     }
 
     static void Shutdown(JNIEnv* env) {
+        // Stop the click thread before the modules go away: its
+        // callback captures a module pointer.
+        ClickScheduler::Stop();
+
         if (env) {
             // Disable everything so modules release the keybinds they
             // took over instead of leaving keys stuck down.
             for (auto& mod : s_modules)
                 if (mod->IsEnabled()) mod->SetEnabled(false, env);
+
+            // Backstop: a module that threw during OnDisable would
+            // still have left something held.
+            KeyBinds::ReleaseAll(env);
         }
         {
             std::lock_guard<std::mutex> lock(s_actionMutex);
