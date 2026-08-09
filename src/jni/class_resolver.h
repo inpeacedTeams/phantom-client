@@ -4,163 +4,198 @@
 #include <string>
 #include <cstdio>
 
-// Lunar uses a custom classloader, so env->FindClass() won't work
-// for Minecraft classes. We enumerate all loaded classes via JVMTI
-// and identify them by their unique fields/methods.
+#include "jvmti_util.h"
+
+// =================================================================
+// ClassResolver
+// =================================================================
+// Lunar uses a custom classloader, so env->FindClass() cannot see
+// Minecraft classes. We enumerate every loaded class through JVMTI
+// and identify them by the fields they declare.
+//
+// Field matching is done by NAME ONLY (via JvmtiUtil), because the
+// signatures are obfuscated and unknowable ahead of time.
+// =================================================================
 
 class ClassResolver {
 public:
-    inline static jclass mcClass           = nullptr; // Minecraft
-    inline static jclass entityPlayerSP    = nullptr; // EntityPlayerSP
-    inline static jclass entityPlayer      = nullptr; // EntityPlayer
-    inline static jclass entityLivingBase  = nullptr; // EntityLivingBase
-    inline static jclass entity            = nullptr; // Entity
-    inline static jclass world             = nullptr; // World
-    inline static jclass worldClient       = nullptr; // WorldClient
-    inline static jclass playerController  = nullptr; // PlayerControllerMP
-    inline static jclass renderManager     = nullptr; // RenderManager
-    inline static jclass activeRenderInfo  = nullptr; // ActiveRenderInfo
-    inline static jclass gameSettings      = nullptr; // GameSettings
-    inline static jclass timerClass        = nullptr; // Timer
-    inline static jclass axisAlignedBB     = nullptr; // AxisAlignedBB
-    inline static jclass networkManager    = nullptr; // NetworkManager
-    inline static jclass inventoryPlayer   = nullptr; // InventoryPlayer
-    inline static jclass itemStack         = nullptr; // ItemStack
+    inline static jclass mcClass          = nullptr; // Minecraft
+    inline static jclass entityPlayerSP   = nullptr; // EntityPlayerSP
+    inline static jclass entityPlayer     = nullptr; // EntityPlayer
+    inline static jclass entityLivingBase = nullptr; // EntityLivingBase
+    inline static jclass entity           = nullptr; // Entity
+    inline static jclass world            = nullptr; // World / WorldClient
+    inline static jclass playerController = nullptr; // PlayerControllerMP
+    inline static jclass gameSettings     = nullptr; // GameSettings
+    inline static jclass keyBinding       = nullptr; // KeyBinding
+    inline static jclass timerClass       = nullptr; // Timer
+
+    inline static bool resolved = false;
 
     static bool ResolveAll(JNIEnv* env) {
-        JavaVM* vm;
-        env->GetJavaVM(&vm);
+        if (resolved) return mcClass != nullptr;
 
-        jvmtiEnv* jvmti = nullptr;
-        if (vm->GetEnv((void**)&jvmti, JVMTI_VERSION_1_2) != JNI_OK || !jvmti) {
-            printf("[Resolver] JVMTI not available\n");
+        jvmtiEnv* jvmti = JvmtiUtil::Get(env);
+        if (!jvmti) {
+            printf("[Resolver] JVMTI unavailable\n");
             return false;
         }
 
         jint classCount = 0;
         jclass* classes = nullptr;
-        jvmti->GetLoadedClasses(&classCount, &classes);
+        if (jvmti->GetLoadedClasses(&classCount, &classes) != JVMTI_ERROR_NONE || !classes) {
+            printf("[Resolver] GetLoadedClasses failed\n");
+            return false;
+        }
         printf("[Resolver] Scanning %d loaded classes...\n", classCount);
 
-        // Mapping: we try both MCP (field_XXXXX) and Notch names
-        // Lunar 1.8.9 typically uses Notch mappings with some SRG
-
         for (jint i = 0; i < classCount; i++) {
-            char* sig = nullptr;
-            jvmti->GetClassSignature(classes[i], &sig, nullptr);
-            if (!sig) continue;
+            jclass c = classes[i];
 
-            std::string s(sig);
-
-            // Minecraft: has thePlayer/field_71439_g
-            if (!mcClass && (
-                HasField(env, classes[i], "thePlayer", "Ljava/lang/Object;") ||
-                HasField(env, classes[i], "field_71439_g", "Ljava/lang/Object;")
-            )) {
-                mcClass = (jclass)env->NewGlobalRef(classes[i]);
-                printf("[Resolver] Minecraft -> %s\n", sig);
+            // ---- Minecraft: declares both thePlayer and theWorld ----
+            if (!mcClass
+                && JvmtiUtil::HasField(env, c, "thePlayer")
+                && JvmtiUtil::HasField(env, c, "theWorld")) {
+                mcClass = (jclass)env->NewGlobalRef(c);
+                printf("[Resolver] Minecraft -> %s\n",
+                    JvmtiUtil::GetClassSignature(env, c).c_str());
+            }
+            if (!mcClass
+                && JvmtiUtil::HasField(env, c, "field_71439_g")
+                && JvmtiUtil::HasField(env, c, "field_71441_e")) {
+                mcClass = (jclass)env->NewGlobalRef(c);
+                printf("[Resolver] Minecraft (SRG) -> %s\n",
+                    JvmtiUtil::GetClassSignature(env, c).c_str());
             }
 
-            // EntityPlayerSP: has sendQueue/field_71174_a
-            if (!entityPlayerSP && (
-                HasField(env, classes[i], "sendQueue", "Ljava/lang/Object;") ||
-                HasField(env, classes[i], "field_71174_a", "Ljava/lang/Object;")
-            )) {
-                entityPlayerSP = (jclass)env->NewGlobalRef(classes[i]);
-                printf("[Resolver] EntityPlayerSP -> %s\n", sig);
+            // ---- EntityPlayerSP: declares sendQueue ----
+            if (!entityPlayerSP
+                && (JvmtiUtil::HasField(env, c, "sendQueue")
+                 || JvmtiUtil::HasField(env, c, "field_71174_a"))) {
+                entityPlayerSP = (jclass)env->NewGlobalRef(c);
+                printf("[Resolver] EntityPlayerSP -> %s\n",
+                    JvmtiUtil::GetClassSignature(env, c).c_str());
             }
 
-            // GameSettings: has gammaSetting/field_74333_Y
-            if (!gameSettings && (
-                HasFieldFloat(env, classes[i], "gammaSetting") ||
-                HasFieldFloat(env, classes[i], "field_74333_Y")
-            )) {
-                gameSettings = (jclass)env->NewGlobalRef(classes[i]);
-                printf("[Resolver] GameSettings -> %s\n", sig);
+            // ---- GameSettings: declares gammaSetting ----
+            if (!gameSettings
+                && (JvmtiUtil::HasField(env, c, "gammaSetting")
+                 || JvmtiUtil::HasField(env, c, "field_74333_Y"))) {
+                gameSettings = (jclass)env->NewGlobalRef(c);
+                printf("[Resolver] GameSettings -> %s\n",
+                    JvmtiUtil::GetClassSignature(env, c).c_str());
             }
 
-            // AxisAlignedBB: has minX, minY, minZ, maxX, maxY, maxZ
-            if (!axisAlignedBB && 
-                HasFieldDouble(env, classes[i], "minX") &&
-                HasFieldDouble(env, classes[i], "maxX")
-            ) {
-                axisAlignedBB = (jclass)env->NewGlobalRef(classes[i]);
-                printf("[Resolver] AxisAlignedBB -> %s\n", sig);
+            // ---- KeyBinding: declares pressed + keyCode ----
+            if (!keyBinding
+                && (JvmtiUtil::HasField(env, c, "pressed")
+                 || JvmtiUtil::HasField(env, c, "field_74513_e"))
+                && (JvmtiUtil::HasField(env, c, "keyCode")
+                 || JvmtiUtil::HasField(env, c, "field_74512_d"))) {
+                keyBinding = (jclass)env->NewGlobalRef(c);
+                printf("[Resolver] KeyBinding -> %s\n",
+                    JvmtiUtil::GetClassSignature(env, c).c_str());
             }
 
-            jvmti->Deallocate((unsigned char*)sig);
+            // ---- Timer: declares timerSpeed + renderPartialTicks ----
+            if (!timerClass
+                && (JvmtiUtil::HasField(env, c, "timerSpeed")
+                 || JvmtiUtil::HasField(env, c, "field_74278_d"))) {
+                timerClass = (jclass)env->NewGlobalRef(c);
+            }
+
+            // ---- PlayerControllerMP: declares curBlockDamageMP ----
+            if (!playerController
+                && (JvmtiUtil::HasField(env, c, "curBlockDamageMP")
+                 || JvmtiUtil::HasField(env, c, "field_78770_f"))) {
+                playerController = (jclass)env->NewGlobalRef(c);
+                printf("[Resolver] PlayerControllerMP -> %s\n",
+                    JvmtiUtil::GetClassSignature(env, c).c_str());
+            }
+
+            // ---- World: declares playerEntities + loadedEntityList ----
+            if (!world
+                && (JvmtiUtil::HasField(env, c, "playerEntities")
+                 || JvmtiUtil::HasField(env, c, "field_73010_i"))) {
+                world = (jclass)env->NewGlobalRef(c);
+                printf("[Resolver] World -> %s\n",
+                    JvmtiUtil::GetClassSignature(env, c).c_str());
+            }
         }
 
         jvmti->Deallocate((unsigned char*)classes);
 
-        // Resolve parent classes from EntityPlayerSP
+        // ---- Derive the entity hierarchy from EntityPlayerSP ----
+        // EntityPlayerSP -> AbstractClientPlayer -> EntityPlayer
+        //   -> EntityLivingBase -> Entity
+        // Depth varies between mappings, so identify each level by
+        // the fields it declares rather than by counting supers.
         if (entityPlayerSP) {
-            jclass superClass = env->GetSuperclass(entityPlayerSP);
-            if (superClass) {
-                entityPlayer = (jclass)env->NewGlobalRef(superClass);
-                printf("[Resolver] EntityPlayer -> (super of EntityPlayerSP)\n");
-
-                jclass super2 = env->GetSuperclass(superClass);
-                if (super2) {
-                    entityLivingBase = (jclass)env->NewGlobalRef(super2);
-                    printf("[Resolver] EntityLivingBase -> (super of EntityPlayer)\n");
-
-                    jclass super3 = env->GetSuperclass(super2);
-                    if (super3) {
-                        entity = (jclass)env->NewGlobalRef(super3);
-                        printf("[Resolver] Entity -> (super of EntityLivingBase)\n");
-                    }
+            jclass cur = env->GetSuperclass(entityPlayerSP);
+            while (cur) {
+                if (!entityPlayer
+                    && (JvmtiUtil::HasField(env, cur, "inventory")
+                     || JvmtiUtil::HasField(env, cur, "field_71071_by"))) {
+                    entityPlayer = (jclass)env->NewGlobalRef(cur);
+                    printf("[Resolver] EntityPlayer resolved\n");
                 }
+                if (!entityLivingBase
+                    && (JvmtiUtil::HasField(env, cur, "hurtTime")
+                     || JvmtiUtil::HasField(env, cur, "field_70737_aN"))) {
+                    entityLivingBase = (jclass)env->NewGlobalRef(cur);
+                    printf("[Resolver] EntityLivingBase resolved\n");
+                }
+                if (!entity
+                    && (JvmtiUtil::HasField(env, cur, "posX")
+                     || JvmtiUtil::HasField(env, cur, "field_70165_t"))) {
+                    entity = (jclass)env->NewGlobalRef(cur);
+                    printf("[Resolver] Entity resolved\n");
+                }
+
+                jclass super = env->GetSuperclass(cur);
+                env->DeleteLocalRef(cur);
+                cur = super;
             }
         }
 
-        bool success = (mcClass != nullptr);
-        if (!success) {
-            printf("[Resolver] FAILED: Could not find Minecraft class\n");
-            printf("[Resolver] Tip: dump all class names and search manually\n");
+        resolved = (mcClass != nullptr);
+
+        if (!resolved) {
+            printf("[Resolver] FAILED: Minecraft class not found.\n");
+            printf("[Resolver] Run DumpAllClasses() and search manually.\n");
+        } else {
+            printf("[Resolver] mc=%p player=%p living=%p entity=%p world=%p gs=%p kb=%p pc=%p\n",
+                (void*)mcClass, (void*)entityPlayerSP, (void*)entityLivingBase,
+                (void*)entity, (void*)world, (void*)gameSettings,
+                (void*)keyBinding, (void*)playerController);
         }
-        return success;
+        return resolved;
     }
 
-    // Utility: dump all class names to console (for reverse engineering)
+    // Some classes (World, PlayerController) only load once you join
+    // a server. Call this after the world exists to fill the gaps.
+    static void ResolveLate(JNIEnv* env) {
+        if (world && playerController && entity) return;
+        resolved = false;
+        // Clear only the ones still missing so we do not leak globals
+        ResolveAll(env);
+    }
+
     static void DumpAllClasses(JNIEnv* env) {
-        JavaVM* vm;
-        env->GetJavaVM(&vm);
-        jvmtiEnv* jvmti = nullptr;
-        vm->GetEnv((void**)&jvmti, JVMTI_VERSION_1_2);
+        jvmtiEnv* jvmti = JvmtiUtil::Get(env);
         if (!jvmti) return;
 
         jint count = 0;
         jclass* classes = nullptr;
-        jvmti->GetLoadedClasses(&count, &classes);
+        if (jvmti->GetLoadedClasses(&count, &classes) != JVMTI_ERROR_NONE) return;
 
         for (jint i = 0; i < count; i++) {
             char* sig = nullptr;
-            jvmti->GetClassSignature(classes[i], &sig, nullptr);
-            if (sig) {
+            if (jvmti->GetClassSignature(classes[i], &sig, nullptr) == JVMTI_ERROR_NONE && sig) {
                 printf("%s\n", sig);
                 jvmti->Deallocate((unsigned char*)sig);
             }
         }
         jvmti->Deallocate((unsigned char*)classes);
-    }
-
-private:
-    static bool HasField(JNIEnv* env, jclass cls, const char* name, const char* sig) {
-        jfieldID f = env->GetFieldID(cls, name, sig);
-        if (env->ExceptionCheck()) { env->ExceptionClear(); return false; }
-        return f != nullptr;
-    }
-
-    static bool HasFieldFloat(JNIEnv* env, jclass cls, const char* name) {
-        jfieldID f = env->GetFieldID(cls, name, "F");
-        if (env->ExceptionCheck()) { env->ExceptionClear(); return false; }
-        return f != nullptr;
-    }
-
-    static bool HasFieldDouble(JNIEnv* env, jclass cls, const char* name) {
-        jfieldID f = env->GetFieldID(cls, name, "D");
-        if (env->ExceptionCheck()) { env->ExceptionClear(); return false; }
-        return f != nullptr;
     }
 };
