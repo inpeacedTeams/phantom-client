@@ -37,20 +37,17 @@ private:
     float m_maxCPS       = 20.0f;
     bool  m_onlyInFight  = true;
 
-    // Butterfly
     int   m_pairGapMin     = 22;
     int   m_pairGapMax     = 38;
     int   m_restGapMin     = 62;
     int   m_restGapMax     = 98;
     float m_pairSkipChance = 6.0f;
 
-    // Drag
     int   m_burstLenMin = 3;
     int   m_burstLenMax = 7;
     int   m_burstGapMin = 90;
     int   m_burstGapMax = 170;
 
-    // Humanization
     bool  m_jitter         = true;
     float m_jitterAmount   = 26.0f;
     bool  m_fatigue        = true;
@@ -61,7 +58,6 @@ private:
     int   m_outlierAddMin  = 40;
     int   m_outlierAddMax  = 120;
 
-    // Safety
     int   m_hardFloorMs   = 24;
     bool  m_entropyGuard  = true;
     float m_minStdDev     = 9.0f;
@@ -69,7 +65,6 @@ private:
     float m_breakChance   = 8.0f;
     int   m_breakDuration = 5;
 
-    // Internal
     std::chrono::steady_clock::time_point m_lastClick;
     std::chrono::steady_clock::time_point m_holdStart;
     bool m_wasHolding = false;
@@ -87,7 +82,6 @@ private:
         std::uniform_int_distribution<int> d(lo, hi);
         return d(m_rng);
     }
-
     bool Roll(float pct) {
         std::uniform_real_distribution<float> d(0.f, 100.f);
         return d(m_rng) < pct;
@@ -123,7 +117,7 @@ private:
         if (m_outliers && Roll(m_outlierChance)) {
             delay += Rand(m_outlierAddMin, m_outlierAddMax);
         }
-        // If the recent stream has flattened out, widen it back up.
+        // If the recent stream flattened out, widen it back up.
         if (m_entropyGuard && CurrentStdDev() < m_minStdDev) {
             std::uniform_real_distribution<float> d(-m_minStdDev * 1.6f, m_minStdDev * 1.6f);
             delay += (long long)d(m_rng);
@@ -204,9 +198,37 @@ private:
 
 public:
     ClickAssist() : Module("Click Assist", "High CPS with human click timing",
-                           ModuleCategory::COMBAT, 0) {
+                           ModuleCategory::COMBAT, 0)
+    {
         m_lastClick = std::chrono::steady_clock::now();
         m_holdStart = m_lastClick;
+
+        Bind("Pattern", &m_pattern);
+        Bind("Min CPS", &m_minCPS);
+        Bind("Max CPS", &m_maxCPS);
+        Bind("Only While Clicking", &m_onlyInFight);
+        Bind("Pair Gap Min", &m_pairGapMin);
+        Bind("Pair Gap Max", &m_pairGapMax);
+        Bind("Rest Gap Min", &m_restGapMin);
+        Bind("Rest Gap Max", &m_restGapMax);
+        Bind("Pair Skip Chance", &m_pairSkipChance);
+        Bind("Burst Len Min", &m_burstLenMin);
+        Bind("Burst Len Max", &m_burstLenMax);
+        Bind("Burst Gap Min", &m_burstGapMin);
+        Bind("Burst Gap Max", &m_burstGapMax);
+        Bind("Jitter", &m_jitter);
+        Bind("Jitter Amount", &m_jitterAmount);
+        Bind("Fatigue", &m_fatigue);
+        Bind("Fatigue Rate", &m_fatigueRate);
+        Bind("Fatigue After", &m_fatigueAfterMs);
+        Bind("Outliers", &m_outliers);
+        Bind("Outlier Chance", &m_outlierChance);
+        Bind("Hard Floor", &m_hardFloorMs);
+        Bind("Entropy Guard", &m_entropyGuard);
+        Bind("Min Std Dev", &m_minStdDev);
+        Bind("Break Patterns", &m_breakPatterns);
+        Bind("Break Chance", &m_breakChance);
+        Bind("Break Duration", &m_breakDuration);
     }
 
     void OnTick(JNIEnv*) override {
@@ -276,9 +298,8 @@ public:
 
             float avgPair = (m_pairGapMin + m_pairGapMax) * 0.5f;
             float avgRest = (m_restGapMin + m_restGapMax) * 0.5f;
-            float est = 2000.0f / (avgPair + avgRest);
             ImGui::TextColored(ImVec4(0.4f, 1.f, 0.6f, 1.f),
-                "Estimated actual CPS: %.1f", est);
+                "Estimated actual CPS: %.1f", 2000.0f / (avgPair + avgRest));
         }
 
         if (m_pattern == 2) {
