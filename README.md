@@ -37,7 +37,9 @@ unit: `src/dllmain.cpp` plus the ImGui sources.
 ## How it works
 
 1. **JVM attach.** `JNI_GetCreatedJavaVMs` out of `jvm.dll`, then
-   `AttachCurrentThread` on our own client thread.
+   `AttachCurrentThreadAsDaemon`. Daemon matters: a non-daemon thread keeps the
+   JVM alive, so closing Minecraft without ejecting first would leave `javaw`
+   running as a zombie.
 2. **Class resolution.** Lunar uses a custom classloader, so `FindClass` cannot
    see Minecraft classes. We enumerate every loaded class through JVMTI and
    identify them by the fields they declare.
@@ -51,17 +53,45 @@ unit: `src/dllmain.cpp` plus the ImGui sources.
    the real keybind makes the outgoing packets identical to a human's.
 5. **Overlay.** MinHook on `wglSwapBuffers`. We create a second GL context,
    share lists with the game's, draw, then restore the original context.
-6. **Client loop.** 20 TPS to match Minecraft, since module delays are in ticks.
+
+## Timing
+
+Two clocks, because one is not enough.
+
+**Module loop, 20 TPS.** Matches Minecraft, since every module expresses its
+delays in ticks. Anything faster made a "2 tick" delay expire in 2ms.
+
+**Click scheduler, 1ms.** Clicks cannot come from the tick loop: the smallest
+gap it can express is 50ms, so every butterfly pair collapsed into a dead-flat
+20 CPS stream with near-zero variance, which is the clearest machine signature
+there is. `ClickScheduler` runs its own thread with `timeBeginPeriod(1)` plus a
+short spin for the final 2ms, and asks the module for each gap through a
+callback.
 
 ## Threading
 
 One rule: **JNI only ever runs on the client thread.**
 
 `ModuleManager::Tick` wraps each tick in a JNI local frame so the reference
-table cannot overflow. The render thread draws the menu and ESP but never calls
-JNI. Anything the UI needs a `JNIEnv` for (toggles, loading a profile) is pushed
-onto an action queue and executed on the client thread. ESP publishes a
-plain-data snapshot under a mutex for the renderer to read.
+table cannot overflow. The entity scan runs once per tick and is shared, rather
+than five modules each rebuilding it.
+
+The render thread draws the menu and ESP but never calls JNI. Anything the UI
+needs a `JNIEnv` for (toggles, loading a profile) goes onto an action queue and
+runs on the client thread. ESP publishes a plain-data snapshot under a mutex.
+
+The click scheduler is a third thread. It only touches its own state and
+`SendInput`, and it is stopped before the modules are destroyed because its
+callback captures a module pointer.
+
+**Eject ordering.** `GLHook::Remove()` raises a shutdown flag, waits for any
+in-flight frame to leave the hook, and only then destroys ImGui. It runs before
+`ModuleManager::Shutdown()`, otherwise the render thread would walk a module
+list that is being freed underneath it.
+
+**Held keys.** Modules hold real keybinds down. Leaving a world, disabling a
+module and ejecting all release them, so a disconnect mid-fight cannot leave you
+sprinting into a wall in the next game.
 
 ## Profiles
 
@@ -87,7 +117,7 @@ new tunable is one `Bind("Name", &field)` call in the constructor.
 | Auto Blockhit | Combat | Working. Drives `keyBindUseItem` |
 | Aim Assist | Combat | Working |
 | Hit Select | Combat | Working |
-| Click Assist | Combat | Working. Butterfly, drag, jitter |
+| Click Assist | Combat | Working. Butterfly, drag, jitter on the 1ms thread |
 | Kill Aura | Combat | Working. Loud, detected everywhere |
 | **Backtrack** | Combat | **Inert.** Needs a Netty packet hook |
 | Bridge Assist | Movement | Working |
@@ -106,16 +136,17 @@ new tunable is one `Bind("Name", &field)` call in the constructor.
   the ESP health bar falls back to full.
 - **Speed and Fly** will not survive a prediction anticheat. They are there for
   unprotected servers.
-- Config profiles live in code. There is no save/load to disk yet.
+- Profiles live in code. No save/load to disk yet.
+- Keybinds are fixed at compile time. No rebinding in the menu.
 
 ## Troubleshooting
 
 The DLL opens a console. If class resolution fails it dumps every loaded class
 signature so you can find the obfuscated names by hand, then extend the
-candidate lists in the module's `JvmtiUtil::FindField` call.
+candidate lists in that module's `JvmtiUtil::FindField` call.
 
-Injecting at the main menu is fine. Startup retries for 60 seconds, and
-keybinds and the entity list keep retrying quietly until a world loads.
+Injecting at the main menu is fine. Startup retries for 60 seconds, and keybinds
+and the entity list keep retrying quietly until a world loads.
 
 If a module prints "unresolved" in its settings panel, that lookup failed and
 the module is inert rather than silently doing nothing.
