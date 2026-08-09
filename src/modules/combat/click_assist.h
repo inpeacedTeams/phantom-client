@@ -1,10 +1,12 @@
 #pragma once
 #include "../module.h"
 #include <imgui.h>
+#include <Windows.h>
 #include <random>
 #include <chrono>
 #include <deque>
 #include <cmath>
+#include <algorithm>
 
 // =================================================================
 // Click Assist
@@ -13,72 +15,70 @@
 // What flags is the SHAPE of the click stream.
 //
 // Anticheats fingerprint clicking with:
-//   1. Standard deviation of intervals. Too low = machine.
-//   2. Kurtosis / outlier count. Humans produce stray long gaps.
-//   3. Double-click ratio. Butterfly makes tight PAIRS, not an
-//      even stream. A flat 50ms cadence at 20 CPS is impossible
-//      for a human hand.
-//   4. Drift over time. Real hands fatigue; CPS sags after a few
-//      seconds of sustained clicking.
-//   5. Sub-20ms intervals. Physically unreachable, instant flag.
+//   1. Standard deviation of intervals. Too low means machine.
+//   2. Outlier count. Humans produce stray long gaps.
+//   3. Double-click ratio. Butterfly makes tight PAIRS, not an even
+//      stream. A flat 50ms cadence at 20 CPS is not producible by
+//      a human hand.
+//   4. Drift over time. Real hands fatigue and CPS sags.
+//   5. Sub-20ms intervals, which are physically unreachable.
 //
-// PATTERNS:
-//   0 Normal    — single stream, gaussian intervals. Cap ~14 CPS
-//   1 Butterfly — two-finger pairs. The only honest way past 16
-//   2 Drag      — dense bursts with longer recovery gaps
-//   3 Jitter    — high variance single stream, mid CPS
+// PATTERNS
+//   0 Normal    single stream, gaussian intervals. Cap around 14
+//   1 Butterfly two-finger pairs. The only honest way past 16
+//   2 Drag      dense bursts with longer recovery gaps
+//   3 Jitter    high-variance single stream, mid CPS
 // =================================================================
 
 class ClickAssist : public Module {
 private:
-    // ---- Core ----
-    int   m_pattern       = 1;        // Butterfly
-    float m_minCPS        = 15.0f;
-    float m_maxCPS        = 20.0f;
-    bool  m_onlyInFight   = true;
+    int   m_pattern      = 1;
+    float m_minCPS       = 15.0f;
+    float m_maxCPS       = 20.0f;
+    bool  m_onlyInFight  = true;
 
-    // ---- Butterfly ----
-    int   m_pairGapMin    = 22;       // ms between the two clicks of a pair
-    int   m_pairGapMax    = 38;
-    int   m_restGapMin    = 62;       // ms between pairs
-    int   m_restGapMax    = 98;
-    float m_pairSkipChance = 6.0f;    // Sometimes a finger misses
+    // Butterfly
+    int   m_pairGapMin     = 22;
+    int   m_pairGapMax     = 38;
+    int   m_restGapMin     = 62;
+    int   m_restGapMax     = 98;
+    float m_pairSkipChance = 6.0f;
 
-    // ---- Drag ----
-    int   m_burstLenMin   = 3;
-    int   m_burstLenMax   = 7;
-    int   m_burstGapMin   = 90;
-    int   m_burstGapMax   = 170;
+    // Drag
+    int   m_burstLenMin = 3;
+    int   m_burstLenMax = 7;
+    int   m_burstGapMin = 90;
+    int   m_burstGapMax = 170;
 
-    // ---- Humanization ----
-    bool  m_jitter        = true;
-    float m_jitterAmount  = 26.0f;
-    bool  m_fatigue       = true;     // CPS sags during long holds
-    float m_fatigueRate   = 12.0f;    // % drop over the fatigue window
-    int   m_fatigueAfterMs = 2600;    // When the sag begins
-    bool  m_outliers      = true;     // Inject rare long gaps
-    float m_outlierChance = 4.0f;
-    int   m_outlierAddMin = 40;
-    int   m_outlierAddMax = 120;
+    // Humanization
+    bool  m_jitter         = true;
+    float m_jitterAmount   = 26.0f;
+    bool  m_fatigue        = true;
+    float m_fatigueRate    = 12.0f;
+    int   m_fatigueAfterMs = 2600;
+    bool  m_outliers       = true;
+    float m_outlierChance  = 4.0f;
+    int   m_outlierAddMin  = 40;
+    int   m_outlierAddMax  = 120;
 
-    // ---- Safety ----
-    int   m_hardFloorMs   = 24;       // Never click faster than this
-    bool  m_entropyGuard  = true;     // Force-inject variance if too flat
-    float m_minStdDev     = 9.0f;     // Target ms std-dev floor
+    // Safety
+    int   m_hardFloorMs   = 24;
+    bool  m_entropyGuard  = true;
+    float m_minStdDev     = 9.0f;
     bool  m_breakPatterns = true;
     float m_breakChance   = 8.0f;
     int   m_breakDuration = 5;
 
-    // ---- Internal ----
+    // Internal
     std::chrono::steady_clock::time_point m_lastClick;
     std::chrono::steady_clock::time_point m_holdStart;
-    bool  m_wasHolding    = false;
-    bool  m_inPair        = false;    // Second click of a butterfly pair pending
-    int   m_burstLeft     = 0;
-    bool  m_inBreak       = false;
-    int   m_breakCounter  = 0;
+    bool m_wasHolding = false;
+    bool m_inPair     = false;
+    int  m_burstLeft  = 0;
+    bool m_inBreak    = false;
+    int  m_breakCounter = 0;
     long long m_nextDelay = 60;
-    std::deque<long long> m_history;  // Recent intervals for entropy check
+    std::deque<long long> m_history;
 
     std::mt19937 m_rng{ std::random_device{}() };
 
@@ -95,12 +95,12 @@ private:
 
     float CurrentStdDev() const {
         if (m_history.size() < 6) return 999.f;
-        double mean = 0;
-        for (auto v : m_history) mean += v;
-        mean /= m_history.size();
-        double var = 0;
-        for (auto v : m_history) { double d = v - mean; var += d * d; }
-        var /= m_history.size();
+        double mean = 0.0;
+        for (auto v : m_history) mean += (double)v;
+        mean /= (double)m_history.size();
+        double var = 0.0;
+        for (auto v : m_history) { double d = (double)v - mean; var += d * d; }
+        var /= (double)m_history.size();
         return (float)std::sqrt(var);
     }
 
@@ -109,42 +109,42 @@ private:
         auto held = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - m_holdStart).count();
         if (held < m_fatigueAfterMs) return 1.0f;
-        // Ramp the sag in over ~4s past the threshold, then hold
-        float over = (float)(held - m_fatigueAfterMs) / 4000.f;
-        if (over > 1.f) over = 1.f;
-        return 1.0f - (m_fatigueRate / 100.f) * over;
+        float over = (float)(held - m_fatigueAfterMs) / 4000.0f;
+        if (over > 1.0f) over = 1.0f;
+        return 1.0f - (m_fatigueRate / 100.0f) * over;
     }
 
     long long ApplyNoise(long long delay) {
         if (m_jitter && m_jitterAmount > 0.f) {
-            float range = delay * (m_jitterAmount / 100.f);
+            float range = (float)delay * (m_jitterAmount / 100.0f);
             std::uniform_real_distribution<float> d(-range, range);
             delay += (long long)d(m_rng);
         }
         if (m_outliers && Roll(m_outlierChance)) {
             delay += Rand(m_outlierAddMin, m_outlierAddMax);
         }
-        // Entropy guard: if the recent stream is too regular, widen it
+        // If the recent stream has flattened out, widen it back up.
         if (m_entropyGuard && CurrentStdDev() < m_minStdDev) {
-            std::uniform_real_distribution<float> d(-m_minStdDev * 1.6f,
-                                                     m_minStdDev * 1.6f);
+            std::uniform_real_distribution<float> d(-m_minStdDev * 1.6f, m_minStdDev * 1.6f);
             delay += (long long)d(m_rng);
         }
-        if (delay < m_hardFloorMs) delay = m_hardFloorMs;
+        if (delay < (long long)m_hardFloorMs) delay = m_hardFloorMs;
         return delay;
     }
 
     long long ComputeNextDelay() {
         float fatigue = FatigueFactor();
+        if (fatigue < 0.3f) fatigue = 0.3f;
         long long delay;
 
         if (m_inBreak) {
-            delay = (long long)(1000.f / (m_minCPS * 0.55f));
-            return ApplyNoise(delay);
+            float c = m_minCPS * 0.55f;
+            if (c < 1.f) c = 1.f;
+            return ApplyNoise((long long)(1000.0f / c));
         }
 
         switch (m_pattern) {
-            case 1: { // Butterfly: tight pair, then a rest
+            case 1: {   // Butterfly
                 if (m_inPair) {
                     delay = Rand(m_pairGapMin, m_pairGapMax);
                     m_inPair = false;
@@ -152,36 +152,40 @@ private:
                     delay = Rand(m_restGapMin, m_restGapMax);
                     m_inPair = !Roll(m_pairSkipChance);
                 }
-                delay = (long long)(delay / fatigue);
+                delay = (long long)((float)delay / fatigue);
                 break;
             }
-            case 2: { // Drag: dense burst, longer recovery
+            case 2: {   // Drag
                 if (m_burstLeft > 0) {
                     m_burstLeft--;
-                    delay = (long long)(1000.f / m_maxCPS);
+                    float c = m_maxCPS < 1.f ? 1.f : m_maxCPS;
+                    delay = (long long)(1000.0f / c);
                 } else {
                     m_burstLeft = Rand(m_burstLenMin, m_burstLenMax);
                     delay = Rand(m_burstGapMin, m_burstGapMax);
                 }
-                delay = (long long)(delay / fatigue);
+                delay = (long long)((float)delay / fatigue);
                 break;
             }
-            case 3: { // Jitter: wide gaussian, single stream
+            case 3: {   // Jitter
                 float mean = (m_minCPS + m_maxCPS) * 0.5f * fatigue;
                 float sd   = (m_maxCPS - m_minCPS) * 0.42f;
+                if (sd < 0.1f) sd = 0.1f;
                 std::normal_distribution<float> d(mean, sd);
                 float cps = d(m_rng);
-                cps = std::max(1.f, cps);
-                delay = (long long)(1000.f / cps);
+                if (cps < 1.f) cps = 1.f;
+                delay = (long long)(1000.0f / cps);
                 break;
             }
-            default: { // Normal
+            default: {  // Normal
                 float mean = (m_minCPS + m_maxCPS) * 0.5f * fatigue;
                 float sd   = (m_maxCPS - m_minCPS) * 0.25f;
+                if (sd < 0.1f) sd = 0.1f;
                 std::normal_distribution<float> d(mean, sd);
                 float cps = d(m_rng);
                 cps = std::max(m_minCPS * 0.6f, std::min(m_maxCPS, cps));
-                delay = (long long)(1000.f / cps);
+                if (cps < 1.f) cps = 1.f;
+                delay = (long long)(1000.0f / cps);
                 break;
             }
         }
@@ -189,7 +193,7 @@ private:
         return ApplyNoise(delay);
     }
 
-    void Click() {
+    static void Click() {
         INPUT in[2] = {};
         in[0].type = INPUT_MOUSE;
         in[0].mi.dwFlags = MOUSEEVENTF_LEFTDOWN;
@@ -199,13 +203,13 @@ private:
     }
 
 public:
-    ClickAssist() : Module("Click Assist", "High-CPS clicking with human timing shape",
+    ClickAssist() : Module("Click Assist", "High CPS with human click timing",
                            ModuleCategory::COMBAT, 0) {
         m_lastClick = std::chrono::steady_clock::now();
         m_holdStart = m_lastClick;
     }
 
-    void OnTick(JNIEnv* env) override {
+    void OnTick(JNIEnv*) override {
         bool holding = (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0;
 
         if (m_onlyInFight && !holding) {
@@ -222,7 +226,6 @@ public:
             m_history.clear();
         }
 
-        // Break windows: humans stop mid-fight
         if (m_breakPatterns) {
             if (m_inBreak) {
                 if (--m_breakCounter <= 0) m_inBreak = false;
@@ -251,7 +254,7 @@ public:
 
         if (m_pattern == 0 && m_maxCPS > 15.f) {
             ImGui::TextColored(ImVec4(1.f, 0.45f, 0.35f, 1.f),
-                "! Normal pattern above 15 CPS is not humanly reachable");
+                "! A flat stream above 15 CPS is not humanly reachable");
         }
 
         ImGui::Separator();
@@ -271,8 +274,9 @@ public:
             if (m_restGapMin > m_restGapMax) m_restGapMin = m_restGapMax;
             ImGui::SliderFloat("Pair Skip Chance", &m_pairSkipChance, 0.f, 20.f, "%.0f%%");
 
-            float est = 2000.f /
-                ((m_pairGapMin + m_pairGapMax) * 0.5f + (m_restGapMin + m_restGapMax) * 0.5f);
+            float avgPair = (m_pairGapMin + m_pairGapMax) * 0.5f;
+            float avgRest = (m_restGapMin + m_restGapMax) * 0.5f;
+            float est = 2000.0f / (avgPair + avgRest);
             ImGui::TextColored(ImVec4(0.4f, 1.f, 0.6f, 1.f),
                 "Estimated actual CPS: %.1f", est);
         }
@@ -320,10 +324,10 @@ public:
 
         float sd = CurrentStdDev();
         if (sd < 900.f) {
-            ImVec4 c = sd < m_minStdDev
+            ImVec4 col = (sd < m_minStdDev)
                 ? ImVec4(1.f, 0.45f, 0.35f, 1.f)
                 : ImVec4(0.4f, 1.f, 0.6f, 1.f);
-            ImGui::TextColored(c, "Live std-dev: %.1f ms", sd);
+            ImGui::TextColored(col, "Live std-dev: %.1f ms", sd);
         }
     }
 };
