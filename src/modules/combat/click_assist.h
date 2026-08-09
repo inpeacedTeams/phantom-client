@@ -33,6 +33,10 @@
 // The callback runs on that thread, so shared state is guarded by
 // m_mutex.
 //
+// The hard floor is pushed into the scheduler rather than only
+// clamped here, because Hit Select emits through the same path and
+// has to honour the same limit.
+//
 // PATTERNS
 //   0 Normal    single stream, gaussian intervals. Cap around 14
 //   1 Butterfly two-finger pairs. The only honest way past 16
@@ -252,6 +256,7 @@ public:
 
     void OnEnable(JNIEnv*) override {
         ClickScheduler::SetRightButton(false);
+        ClickScheduler::SetFloor(m_hardFloorMs);
         ClickScheduler::SetProvider([this]() -> long long {
             std::lock_guard<std::mutex> lock(m_mutex);
             return NextDelayLocked();
@@ -285,6 +290,9 @@ public:
             m_holding = holding;
         }
 
+        // The slider can move at any time, and Hit Select shares this
+        // limit, so keep the scheduler in step with it.
+        ClickScheduler::SetFloor(m_hardFloorMs);
         ClickScheduler::SetActive(active);
     }
 
