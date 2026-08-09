@@ -6,85 +6,82 @@
 #include <deque>
 #include <chrono>
 #include <random>
+#include <cmath>
 
 // =================================================================
-// Backtrack — packet-delay reach extension
+// Backtrack
 // =================================================================
-// Holds incoming entity-position packets so enemies render at
-// their PAST position. You hit where they WERE; the server's lag
-// compensation still counts it. Reach value is never touched.
+// STATUS: NOT WIRED UP.
 //
-// WHY AGC/KARHU CATCHES NAIVE BACKTRACK:
-//   1. Constant delay. A fixed 100ms hold produces a packet
-//      arrival histogram with zero variance. Real jitter is noisy.
-//   2. Delay that never stops. Humans don't have 100ms of lag
-//      only during fights and 0ms while walking.
-//   3. Delay that survives a lagback. If the server corrects you
-//      and you keep buffering, the desync compounds into a flag.
-//   4. Hit registration outside the compensation window.
-//      Karhu rejects hits older than its configured window.
+// Backtrack works by holding incoming entity-position packets so
+// enemies render where they WERE. That requires intercepting the
+// Netty pipeline, which this client does not do yet. Until that
+// hook exists this module changes nothing in game.
 //
-// HOW THIS BUILD AVOIDS IT:
-//   - Per-packet random delay inside a band (not a constant)
-//   - Pulse mode: buffer in short bursts, flush between them
-//   - Range window: only active in the 2.5-4.5 block band where
-//     backtrack actually helps. Outside it, packets pass through
-//   - Ping-aware cap: total (ping + delay) stays under the window
-//   - Instant flush on damage taken, on flag, and on target swap
-//   - Smooth ramp: delay grows over several ticks instead of
-//     snapping from 0 to max
+// Everything below is the tuning layer, kept ready for the hook:
+//   ShouldHoldPacket()   decides per packet
+//   GetRolledDelay()     how long to hold it
+//   OnServerCorrection() called from the S08 position-reset handler
+//
+// -----------------------------------------------------------------
+// WHY NAIVE BACKTRACK GETS CAUGHT
+//   1. Constant delay produces a packet-arrival histogram with zero
+//      variance. Real network jitter is noisy.
+//   2. Delay that only appears during fights. Humans do not have
+//      100ms of lag exclusively while holding left click.
+//   3. Delay that survives a lagback, compounding the desync.
+//   4. Hits landing outside the server's lag-compensation window.
+//
+// WHAT THIS DESIGN DOES INSTEAD
+//   - per-packet random delay inside a band, never a constant
+//   - pulse mode: buffer in short bursts, pass through between them
+//   - range window: only active where backtrack actually helps
+//   - ping-aware cap so ping + delay stays inside the window
+//   - instant flush on damage, on flag, and on target swap
+//   - ramp-in so the delay grows over several ticks
 // =================================================================
-
-struct DelayedPacket {
-    void* packetRef;                                  // jobject global ref
-    std::chrono::steady_clock::time_point arrivedAt;
-    long long releaseAfterMs;
-};
 
 class Backtrack : public Module {
 private:
-    // ---- Core ----
-    int   m_mode            = 1;      // 0=Constant, 1=Pulse, 2=Adaptive
-    int   m_delayMinMs      = 40;     // Lower bound of the random band
-    int   m_delayMaxMs      = 90;     // Upper bound
-    int   m_hardCapMs       = 140;    // Never exceed, regardless of mode
+    // Flip this once a real packet hook calls into the module.
+    static constexpr bool kPacketHookAvailable = false;
 
-    // ---- Range window ----
-    bool  m_useRangeWindow  = true;
-    float m_rangeMin        = 2.4f;   // Below this, backtrack hurts you
-    float m_rangeMax        = 4.6f;   // Above this, it does nothing useful
+    int   m_mode       = 1;    // 0=Constant 1=Pulse 2=Adaptive
+    int   m_delayMinMs = 40;
+    int   m_delayMaxMs = 90;
+    int   m_hardCapMs  = 140;
 
-    // ---- Pulse mode ----
-    int   m_pulseOnMin      = 6;      // Ticks of buffering
-    int   m_pulseOnMax      = 14;
-    int   m_pulseOffMin     = 8;      // Ticks of pass-through
-    int   m_pulseOffMax     = 20;
+    bool  m_useRangeWindow = true;
+    float m_rangeMin = 2.4f;
+    float m_rangeMax = 4.6f;
 
-    // ---- Ping awareness ----
-    bool  m_pingAware       = true;
-    int   m_compensationMs  = 200;    // Server lag-comp window estimate
-    int   m_safetyMarginMs  = 40;     // Stay this far under the window
+    int   m_pulseOnMin  = 6;
+    int   m_pulseOnMax  = 14;
+    int   m_pulseOffMin = 8;
+    int   m_pulseOffMax = 20;
 
-    // ---- Safety ----
-    bool  m_flushOnDamage   = true;   // Dump buffer the tick you get hit
+    bool  m_pingAware      = true;
+    int   m_compensationMs = 200;
+    int   m_safetyMarginMs = 40;
+
+    bool  m_flushOnDamage     = true;
     bool  m_flushOnTargetSwap = true;
-    int   m_pauseAfterFlagTicks = 40; // Freeze after a lagback
-    bool  m_onlyWhileClicking = true; // No buffering while walking around
-    int   m_rampTicks       = 4;      // Ticks to ramp delay up from zero
+    int   m_pauseAfterFlagTicks = 40;
+    bool  m_onlyWhileClicking = true;
+    int   m_rampTicks = 4;
 
-    // ---- Randomization ----
-    float m_perPacketJitter = 22.0f;  // % variance applied per packet
+    float m_perPacketJitter = 22.0f;
 
-    // ---- Internal ----
-    std::deque<DelayedPacket> m_queue;
-    bool  m_buffering       = false;
-    int   m_pulseCounter    = 0;
-    int   m_pulseTarget     = 0;
-    int   m_pauseCounter    = 0;
-    int   m_rampCounter     = 0;
-    int   m_lastHurtTime    = 0;
-    int   m_currentDelayMs  = 0;
-    int   m_measuredPing    = 30;
+    // State
+    bool m_buffering   = false;
+    int  m_pulseCounter = 0;
+    int  m_pulseTarget  = 0;
+    int  m_pauseCounter = 0;
+    int  m_rampCounter  = 0;
+    int  m_lastHurtTime = 0;
+    int  m_currentDelayMs = 0;
+    int  m_measuredPing = 30;
+    int  m_heldPackets  = 0;
 
     std::mt19937 m_rng{ std::random_device{}() };
 
@@ -94,7 +91,6 @@ private:
         return d(m_rng);
     }
 
-    // Effective ceiling given ping and the server's comp window
     int EffectiveCap() const {
         int cap = m_hardCapMs;
         if (m_pingAware) {
@@ -107,17 +103,14 @@ private:
     int RollDelay() {
         int base = Rand(m_delayMinMs, m_delayMaxMs);
 
-        // Per-packet jitter so the arrival histogram stays noisy
         if (m_perPacketJitter > 0.f) {
-            float range = base * (m_perPacketJitter / 100.f);
-            std::uniform_real_distribution<float> jd(-range, range);
-            base += (int)jd(m_rng);
+            float r = base * (m_perPacketJitter / 100.f);
+            std::uniform_real_distribution<float> d(-r, r);
+            base += (int)d(m_rng);
         }
 
-        // Ramp: first few ticks after enabling use a fraction of the delay
-        if (m_rampCounter < m_rampTicks && m_rampTicks > 0) {
-            float t = (float)m_rampCounter / (float)m_rampTicks;
-            base = (int)(base * t);
+        if (m_rampTicks > 0 && m_rampCounter < m_rampTicks) {
+            base = (int)(base * ((float)m_rampCounter / (float)m_rampTicks));
         }
 
         int cap = EffectiveCap();
@@ -130,25 +123,23 @@ public:
     Backtrack() : Module("Backtrack", "Hit players at their past positions",
                          ModuleCategory::COMBAT, 0) {}
 
-    void OnEnable(JNIEnv* env) override {
-        m_queue.clear();
-        m_rampCounter = 0;
+    static constexpr bool IsFunctional() { return kPacketHookAvailable; }
+
+    void OnEnable(JNIEnv*) override {
+        m_rampCounter  = 0;
         m_pulseCounter = 0;
-        m_pulseTarget = Rand(m_pulseOnMin, m_pulseOnMax);
-        m_buffering = true;
+        m_pulseTarget  = Rand(m_pulseOnMin, m_pulseOnMax);
+        m_buffering    = true;
         m_pauseCounter = 0;
+        m_heldPackets  = 0;
     }
 
-    void OnDisable(JNIEnv* env) override {
-        FlushAll();
-    }
+    void OnDisable(JNIEnv*) override { FlushAll(); }
 
-    // Called by the network hook for every entity-position packet.
-    // Return true to hold the packet, false to let it through now.
-    bool ShouldHoldPacket(JNIEnv* env, double entX, double entY, double entZ) {
-        if (!m_enabled) return false;
-        if (m_pauseCounter > 0) return false;
-        if (!m_buffering) return false;
+    // ---- Called by the packet hook, once one exists ----
+    bool ShouldHoldPacket(JNIEnv* env, double ex, double ey, double ez) {
+        if (!kPacketHookAvailable) return false;
+        if (!m_enabled || m_pauseCounter > 0 || !m_buffering) return false;
 
         if (m_onlyWhileClicking && !(GetAsyncKeyState(VK_LBUTTON) & 0x8000))
             return false;
@@ -156,9 +147,9 @@ public:
         if (m_useRangeWindow) {
             jobject player = Minecraft::GetPlayer(env);
             if (!player) return false;
-            double dx = entX - Minecraft::GetPosX(env, player);
-            double dy = entY - Minecraft::GetPosY(env, player);
-            double dz = entZ - Minecraft::GetPosZ(env, player);
+            double dx = ex - Minecraft::GetPosX(env, player);
+            double dy = ey - Minecraft::GetPosY(env, player);
+            double dz = ez - Minecraft::GetPosZ(env, player);
             double dist = std::sqrt(dx*dx + dy*dy + dz*dz);
             if (dist < m_rangeMin || dist > m_rangeMax) return false;
         }
@@ -167,44 +158,41 @@ public:
         return m_currentDelayMs > 0;
     }
 
-    int GetRolledDelay() const { return m_currentDelayMs; }
+    int  GetRolledDelay() const { return m_currentDelayMs; }
+    void FlushAll() { m_heldPackets = 0; }
+    void SetPing(int ping) { m_measuredPing = ping; }
 
-    void FlushAll() {
-        // The network hook drains and processes everything immediately
-        m_queue.clear();
+    void OnServerCorrection() {
+        FlushAll();
+        m_pauseCounter = m_pauseAfterFlagTicks;
+        m_buffering = false;
     }
 
     void OnTick(JNIEnv* env) override {
+        if (!kPacketHookAvailable) return;   // nothing to drive yet
+
         jobject player = Minecraft::GetPlayer(env);
         if (!player) return;
 
         if (m_rampCounter < m_rampTicks) m_rampCounter++;
 
-        // --- Pause after a server correction ---
         if (m_pauseCounter > 0) {
-            m_pauseCounter--;
-            if (m_pauseCounter == 0) m_rampCounter = 0; // Re-ramp after pause
+            if (--m_pauseCounter == 0) m_rampCounter = 0;
             return;
         }
 
-        // --- Flush on damage ---
         if (m_flushOnDamage) {
-            int hurtTime = Minecraft::GetHurtTime(env, player);
-            if (hurtTime > 0 && m_lastHurtTime == 0) {
-                FlushAll();
-            }
-            m_lastHurtTime = hurtTime;
+            int hurt = Minecraft::GetHurtTime(env, player);
+            if (hurt > 0 && m_lastHurtTime == 0) FlushAll();
+            m_lastHurtTime = hurt;
         }
 
-        // --- Pulse cycling ---
         if (m_mode == 1) {
-            m_pulseCounter++;
-            if (m_pulseCounter >= m_pulseTarget) {
+            if (++m_pulseCounter >= m_pulseTarget) {
                 m_buffering = !m_buffering;
                 m_pulseCounter = 0;
-                m_pulseTarget = m_buffering
-                    ? Rand(m_pulseOnMin, m_pulseOnMax)
-                    : Rand(m_pulseOffMin, m_pulseOffMax);
+                m_pulseTarget = m_buffering ? Rand(m_pulseOnMin, m_pulseOnMax)
+                                            : Rand(m_pulseOffMin, m_pulseOffMax);
                 if (!m_buffering) FlushAll();
                 else m_rampCounter = 0;
             }
@@ -212,36 +200,34 @@ public:
             m_buffering = true;
         }
 
-        // --- Adaptive: scale delay to target distance ---
         if (m_mode == 2) {
-            EntityList::Init(env);
+            if (!EntityList::Init(env)) return;
             auto ents = EntityList::GetPlayers(env, m_rangeMax);
             auto* t = EntityList::FindClosest(ents, m_rangeMax);
             if (t) {
-                // Further target = more delay helps, closer = less
                 float span = m_rangeMax - m_rangeMin;
-                float pos  = (float)(t->distanceToPlayer - m_rangeMin);
-                float f    = span > 0 ? (pos / span) : 0.5f;
-                f = f < 0.f ? 0.f : (f > 1.f ? 1.f : f);
-                m_delayMaxMs = m_delayMinMs +
-                    (int)((EffectiveCap() - m_delayMinMs) * f);
+                float f = span > 0.f
+                    ? (float)((t->distanceToPlayer - m_rangeMin) / span) : 0.5f;
+                if (f < 0.f) f = 0.f;
+                if (f > 1.f) f = 1.f;
+                m_delayMaxMs = m_delayMinMs + (int)((EffectiveCap() - m_delayMinMs) * f);
             }
         }
     }
 
-    // Call from the movement-correction hook (S08PacketPlayerPosLook)
-    void OnServerCorrection() {
-        FlushAll();
-        m_pauseCounter = m_pauseAfterFlagTicks;
-        m_buffering = false;
-    }
-
-    void SetPing(int ping) { m_measuredPing = ping; }
-
     void RenderSettings() override {
+        if (!kPacketHookAvailable) {
+            ImGui::TextColored(ImVec4(1.f, 0.35f, 0.3f, 1.f), "NOT ACTIVE");
+            ImGui::TextWrapped(
+                "Backtrack needs a Netty packet hook to delay entity position "
+                "updates. That hook is not implemented, so enabling this module "
+                "currently changes nothing in game. The settings below are the "
+                "tuning layer, kept ready for when it lands.");
+            ImGui::Separator();
+        }
+
         const char* modes[] = { "Constant", "Pulse", "Adaptive" };
         ImGui::Combo("Mode", &m_mode, modes, 3);
-
         if (m_mode == 0) {
             ImGui::TextColored(ImVec4(1.f, 0.5f, 0.35f, 1.f),
                 "! Constant delay is the easiest pattern to fingerprint");
@@ -282,7 +268,7 @@ public:
         if (m_pingAware) {
             ImGui::SliderInt("Comp Window (ms)", &m_compensationMs, 100, 400);
             ImGui::SliderInt("Safety Margin (ms)", &m_safetyMarginMs, 0, 120);
-            ImGui::Text("Effective cap: %d ms  (ping %d)", EffectiveCap(), m_measuredPing);
+            ImGui::Text("Effective cap: %d ms (ping %d)", EffectiveCap(), m_measuredPing);
         }
         ImGui::Checkbox("Flush On Damage", &m_flushOnDamage);
         ImGui::Checkbox("Flush On Target Swap", &m_flushOnTargetSwap);
@@ -290,7 +276,7 @@ public:
         ImGui::SliderInt("Pause After Flag", &m_pauseAfterFlagTicks, 0, 100);
 
         ImGui::Separator();
-        ImGui::TextWrapped("Buffered packets: %d | State: %s",
-            (int)m_queue.size(), m_buffering ? "BUFFERING" : "pass-through");
+        ImGui::TextDisabled("Held: %d | %s", m_heldPackets,
+            m_buffering ? "buffering" : "pass-through");
     }
 };
