@@ -7,15 +7,16 @@
 #include "jni/class_resolver.h"
 #include "hooks/gl_hook.h"
 #include "mc/minecraft.h"
+#include "mc/keybinds.h"
 #include "mc/entity_list.h"
 #include "modules/module_manager.h"
 
 FILE* g_console = nullptr;
 
-// Minecraft runs at 20 ticks per second. Every module expresses its
-// delays in ticks, so the client loop has to match. The old Sleep(1)
-// ran ~1000 iterations a second, which made every "2 tick" delay
-// expire in 2 milliseconds and broke all timing logic.
+// Minecraft runs at 20 ticks per second and every module expresses
+// its delays in ticks, so the client loop has to match. An earlier
+// version used Sleep(1), which ran roughly 1000 iterations a second
+// and made every "2 tick" delay expire in two milliseconds.
 static constexpr int TICK_MS = 50;
 
 static bool WaitForResolve(JNIEnv* env, int maxSeconds) {
@@ -46,7 +47,7 @@ void MainThread(HMODULE hModule) {
     printf("[Phantom] JVM attached (JNI 0x%x)\n", JNIHelper::GetVersion());
 
     // ---- 2. Resolve classes and the Minecraft singleton ----
-    // Injecting at the main menu is normal, so retry rather than
+    // Injecting at the main menu is normal, so retry instead of
     // giving up on the first pass.
     if (!WaitForResolve(env, 60)) {
         printf("[Phantom] FATAL: could not resolve Minecraft classes\n");
@@ -59,11 +60,18 @@ void MainThread(HMODULE hModule) {
     }
     printf("[Phantom] Minecraft resolved\n");
 
-    // ---- 3. Modules ----
+    // ---- 3. Keybinds ----
+    // Most modules simulate input by driving these, so without them
+    // the client is inert. Not fatal: they resolve later if the
+    // options object is not ready yet.
+    if (KeyBinds::Init(env)) printf("[Phantom] Keybinds resolved\n");
+    else                     printf("[Phantom] Keybinds deferred\n");
+
+    // ---- 4. Modules ----
     ModuleManager::Init();
     printf("[Phantom] %d modules registered\n", ModuleManager::GetModuleCount());
 
-    // ---- 4. Overlay ----
+    // ---- 5. Overlay ----
     if (!GLHook::Install()) {
         printf("[Phantom] FATAL: could not hook wglSwapBuffers\n");
         Sleep(4000);
@@ -74,7 +82,7 @@ void MainThread(HMODULE hModule) {
     }
     printf("[Phantom] Ready. INSERT opens the menu, DELETE ejects.\n");
 
-    // ---- 5. Client loop ----
+    // ---- 6. Client loop ----
     auto next = std::chrono::steady_clock::now();
     bool ejectHeld = false;
 
@@ -83,8 +91,9 @@ void MainThread(HMODULE hModule) {
         if (del && !ejectHeld) break;
         ejectHeld = del;
 
-        // EntityList needs a loaded world, so keep retrying quietly
         if (Minecraft::InGame(env)) {
+            // Both retry quietly until a world exists
+            KeyBinds::Init(env);
             EntityList::Init(env);
             ModuleManager::Tick(env);
         }
@@ -92,13 +101,17 @@ void MainThread(HMODULE hModule) {
         next += std::chrono::milliseconds(TICK_MS);
         auto now = std::chrono::steady_clock::now();
         if (next > now) std::this_thread::sleep_until(next);
-        else next = now;   // we fell behind, resync instead of spinning
+        else next = now;   // fell behind, resync rather than spin
     }
 
-    // ---- 6. Teardown ----
+    // ---- 7. Teardown ----
     printf("[Phantom] Ejecting...\n");
     GLHook::Remove();
+
+    // Disables every module first, so anything holding a keybind
+    // lets go before we drop the references.
     ModuleManager::Shutdown(env);
+    KeyBinds::Shutdown(env);
     EntityList::Shutdown(env);
     Minecraft::Shutdown(env);
     JNIHelper::Detach();
