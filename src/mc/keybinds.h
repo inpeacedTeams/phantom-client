@@ -49,17 +49,6 @@ private:
     inline static jfieldID s_fPressed = nullptr;
     inline static bool s_ready = false;
 
-    static Bind* All(int& count) {
-        static Bind* table[] = {
-            &s_forward, &s_back, &s_left, &s_right,
-            &s_jump, &s_sneak, &s_sprint, &s_useItem, &s_attack
-        };
-        count = (int)(sizeof(table) / sizeof(table[0]));
-        // Returning the array of pointers through a Bind* would be
-        // wrong, so callers use AllPtrs() instead.
-        return nullptr;
-    }
-
     static Bind** AllPtrs(int& count) {
         static Bind* table[] = {
             &s_forward, &s_back, &s_left, &s_right,
@@ -156,9 +145,9 @@ public:
         b.overridden = false;
     }
 
-    // Drop every key we are still holding. Safe to call at any time;
-    // keys the player is physically holding are untouched because we
-    // only clear the ones we set ourselves.
+    // Drop every key we are still holding. Safe at any time: keys the
+    // player is physically holding are untouched, because we only
+    // clear the ones we set ourselves.
     static void ReleaseAll(JNIEnv* env) {
         if (!env || !s_fPressed) return;
         int n = 0;
