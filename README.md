@@ -68,6 +68,24 @@ there is. `ClickScheduler` runs its own thread with `timeBeginPeriod(1)` plus a
 short spin for the final 2ms, and asks the module for each gap through a
 callback.
 
+Every click in the client leaves through that scheduler, including the one-off
+from Hit Select. Two sources firing `SendInput` independently can land
+microseconds apart, and a sub-20ms interval is the one thing no hand produces,
+so the scheduler holds a shared floor and drops anything that would break it.
+
+## Tick order
+
+Backtrack rewrites entity positions, so the order inside a tick is load-bearing:
+
+1. Push the JNI local frame and invalidate the entity cache.
+2. **Backtrack restores** every rewound entity to its true position.
+3. Modules run. The entity scan happens here, so everything else and the ESP
+   see the real world rather than the rewound one.
+4. Backtrack records the true positions and rewinds again.
+
+Backtrack holds its targets as global refs, because the restore in step 2 has to
+reach entities whose local refs died with the previous frame.
+
 ## Threading
 
 One rule: **JNI only ever runs on the client thread.**
@@ -116,10 +134,10 @@ new tunable is one `Bind("Name", &field)` call in the constructor.
 | Sprint Reset | Combat | Working. 5 techniques via real keybinds |
 | Auto Blockhit | Combat | Working. Drives `keyBindUseItem` |
 | Aim Assist | Combat | Working |
-| Hit Select | Combat | Working |
+| Hit Select | Combat | Working. Emits through the shared click floor |
 | Click Assist | Combat | Working. Butterfly, drag, jitter on the 1ms thread |
 | Kill Aura | Combat | Working. Loud, detected everywhere |
-| **Backtrack** | Combat | **Inert.** Needs a Netty packet hook |
+| Backtrack | Combat | Working. Position rewind, no packet hook |
 | Bridge Assist | Movement | Working |
 | Sprint | Movement | Working |
 | No Jump Delay | Movement | Working |
@@ -130,8 +148,13 @@ new tunable is one `Bind("Name", &field)` call in the constructor.
 
 ## Known gaps
 
-- **Backtrack** has no packet hook, so it does nothing. Its tuning and safety
-  logic are written and waiting; the interception is not. The menu says so.
+- **Backtrack rewinds only between our ticks**, because there is no packet hook
+  to hold updates at the source. On a low-ping duel server there is little
+  natural jitter to hide inside, so keep the band short. It is the least
+  reliable module here.
+- **No lagback handler.** `OnServerCorrection` exists on Backtrack and Auto
+  Blockhit but nothing calls it: detecting a server position reset needs the
+  packet hook. Until then, both keep running through a correction.
 - **Health** is read through `getHealth()`. If a Lunar build strips that method
   the ESP health bar falls back to full.
 - **Speed and Fly** will not survive a prediction anticheat. They are there for
