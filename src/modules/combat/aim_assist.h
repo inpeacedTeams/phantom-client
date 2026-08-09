@@ -11,29 +11,29 @@
 // =================================================================
 // Aim Assist
 // =================================================================
-// Nudges your crosshair toward a target instead of snapping to it.
-// Speed scales down as the crosshair closes in, which removes the
-// tell-tale overshoot-and-correct wobble a naive lerp produces.
+// Nudges the crosshair toward a target instead of snapping to it.
+// Step size shrinks as the crosshair closes in, which removes the
+// overshoot-and-correct wobble a plain lerp produces.
 //
-// Randomization and aim breaks exist to keep the rotation delta
-// distribution away from anything a GCD or entropy check can lock
-// onto. Turning them off makes the module far easier to detect.
+// Randomization and aim breaks keep the rotation-delta distribution
+// away from anything a GCD or entropy check can lock onto. Turning
+// them off makes this trivially detectable.
 // =================================================================
 
 class AimAssist : public Module {
 private:
-    float m_speed             = 4.2f;
-    float m_pitchSpeed        = 3.0f;
-    float m_fov               = 120.0f;
-    float m_maxRange          = 4.5f;
-    int   m_targetMode        = 2;      // 0=closest 1=lowest HP 2=crosshair
+    float m_speed              = 4.2f;
+    float m_pitchSpeed         = 3.0f;
+    float m_fov                = 120.0f;
+    float m_maxRange           = 4.5f;
+    int   m_targetMode         = 2;     // 0 closest, 1 lowest HP, 2 crosshair
     bool  m_onlyWhileAttacking = false;
-    bool  m_smoothYaw         = true;
-    bool  m_smoothPitch       = true;
-    float m_randomization     = 15.0f;
-    bool  m_breakAim          = true;
-    float m_breakChance       = 5.0f;
-    float m_aimHeight         = 1.0f;   // Where on the body to aim
+    bool  m_smoothYaw          = true;
+    bool  m_smoothPitch        = true;
+    float m_randomization      = 15.0f;
+    bool  m_breakAim           = true;
+    float m_breakChance        = 5.0f;
+    float m_aimHeight          = 1.0f;
 
     std::mt19937 m_rng{ std::random_device{}() };
 
@@ -50,7 +50,21 @@ private:
 
 public:
     AimAssist() : Module("Aim Assist", "Smooth aim correction toward the nearest player",
-                         ModuleCategory::COMBAT, 'R') {}
+                         ModuleCategory::COMBAT, 'R')
+    {
+        Bind("Yaw Speed", &m_speed);
+        Bind("Pitch Speed", &m_pitchSpeed);
+        Bind("FOV", &m_fov);
+        Bind("Range", &m_maxRange);
+        Bind("Target Mode", &m_targetMode);
+        Bind("Only While Clicking", &m_onlyWhileAttacking);
+        Bind("Smooth Yaw", &m_smoothYaw);
+        Bind("Smooth Pitch", &m_smoothPitch);
+        Bind("Randomization", &m_randomization);
+        Bind("Break Aim", &m_breakAim);
+        Bind("Break Chance", &m_breakChance);
+        Bind("Aim Height", &m_aimHeight);
+    }
 
     void OnTick(JNIEnv* env) override {
         jobject player = Minecraft::GetPlayer(env);
@@ -59,8 +73,8 @@ public:
 
         if (m_onlyWhileAttacking && !(GetAsyncKeyState(VK_LBUTTON) & 0x8000)) return;
 
-        // Skipping the occasional tick produces the small misses a
-        // human makes, instead of perfect frame-by-frame tracking.
+        // Skipping the odd tick produces the small misses a human
+        // makes instead of perfect frame-by-frame tracking.
         if (m_breakAim && Roll(m_breakChance)) return;
 
         if (!EntityList::Init(env)) return;
@@ -99,8 +113,8 @@ public:
             pitchStep *= (1.0f + d(m_rng));
         }
 
-        // Ease off as the crosshair closes in, so the aim settles
-        // instead of oscillating around the target.
+        // Ease off near the target so the aim settles rather than
+        // oscillating around it.
         float yawEase   = std::min(1.0f, std::fabs(yawDiff)   / 30.0f);
         float pitchEase = std::min(1.0f, std::fabs(pitchDiff) / 20.0f);
 
@@ -140,6 +154,10 @@ public:
         if (m_randomization < 5.f || !m_breakAim) {
             ImGui::TextColored(ImVec4(1.f, 0.7f, 0.3f, 1.f),
                 "Low randomization is easy to fingerprint");
+        }
+        if (m_speed > 5.f) {
+            ImGui::TextColored(ImVec4(1.f, 0.7f, 0.3f, 1.f),
+                "Above 5 the correction is visible in replays");
         }
     }
 };
