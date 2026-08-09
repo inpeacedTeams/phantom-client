@@ -1,30 +1,40 @@
 #pragma once
 #include "../module.h"
 #include "../../mc/minecraft.h"
+#include "../../mc/entity_list.h"
 #include <imgui.h>
+#include <Windows.h>
+#include <random>
 
 // =================================================================
 // Hit Select
 // =================================================================
-// Sends your click on the EXACT tick you receive knockback.
-// When you hit someone the same tick you take KB, the game
-// partially cancels your knockback. Top players do this manually
-// by timing their clicks. This module automates it.
+// Fires your click on the exact tick you receive knockback.
+// Landing a hit on the same tick you take one makes the server
+// apply your attacker's knockback against your own outgoing swing,
+// shaving off part of the push. Strong players do this by feel.
 //
-// 100% legit: you're just clicking at the right moment.
+// This is pure click timing, so there is nothing for a server-side
+// anticheat to see beyond a well-timed player.
 // =================================================================
 
 class HitSelect : public Module {
 private:
-    int m_hurtTimeTarget = 9;  // hurtTime value to click on (10 = just hit, 9 = 1 tick after)
-    float m_chance = 90.0f;
-    bool m_onlyInCombat = true;
+    int   m_hurtTimeTarget = 9;     // 10 = hit tick, 9 = one tick later
+    float m_chance         = 90.0f;
+    bool  m_requireTarget  = true;  // Only fire with someone in reach
+    float m_targetRange    = 3.6f;
 
     int m_lastHurtTime = 0;
     std::mt19937 m_rng{ std::random_device{}() };
 
+    bool Roll(float pct) {
+        std::uniform_real_distribution<float> d(0.f, 100.f);
+        return d(m_rng) < pct;
+    }
+
 public:
-    HitSelect() : Module("Hit Select", "Click at the perfect tick to reduce incoming KB",
+    HitSelect() : Module("Hit Select", "Click on the tick you take knockback",
                          ModuleCategory::COMBAT, 0) {}
 
     void OnTick(JNIEnv* env) override {
@@ -33,33 +43,35 @@ public:
         if (Minecraft::IsInGui(env)) return;
 
         int hurtTime = Minecraft::GetHurtTime(env, player);
+        bool onTargetTick = (hurtTime == m_hurtTimeTarget && m_lastHurtTime != m_hurtTimeTarget);
+        m_lastHurtTime = hurtTime;
 
-        // Detect the target hurtTime tick
-        if (hurtTime == m_hurtTimeTarget && m_lastHurtTime != m_hurtTimeTarget) {
-            // Check if LMB is being held (player wants to attack)
-            if (GetAsyncKeyState(VK_LBUTTON) & 0x8000) {
-                std::uniform_real_distribution<float> d(0.f, 100.f);
-                if (d(m_rng) < m_chance) {
-                    // Simulate a click via SendInput
-                    INPUT input = {};
-                    input.type = INPUT_MOUSE;
-                    input.mi.dwFlags = MOUSEEVENTF_LEFTDOWN;
-                    SendInput(1, &input, sizeof(INPUT));
+        if (!onTargetTick) return;
+        if (!(GetAsyncKeyState(VK_LBUTTON) & 0x8000)) return;
 
-                    input.mi.dwFlags = MOUSEEVENTF_LEFTUP;
-                    SendInput(1, &input, sizeof(INPUT));
-                }
-            }
+        if (m_requireTarget) {
+            if (!EntityList::Init(env)) return;
+            auto ents = EntityList::GetPlayers(env, m_targetRange);
+            if (ents.empty()) return;
         }
 
-        m_lastHurtTime = hurtTime;
+        if (!Roll(m_chance)) return;
+
+        INPUT in[2] = {};
+        in[0].type = INPUT_MOUSE;
+        in[0].mi.dwFlags = MOUSEEVENTF_LEFTDOWN;
+        in[1].type = INPUT_MOUSE;
+        in[1].mi.dwFlags = MOUSEEVENTF_LEFTUP;
+        SendInput(2, in, sizeof(INPUT));
     }
 
     void RenderSettings() override {
         ImGui::SliderInt("HurtTime Target", &m_hurtTimeTarget, 1, 10);
         ImGui::SliderFloat("Chance", &m_chance, 10.f, 100.f, "%.0f%%");
-        ImGui::Checkbox("Only In Combat", &m_onlyInCombat);
+        ImGui::Checkbox("Require Target", &m_requireTarget);
+        if (m_requireTarget)
+            ImGui::SliderFloat("Target Range", &m_targetRange, 2.f, 6.f, "%.1f");
         ImGui::Separator();
-        ImGui::TextWrapped("Clicks the exact tick you take KB to cancel part of it. Fully legit.");
+        ImGui::TextWrapped("Clicks the exact tick you take KB, cancelling part of it.");
     }
 };
