@@ -14,40 +14,38 @@
 // =================================================================
 // ESP
 // =================================================================
-// WHY WE DO NOT READ GL MATRICES:
+// WHY WE DO NOT READ GL MATRICES
 //
-// The original version called glGetDoublev(GL_MODELVIEW_MATRIX) from
-// the wglSwapBuffers hook. By that point Minecraft has already
-// finished the world pass AND the GUI pass, so the matrix on the
-// stack is the orthographic GUI matrix. Projecting world coordinates
-// through it produces garbage.
+// An earlier version called glGetDoublev(GL_MODELVIEW_MATRIX) from
+// the wglSwapBuffers hook. By that point Minecraft has finished the
+// world pass AND the GUI pass, so the matrix on the stack is the
+// orthographic GUI matrix. Projecting world coordinates through it
+// produces garbage.
 //
-// Instead we rebuild the camera transform ourselves from the values
-// Minecraft used: interpolated eye position, yaw, pitch and FOV.
-// That is deterministic and independent of when we run.
+// We rebuild the camera transform ourselves from the values the
+// game used: interpolated eye position, yaw, pitch and FOV. That is
+// deterministic and independent of when we run.
 //
-// THREADING:
+// THREADING
 // OnTick runs on the client thread and writes a plain-data snapshot
 // under a mutex. Render runs on the game's render thread and only
-// reads that snapshot, so it never touches JNI.
+// reads it, so it never touches JNI.
 // =================================================================
 
 class ESP : public Module {
 private:
-    // ---- Settings ----
     bool  m_showBox        = true;
     bool  m_showHealthBar  = true;
     bool  m_showDistance   = true;
     bool  m_showName       = true;
     bool  m_showSnaplines  = false;
-    int   m_boxStyle       = 0;      // 0 = corners, 1 = full
+    int   m_boxStyle       = 0;      // 0 corners, 1 full
     float m_maxRange       = 64.0f;
     float m_lineThickness  = 1.5f;
     bool  m_interpolate    = true;
 
     float m_colorEnemy[4] = { 1.0f, 0.30f, 0.30f, 1.0f };
 
-    // ---- Snapshot shared with the render thread ----
     struct Frame {
         std::vector<EntitySnapshot> targets;
         double camX = 0, camY = 0, camZ = 0;
@@ -63,8 +61,8 @@ private:
     jfieldID m_fFov = nullptr;
     bool m_fovResolved = false;
 
-    // World point -> screen point using our own camera transform.
-    // Returns false when the point is behind the camera.
+    // World point to screen point through our own camera transform.
+    // Returns false when the point sits behind the camera.
     static bool Project(double wx, double wy, double wz,
                         double camX, double camY, double camZ,
                         float yawDeg, float pitchDeg, float fovDeg,
@@ -90,8 +88,7 @@ private:
         double y2 = y1 * cp - z1 * sp;
         double z2 = y1 * sp + z1 * cp;
 
-        // Camera looks down -Z, so depth is -z2
-        double depth = -z2;
+        double depth = -z2;             // camera looks down -Z
         if (depth < 0.05) return false;
 
         double aspect = (screenH > 0) ? ((double)screenW / (double)screenH) : 1.777;
@@ -106,7 +103,18 @@ private:
     }
 
 public:
-    ESP() : Module("ESP", "Highlight players through walls", ModuleCategory::VISUAL, 'X') {}
+    ESP() : Module("ESP", "Highlight players through walls", ModuleCategory::VISUAL, 'X')
+    {
+        Bind("Show Box", &m_showBox);
+        Bind("Show Health Bar", &m_showHealthBar);
+        Bind("Show Distance", &m_showDistance);
+        Bind("Show Name", &m_showName);
+        Bind("Show Snaplines", &m_showSnaplines);
+        Bind("Box Style", &m_boxStyle);
+        Bind("Max Range", &m_maxRange);
+        Bind("Line Thickness", &m_lineThickness);
+        Bind("Interpolate", &m_interpolate);
+    }
 
     void OnDisable(JNIEnv*) override {
         std::lock_guard<std::mutex> lock(m_mutex);
@@ -160,10 +168,9 @@ public:
         }
     }
 
-    // Called from the render thread during the ImGui frame.
-    // Touches no JNI.
+    // Render thread. Touches no JNI.
     void RenderESP() {
-        if (!m_enabled) return;
+        if (!IsEnabled()) return;
 
         Frame f;
         {
@@ -177,12 +184,12 @@ public:
         float sh = io.DisplaySize.y;
         if (sw < 2.f || sh < 2.f) return;
 
-        // Interpolate between ticks so ESP does not stutter at 20 TPS
+        // Smooth between ticks so boxes do not stutter at 20 TPS
         // while the game renders at 200 FPS.
         float alpha = 1.0f;
         if (m_interpolate) {
-            auto now = std::chrono::steady_clock::now();
-            auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - f.stamp).count();
+            auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - f.stamp).count();
             alpha = (float)ms / 50.0f;
             if (alpha < 0.f) alpha = 0.f;
             if (alpha > 1.f) alpha = 1.f;
@@ -202,8 +209,8 @@ public:
             double ey = e.prevPosY + (e.posY - e.prevPosY) * alpha;
             double ez = e.prevPosZ + (e.posZ - e.prevPosZ) * alpha;
 
-            const double hw = 0.32;   // player half-width
-            const double ht = 1.85;   // player height
+            const double hw = 0.32;
+            const double ht = 1.85;
 
             const double corners[8][3] = {
                 { ex - hw, ey,      ez - hw }, { ex + hw, ey,      ez - hw },
@@ -227,7 +234,7 @@ public:
                 if (sy > maxY) maxY = sy;
             }
 
-            if (visible < 4) continue;   // mostly behind the camera
+            if (visible < 4) continue;
 
             float boxW = maxX - minX;
             float boxH = maxY - minY;
@@ -239,11 +246,9 @@ public:
                 ImVec4(m_colorEnemy[0], m_colorEnemy[1], m_colorEnemy[2], m_colorEnemy[3]));
             if (e.hurtTime > 0) col = IM_COL32(255, 255, 255, 225);
 
-            // ---- Box ----
             if (m_showBox) {
                 if (m_boxStyle == 0) {
-                    float cl = boxW < boxH ? boxW : boxH;
-                    cl *= 0.25f;
+                    float cl = (boxW < boxH ? boxW : boxH) * 0.25f;
                     if (cl < 4.f) cl = 4.f;
                     dl->AddLine(ImVec2(minX, minY), ImVec2(minX + cl, minY), col, m_lineThickness);
                     dl->AddLine(ImVec2(minX, minY), ImVec2(minX, minY + cl), col, m_lineThickness);
@@ -260,7 +265,6 @@ public:
                             outline, 0, 0, 1.0f);
             }
 
-            // ---- Health bar ----
             if (m_showHealthBar) {
                 float bw = 3.0f;
                 float bx = minX - bw - 3.0f;
@@ -279,7 +283,6 @@ public:
                 dl->AddRectFilled(ImVec2(bx, barTop), ImVec2(bx + bw, maxY), hc);
             }
 
-            // ---- Name ----
             if (m_showName && !e.name.empty()) {
                 ImVec2 ts = ImGui::CalcTextSize(e.name.c_str());
                 float nx = minX + (boxW - ts.x) * 0.5f;
@@ -290,7 +293,6 @@ public:
                 dl->AddText(ImVec2(nx, ny), IM_COL32(255, 255, 255, 255), e.name.c_str());
             }
 
-            // ---- Distance ----
             if (m_showDistance) {
                 char buf[32];
                 snprintf(buf, sizeof(buf), "%.1fm", e.distanceToPlayer);
@@ -299,7 +301,6 @@ public:
                             IM_COL32(205, 205, 205, 210), buf);
             }
 
-            // ---- Snapline ----
             if (m_showSnaplines) {
                 double t = e.distanceToPlayer / (double)m_maxRange;
                 if (t > 1.0) t = 1.0;
