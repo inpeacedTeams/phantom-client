@@ -8,100 +8,127 @@
 #include <cstdio>
 
 #include "../gui/menu.h"
+#include "../modules/module_manager.h"
 
-// Forward decl for ImGui WndProc handler
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND, UINT, WPARAM, LPARAM);
 
 typedef BOOL(WINAPI* fnWglSwapBuffers)(HDC);
-typedef LRESULT(WINAPI* fnWndProc)(HWND, UINT, WPARAM, LPARAM);
 
 class GLHook {
 private:
     inline static fnWglSwapBuffers oSwapBuffers = nullptr;
-    inline static fnWndProc oWndProc = nullptr;
-    inline static HWND gameWindow = nullptr;
-    inline static HGLRC imguiContext = nullptr;
-    inline static HGLRC gameContext = nullptr;
-    inline static bool initialized = false;
-    inline static bool menuOpen = false;
+    inline static WNDPROC  oWndProc     = nullptr;
+    inline static HWND     gameWindow   = nullptr;
+    inline static HGLRC    imguiContext = nullptr;
+    inline static bool     initialized  = false;
+    inline static bool     menuOpen     = false;
+    inline static void*    pSwapBuffers = nullptr;
 
     static LRESULT CALLBACK HookedWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
-        // Toggle menu with INSERT
         if (msg == WM_KEYDOWN && wParam == VK_INSERT) {
             menuOpen = !menuOpen;
             return 0;
         }
 
-        // Forward to ImGui when menu is open
-        if (menuOpen) {
+        if (initialized && menuOpen) {
             ImGui_ImplWin32_WndProcHandler(hWnd, msg, wParam, lParam);
 
-            // Block game input when menu is open
-            if (msg == WM_MOUSEMOVE || msg == WM_LBUTTONDOWN || msg == WM_LBUTTONUP ||
-                msg == WM_RBUTTONDOWN || msg == WM_RBUTTONUP || msg == WM_MOUSEWHEEL ||
-                msg == WM_KEYDOWN || msg == WM_KEYUP || msg == WM_CHAR) {
-                if (ImGui::GetIO().WantCaptureMouse || ImGui::GetIO().WantCaptureKeyboard) {
-                    return 0;
-                }
+            ImGuiIO& io = ImGui::GetIO();
+            switch (msg) {
+                case WM_MOUSEMOVE: case WM_MOUSEWHEEL:
+                case WM_LBUTTONDOWN: case WM_LBUTTONUP: case WM_LBUTTONDBLCLK:
+                case WM_RBUTTONDOWN: case WM_RBUTTONUP: case WM_RBUTTONDBLCLK:
+                case WM_MBUTTONDOWN: case WM_MBUTTONUP:
+                    if (io.WantCaptureMouse) return 0;
+                    break;
+                case WM_KEYDOWN: case WM_KEYUP:
+                case WM_SYSKEYDOWN: case WM_SYSKEYUP: case WM_CHAR:
+                    if (io.WantCaptureKeyboard) return 0;
+                    break;
+                default:
+                    break;
             }
         }
 
-        return CallWindowProcA((WNDPROC)oWndProc, hWnd, msg, wParam, lParam);
+        return CallWindowProcA(oWndProc, hWnd, msg, wParam, lParam);
+    }
+
+    static bool InitImGui(HDC hdc, HGLRC gameCtx) {
+        gameWindow = WindowFromDC(hdc);
+        if (!gameWindow) return false;
+
+        // Create our own context and share the game's objects with it.
+        // wglShareLists must run BEFORE the new context is ever made
+        // current, otherwise it fails.
+        imguiContext = wglCreateContext(hdc);
+        if (!imguiContext) {
+            printf("[GLHook] wglCreateContext failed (%lu)\n", GetLastError());
+            return false;
+        }
+        if (!wglShareLists(gameCtx, imguiContext)) {
+            printf("[GLHook] wglShareLists failed (%lu), continuing anyway\n", GetLastError());
+        }
+
+        if (!wglMakeCurrent(hdc, imguiContext)) {
+            printf("[GLHook] wglMakeCurrent failed (%lu)\n", GetLastError());
+            wglDeleteContext(imguiContext);
+            imguiContext = nullptr;
+            return false;
+        }
+
+        IMGUI_CHECKVERSION();
+        ImGui::CreateContext();
+        ImGui::GetIO().IniFilename = nullptr;
+
+        if (!ImGui_ImplWin32_Init(gameWindow) || !ImGui_ImplOpenGL2_Init()) {
+            printf("[GLHook] ImGui backend init failed\n");
+            return false;
+        }
+
+        Menu::ApplyTheme();
+
+        oWndProc = (WNDPROC)SetWindowLongPtrA(gameWindow, GWLP_WNDPROC,
+                                              (LONG_PTR)HookedWndProc);
+
+        // Keybinds should only fire while this window is focused
+        ModuleManager::SetGameWindow(gameWindow);
+
+        printf("[GLHook] ImGui ready (hwnd %p)\n", (void*)gameWindow);
+        return true;
     }
 
     static BOOL WINAPI HookedSwapBuffers(HDC hdc) {
+        HGLRC gameCtx = wglGetCurrentContext();
+        HDC   gameDC  = wglGetCurrentDC();
+
+        if (!gameCtx) return oSwapBuffers(hdc);
+
         if (!initialized) {
-            // Save game's GL context
-            gameContext = wglGetCurrentContext();
-            gameWindow = WindowFromDC(hdc);
-
-            // Create our own GL context for ImGui
-            imguiContext = wglCreateContext(hdc);
-            wglMakeCurrent(hdc, imguiContext);
-
-            // Share textures/display lists with game context
-            wglShareLists(gameContext, imguiContext);
-
-            // Init ImGui
-            IMGUI_CHECKVERSION();
-            ImGui::CreateContext();
-            ImGuiIO& io = ImGui::GetIO();
-            io.IniFilename = nullptr; // Don't save imgui.ini
-
-            ImGui_ImplWin32_Init(gameWindow);
-            ImGui_ImplOpenGL2_Init();
-
-            // Hook WndProc for input
-            oWndProc = (fnWndProc)SetWindowLongPtrA(gameWindow, GWLP_WNDPROC, (LONG_PTR)HookedWndProc);
-
-            // Apply theme
-            Menu::ApplyTheme();
-
+            if (!InitImGui(hdc, gameCtx)) {
+                wglMakeCurrent(gameDC, gameCtx);
+                return oSwapBuffers(hdc);
+            }
             initialized = true;
-            printf("[GLHook] ImGui initialized\n");
         }
 
-        // Switch to our GL context
-        wglMakeCurrent(hdc, imguiContext);
+        if (!wglMakeCurrent(hdc, imguiContext)) {
+            return oSwapBuffers(hdc);
+        }
 
-        // Start ImGui frame
         ImGui_ImplOpenGL2_NewFrame();
         ImGui_ImplWin32_NewFrame();
         ImGui::NewFrame();
 
-        // Render our menu
-        if (menuOpen) {
-            Menu::Render();
-        }
-
-        // Always render the active modules HUD
+        // World overlays draw every frame; the menu only when open.
+        Menu::RenderOverlays();
         Menu::RenderHUD();
+        if (menuOpen) Menu::Render();
 
         ImGui::Render();
         ImGui_ImplOpenGL2_RenderDrawData(ImGui::GetDrawData());
 
-        // Switch back to game's GL context
-        wglMakeCurrent(hdc, gameContext);
+        // Hand the game back exactly the context it had
+        wglMakeCurrent(gameDC, gameCtx);
 
         return oSwapBuffers(hdc);
     }
@@ -113,47 +140,59 @@ public:
             return false;
         }
 
-        HMODULE hOpenGL = GetModuleHandleA("opengl32.dll");
-        if (!hOpenGL) {
-            printf("[GLHook] opengl32.dll not found\n");
+        HMODULE hGL = GetModuleHandleA("opengl32.dll");
+        if (!hGL) {
+            printf("[GLHook] opengl32.dll not loaded\n");
             return false;
         }
 
-        void* pSwapBuffers = GetProcAddress(hOpenGL, "wglSwapBuffers");
+        pSwapBuffers = (void*)GetProcAddress(hGL, "wglSwapBuffers");
         if (!pSwapBuffers) {
             printf("[GLHook] wglSwapBuffers not found\n");
             return false;
         }
 
-        if (MH_CreateHook(pSwapBuffers, &HookedSwapBuffers, (void**)&oSwapBuffers) != MH_OK) {
-            printf("[GLHook] Hook creation failed\n");
+        if (MH_CreateHook(pSwapBuffers, (void*)&HookedSwapBuffers,
+                          (void**)&oSwapBuffers) != MH_OK) {
+            printf("[GLHook] MH_CreateHook failed\n");
             return false;
         }
-
         if (MH_EnableHook(pSwapBuffers) != MH_OK) {
-            printf("[GLHook] Hook enable failed\n");
+            printf("[GLHook] MH_EnableHook failed\n");
             return false;
         }
 
-        printf("[GLHook] wglSwapBuffers hooked at %p\n", pSwapBuffers);
+        printf("[GLHook] hooked wglSwapBuffers at %p\n", pSwapBuffers);
         return true;
     }
 
     static void Remove() {
-        MH_DisableHook(MH_ALL_HOOKS);
-        MH_Uninitialize();
+        if (pSwapBuffers) MH_DisableHook(pSwapBuffers);
+
+        // Let any in-flight frame finish before tearing ImGui down
+        Sleep(120);
 
         if (gameWindow && oWndProc) {
             SetWindowLongPtrA(gameWindow, GWLP_WNDPROC, (LONG_PTR)oWndProc);
+            oWndProc = nullptr;
         }
 
         if (initialized) {
             ImGui_ImplOpenGL2_Shutdown();
             ImGui_ImplWin32_Shutdown();
             ImGui::DestroyContext();
+            initialized = false;
         }
+
+        if (imguiContext) {
+            wglDeleteContext(imguiContext);
+            imguiContext = nullptr;
+        }
+
+        MH_Uninitialize();
     }
 
     static bool IsMenuOpen() { return menuOpen; }
-    static void SetMenuOpen(bool open) { menuOpen = open; }
+    static void SetMenuOpen(bool v) { menuOpen = v; }
+    static HWND GetWindow() { return gameWindow; }
 };
