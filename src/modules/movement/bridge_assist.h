@@ -12,10 +12,11 @@
 // Holds sneak when you reach the edge of the block under you, so
 // you can bridge backwards without looking down or falling.
 //
-// Driving keyBindSneak rather than setSneaking matters: the entity
-// flag is recomputed from the key every tick, so writing it直接
-// achieves nothing. Holding the key is also what makes this
-// undetectable, since the packet stream is a plain shift hold.
+// Driving keyBindSneak rather than setSneaking matters twice over:
+// the entity flag is recomputed from the key every tick, so writing
+// it directly achieves nothing, and holding the real key is what
+// makes this invisible to a server. The packet stream is a plain
+// shift hold.
 //
 // MODES
 //   0 Eagle     sneak at the edge, release once clear
