@@ -2,21 +2,22 @@
 #include <imgui.h>
 #include <cstdio>
 #include "../modules/module_manager.h"
+#include "../config/profiles.h"
 
 // =================================================================
 // Menu
 // =================================================================
-// Runs entirely on the render thread. It must never call JNI:
-// toggles are pushed to ModuleManager's queue and applied on the
-// client thread where a valid JNIEnv exists.
+// Runs entirely on the render thread, so it must never call JNI.
+// Toggles and profile loads are queued to ModuleManager and applied
+// on the client thread where a valid JNIEnv exists.
 // =================================================================
 
 class Menu {
 public:
     inline static int s_currentTab = 0;
 
-    inline static const char* s_tabNames[5] = {
-        "Combat", "Movement", "Visual", "Player", "Misc"
+    inline static const char* s_tabNames[6] = {
+        "Combat", "Movement", "Visual", "Player", "Misc", "Configs"
     };
     inline static ModuleCategory s_tabCategories[5] = {
         ModuleCategory::COMBAT,
@@ -81,7 +82,7 @@ public:
         c[ImGuiCol_Separator]           = ImVec4(0.18f, 0.18f, 0.25f, 0.50f);
         c[ImGuiCol_Tab]                 = surface;
         c[ImGuiCol_TabHovered]          = accentDim;
-        // 1.90 names this TabActive. TabSelected only exists in 1.91+.
+        // 1.90 calls this TabActive. TabSelected only exists in 1.91+.
         c[ImGuiCol_TabActive]           = accent;
         c[ImGuiCol_TabUnfocused]        = surface;
         c[ImGuiCol_TabUnfocusedActive]  = accentDim;
@@ -91,51 +92,33 @@ public:
     }
 
     static void KeyLabel(int key, char* out, size_t n) {
-        if (key >= 'A' && key <= 'Z')      snprintf(out, n, "[%c]", (char)key);
-        else if (key == VK_CONTROL)        snprintf(out, n, "[CTRL]");
-        else if (key == VK_SHIFT)          snprintf(out, n, "[SHIFT]");
-        else if (key == VK_MENU)           snprintf(out, n, "[ALT]");
-        else if (key > 0)                  snprintf(out, n, "[0x%X]", key);
-        else                               snprintf(out, n, "%s", "");
+        if (key >= 'A' && key <= 'Z')  snprintf(out, n, "[%c]", (char)key);
+        else if (key == VK_CONTROL)    snprintf(out, n, "[CTRL]");
+        else if (key == VK_SHIFT)      snprintf(out, n, "[SHIFT]");
+        else if (key == VK_MENU)       snprintf(out, n, "[ALT]");
+        else if (key > 0)              snprintf(out, n, "[0x%X]", key);
+        else                           out[0] = '\0';
     }
 
-    static void Render() {
-        ImGui::SetNextWindowSize(ImVec2(560, 440), ImGuiCond_FirstUseEver);
-        ImGui::Begin("Phantom Client v2.4.1", nullptr, ImGuiWindowFlags_NoCollapse);
-
-        if (ImGui::BeginTabBar("##tabs")) {
-            for (int i = 0; i < 5; i++) {
-                if (ImGui::BeginTabItem(s_tabNames[i])) {
-                    s_currentTab = i;
-                    ImGui::EndTabItem();
-                }
-            }
-            ImGui::EndTabBar();
-        }
-
-        ImGui::Separator();
-
-        auto modules = ModuleManager::GetModulesByCategory(s_tabCategories[s_currentTab]);
-
-        ImGui::BeginChild("##modules", ImVec2(0, 0), false);
+    static void RenderModuleList(ModuleCategory cat) {
+        auto modules = ModuleManager::GetModulesByCategory(cat);
 
         if (modules.empty()) {
-            ImGui::TextDisabled("No modules in this category yet.");
+            ImGui::TextDisabled("No modules in this category.");
+            return;
         }
 
         for (auto& mod : modules) {
             ImGui::PushID(mod.get());
 
-            // Toggle first so the checkbox always has a stable hit box
             bool enabled = mod->IsEnabled();
             if (ImGui::Checkbox("##toggle", &enabled)) {
-                // Do NOT flip state here. OnEnable/OnDisable need a
-                // JNIEnv, so hand it to the client thread instead.
+                // Do not flip state here: OnEnable/OnDisable need a
+                // JNIEnv, so hand it to the client thread.
                 ModuleManager::QueueToggle(mod.get());
             }
 
             ImGui::SameLine();
-
             bool open = ImGui::CollapsingHeader(mod->GetName().c_str());
 
             int key = mod->GetKeybind();
@@ -158,12 +141,64 @@ public:
 
             ImGui::PopID();
         }
+    }
+
+    static void RenderConfigs() {
+        ImGui::TextWrapped(
+            "A profile turns the right modules on, forces the dangerous ones "
+            "off, and sets values tuned for that server's anticheat.");
+        ImGui::Spacing();
+
+        auto profiles = Profiles::All();
+        for (size_t i = 0; i < profiles.size(); i++) {
+            ImGui::PushID((int)i);
+
+            ImGui::TextColored(ImVec4(0.45f, 0.35f, 0.95f, 1.f), "%s", profiles[i].name);
+            ImGui::TextDisabled("%s", profiles[i].description);
+
+            if (ImGui::Button("Load", ImVec2(120, 0))) {
+                Profile p = profiles[i];
+                ModuleManager::QueueAction([p](JNIEnv* env) {
+                    Profiles::Apply(p, env);
+                });
+            }
+
+            ImGui::Spacing();
+            ImGui::PopID();
+        }
+
+        const std::string& report = Profiles::LastReport();
+        if (!report.empty()) {
+            ImGui::Separator();
+            ImGui::TextColored(ImVec4(0.4f, 1.f, 0.6f, 1.f), "%s", report.c_str());
+        }
+    }
+
+    static void Render() {
+        ImGui::SetNextWindowSize(ImVec2(580, 460), ImGuiCond_FirstUseEver);
+        ImGui::Begin("Phantom Client v2.4.1", nullptr, ImGuiWindowFlags_NoCollapse);
+
+        if (ImGui::BeginTabBar("##tabs")) {
+            for (int i = 0; i < 6; i++) {
+                if (ImGui::BeginTabItem(s_tabNames[i])) {
+                    s_currentTab = i;
+                    ImGui::EndTabItem();
+                }
+            }
+            ImGui::EndTabBar();
+        }
+
+        ImGui::Separator();
+        ImGui::BeginChild("##body", ImVec2(0, 0), false);
+
+        if (s_currentTab == 5) RenderConfigs();
+        else                   RenderModuleList(s_tabCategories[s_currentTab]);
 
         ImGui::EndChild();
         ImGui::End();
     }
 
-    // Active-module list, top right corner
+    // Active-module list, top right
     static void RenderHUD() {
         ImGuiIO& io = ImGui::GetIO();
         ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x - 10.0f, 10.0f),
@@ -193,7 +228,7 @@ public:
         ImGui::End();
     }
 
-    // World overlays. Called every frame regardless of menu state.
+    // World overlays, drawn every frame regardless of menu state
     static void RenderOverlays() {
         auto esp = ModuleManager::GetESP();
         if (esp) esp->RenderESP();
