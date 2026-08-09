@@ -4,14 +4,24 @@
 #include <Windows.h>
 #include "module.h"
 
-// Module includes
+// Combat
 #include "combat/aim_assist.h"
 #include "combat/kill_aura.h"
 #include "combat/velocity.h"
 #include "combat/sprint_reset.h"
+#include "combat/autoblockhit.h"
+#include "combat/hitselect.h"
+#include "combat/backtrack.h"
+#include "combat/click_assist.h"
+
+// Movement
 #include "movement/speed.h"
 #include "movement/sprint.h"
 #include "movement/fly.h"
+#include "movement/bridge_assist.h"
+#include "movement/no_jump_delay.h"
+
+// Visual
 #include "visual/esp.h"
 #include "visual/fullbright.h"
 
@@ -22,20 +32,30 @@ private:
 
 public:
     static void Init() {
-        // Combat
-        s_modules.push_back(std::make_shared<AimAssist>());
-        s_modules.push_back(std::make_shared<KillAura>());
-        s_modules.push_back(std::make_shared<Velocity>());
-        s_modules.push_back(std::make_shared<SprintReset>());
+        // ===== Combat (core) =====
+        s_modules.push_back(std::make_shared<Velocity>());       // Reduce incoming KB
+        s_modules.push_back(std::make_shared<SprintReset>());    // More outgoing KB
+        s_modules.push_back(std::make_shared<AutoBlockhit>());   // Auto sword block
+        s_modules.push_back(std::make_shared<AimAssist>());      // Smooth aim correction
 
-        // Movement
-        s_modules.push_back(std::make_shared<Speed>());
-        s_modules.push_back(std::make_shared<Sprint>());
-        s_modules.push_back(std::make_shared<Fly>());
+        // ===== Combat (extra) =====
+        s_modules.push_back(std::make_shared<HitSelect>());      // Click on KB tick
+        s_modules.push_back(std::make_shared<Backtrack>());      // Hit past positions
+        s_modules.push_back(std::make_shared<ClickAssist>());    // Legit autoclicker
+        s_modules.push_back(std::make_shared<KillAura>());       // Auto attack (blatant)
 
-        // Visual
-        s_modules.push_back(std::make_shared<ESP>());
-        s_modules.push_back(std::make_shared<Fullbright>());
+        // ===== Movement (core) =====
+        s_modules.push_back(std::make_shared<BridgeAssist>());   // AutoEagle / safewalk
+        s_modules.push_back(std::make_shared<Sprint>());         // Always sprint
+        s_modules.push_back(std::make_shared<NoJumpDelay>());    // Remove jump cooldown
+
+        // ===== Movement (extra) =====
+        s_modules.push_back(std::make_shared<Speed>());          // Speed boost
+        s_modules.push_back(std::make_shared<Fly>());            // Fly (blatant)
+
+        // ===== Visual =====
+        s_modules.push_back(std::make_shared<ESP>());            // Player wallhack
+        s_modules.push_back(std::make_shared<Fullbright>());     // Gamma override
     }
 
     static void Tick(JNIEnv* env) {
