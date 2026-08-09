@@ -46,6 +46,11 @@
 // Every tick runs inside a JNI local frame. Without it the local
 // reference table fills up within seconds and the JVM aborts.
 //
+// TICK ORDER
+// Backtrack rewrites entity positions. Everything else, including
+// the ESP, has to see the real world, so its restore pass runs
+// before the entity scan rather than as a normal module tick.
+//
 // KEY SAFETY
 // Modules hold real keybinds down. If the world goes away or we
 // eject while a key is held, the player is left walking into a wall
@@ -62,6 +67,7 @@ private:
 
     inline static HWND s_gameWindow = nullptr;
     inline static std::shared_ptr<ESP> s_esp;
+    inline static std::shared_ptr<Backtrack> s_backtrack;
     inline static bool s_wasInGame = false;
 
     // A packed lobby can hold 60+ players, and the entity scan takes
@@ -77,7 +83,10 @@ public:
         s_modules.push_back(std::make_shared<AutoBlockhit>());
         s_modules.push_back(std::make_shared<AimAssist>());
         s_modules.push_back(std::make_shared<HitSelect>());
-        s_modules.push_back(std::make_shared<Backtrack>());
+
+        s_backtrack = std::make_shared<Backtrack>();
+        s_modules.push_back(s_backtrack);
+
         s_modules.push_back(std::make_shared<ClickAssist>());
         s_modules.push_back(std::make_shared<KillAura>());
 
@@ -149,6 +158,14 @@ public:
         // cache has to be invalidated inside it, not outside.
         EntityList::BeginTick();
 
+        // Undo last tick's rewind before anything reads an entity.
+        // Runs even while the module is off, so a toggle mid-rewind
+        // still leaves the world in the right place.
+        if (s_backtrack) {
+            s_backtrack->RestoreBeforeScan(env);
+            if (env->ExceptionCheck()) { env->ExceptionDescribe(); env->ExceptionClear(); }
+        }
+
         // ---- Work handed over by the UI ----
         {
             std::vector<std::function<void(JNIEnv*)>> pending;
@@ -209,6 +226,7 @@ public:
             std::lock_guard<std::mutex> lock(s_actionMutex);
             s_actions.clear();
         }
+        s_backtrack.reset();
         s_esp.reset();
         s_modules.clear();
     }
