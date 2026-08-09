@@ -7,16 +7,18 @@
 #include "jni/class_resolver.h"
 #include "hooks/gl_hook.h"
 #include "mc/minecraft.h"
-#include "mc/keybinds.h"
 #include "mc/entity_list.h"
+#include "mc/keybinds.h"
 #include "modules/module_manager.h"
 
 FILE* g_console = nullptr;
 
-// Minecraft runs at 20 ticks per second and every module expresses
-// its delays in ticks, so the client loop has to match. An earlier
-// version used Sleep(1), which ran roughly 1000 iterations a second
-// and made every "2 tick" delay expire in two milliseconds.
+// Minecraft runs at 20 ticks per second. Every module expresses its
+// delays in ticks, so the client loop has to match. Running faster
+// made a "2 tick" delay expire in 2 milliseconds.
+//
+// Click timing does NOT live here: ClickScheduler runs on its own
+// 1ms thread, because a 50ms loop cannot express a 27ms gap.
 static constexpr int TICK_MS = 50;
 
 static bool WaitForResolve(JNIEnv* env, int maxSeconds) {
@@ -47,7 +49,7 @@ void MainThread(HMODULE hModule) {
     printf("[Phantom] JVM attached (JNI 0x%x)\n", JNIHelper::GetVersion());
 
     // ---- 2. Resolve classes and the Minecraft singleton ----
-    // Injecting at the main menu is normal, so retry instead of
+    // Injecting at the main menu is normal, so retry rather than
     // giving up on the first pass.
     if (!WaitForResolve(env, 60)) {
         printf("[Phantom] FATAL: could not resolve Minecraft classes\n");
@@ -61,11 +63,11 @@ void MainThread(HMODULE hModule) {
     printf("[Phantom] Minecraft resolved\n");
 
     // ---- 3. Keybinds ----
-    // Most modules simulate input by driving these, so without them
-    // the client is inert. Not fatal: they resolve later if the
-    // options object is not ready yet.
+    // Most modules act by holding real keys, so without these they
+    // are inert. GameSettings exists at the main menu, so this
+    // normally succeeds immediately.
     if (KeyBinds::Init(env)) printf("[Phantom] Keybinds resolved\n");
-    else                     printf("[Phantom] Keybinds deferred\n");
+    else printf("[Phantom] Keybinds deferred, will retry in the loop\n");
 
     // ---- 4. Modules ----
     ModuleManager::Init();
@@ -92,24 +94,27 @@ void MainThread(HMODULE hModule) {
         ejectHeld = del;
 
         if (Minecraft::InGame(env)) {
-            // Both retry quietly until a world exists
-            KeyBinds::Init(env);
-            EntityList::Init(env);
+            KeyBinds::Init(env);     // no-op once resolved
+            EntityList::Init(env);   // needs a loaded world
             ModuleManager::Tick(env);
+        } else {
+            // Left the world. Drop any key a module was holding,
+            // otherwise it follows you into the next game.
+            ModuleManager::OnLeaveWorld(env);
         }
 
         next += std::chrono::milliseconds(TICK_MS);
         auto now = std::chrono::steady_clock::now();
         if (next > now) std::this_thread::sleep_until(next);
-        else next = now;   // fell behind, resync rather than spin
+        else next = now;   // we fell behind, resync instead of spinning
     }
 
     // ---- 7. Teardown ----
+    // Order matters. GLHook::Remove stops the render thread from
+    // calling into module state, so it has to happen before the
+    // modules are destroyed.
     printf("[Phantom] Ejecting...\n");
     GLHook::Remove();
-
-    // Disables every module first, so anything holding a keybind
-    // lets go before we drop the references.
     ModuleManager::Shutdown(env);
     KeyBinds::Shutdown(env);
     EntityList::Shutdown(env);
