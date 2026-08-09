@@ -7,6 +7,7 @@
 #include <Windows.h>
 #include "module.h"
 #include "../mc/keybinds.h"
+#include "../mc/entity_list.h"
 #include "../input/click_scheduler.h"
 
 // Combat
@@ -62,6 +63,11 @@ private:
     inline static HWND s_gameWindow = nullptr;
     inline static std::shared_ptr<ESP> s_esp;
     inline static bool s_wasInGame = false;
+
+    // A packed lobby can hold 60+ players, and the entity scan takes
+    // a couple of refs each on top of whatever the modules allocate.
+    // 256 was close enough to the edge to matter.
+    static constexpr jint kLocalFrameSize = 768;
 
 public:
     static void Init() {
@@ -134,12 +140,14 @@ public:
         if (!env) return;
         s_wasInGame = true;
 
-        // Room for the refs this tick allocates. PopLocalFrame frees
-        // every one of them, including anything the modules made.
-        if (env->PushLocalFrame(256) != 0) {
+        if (env->PushLocalFrame(kLocalFrameSize) != 0) {
             if (env->ExceptionCheck()) env->ExceptionClear();
             return;
         }
+
+        // Entity refs belong to the frame we just pushed, so the
+        // cache has to be invalidated inside it, not outside.
+        EntityList::BeginTick();
 
         // ---- Work handed over by the UI ----
         {
@@ -177,6 +185,8 @@ public:
             }
         }
 
+        // Drops every entity ref the cache was holding
+        EntityList::BeginTick();
         env->PopLocalFrame(nullptr);
     }
 
