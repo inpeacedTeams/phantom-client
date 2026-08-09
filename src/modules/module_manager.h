@@ -4,10 +4,11 @@
 #include <Windows.h>
 #include "module.h"
 
-// Forward declarations
+// Module includes
 #include "combat/aim_assist.h"
 #include "combat/kill_aura.h"
 #include "combat/velocity.h"
+#include "combat/sprint_reset.h"
 #include "movement/speed.h"
 #include "movement/sprint.h"
 #include "movement/fly.h"
@@ -25,6 +26,7 @@ public:
         s_modules.push_back(std::make_shared<AimAssist>());
         s_modules.push_back(std::make_shared<KillAura>());
         s_modules.push_back(std::make_shared<Velocity>());
+        s_modules.push_back(std::make_shared<SprintReset>());
 
         // Movement
         s_modules.push_back(std::make_shared<Speed>());
@@ -37,7 +39,6 @@ public:
     }
 
     static void Tick(JNIEnv* env) {
-        // Handle keybinds
         for (auto& mod : s_modules) {
             int key = mod->GetKeybind();
             if (key > 0) {
@@ -49,7 +50,6 @@ public:
             }
         }
 
-        // Tick enabled modules
         for (auto& mod : s_modules) {
             if (mod->IsEnabled()) {
                 mod->OnTick(env);
