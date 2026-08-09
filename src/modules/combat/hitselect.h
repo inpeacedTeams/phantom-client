@@ -2,6 +2,7 @@
 #include "../module.h"
 #include "../../mc/minecraft.h"
 #include "../../mc/entity_list.h"
+#include "../../input/click_scheduler.h"
 #include <imgui.h>
 #include <Windows.h>
 #include <random>
@@ -16,6 +17,12 @@
 //
 // Pure click timing, so there is nothing for a server-side anticheat
 // to see beyond a well-timed player.
+//
+// The click goes out through ClickScheduler rather than SendInput.
+// With the autoclicker also running, two independent sources firing
+// SendInput can land microseconds apart, and a sub-20ms interval is
+// the one thing no hand can produce. The scheduler holds a shared
+// floor and drops this click if it would break it.
 // =================================================================
 
 class HitSelect : public Module {
@@ -26,6 +33,8 @@ private:
     float m_targetRange    = 3.6f;
 
     int m_lastHurtTime = 0;
+    int m_fired   = 0;
+    int m_dropped = 0;
     std::mt19937 m_rng{ std::random_device{}() };
 
     bool Roll(float pct) {
@@ -63,12 +72,8 @@ public:
 
         if (!Roll(m_chance)) return;
 
-        INPUT in[2] = {};
-        in[0].type = INPUT_MOUSE;
-        in[0].mi.dwFlags = MOUSEEVENTF_LEFTDOWN;
-        in[1].type = INPUT_MOUSE;
-        in[1].mi.dwFlags = MOUSEEVENTF_LEFTUP;
-        SendInput(2, in, sizeof(INPUT));
+        if (ClickScheduler::RequestClick(false)) m_fired++;
+        else                                     m_dropped++;
     }
 
     void RenderSettings() override {
@@ -77,7 +82,13 @@ public:
         ImGui::Checkbox("Require Target", &m_requireTarget);
         if (m_requireTarget)
             ImGui::SliderFloat("Target Range", &m_targetRange, 2.f, 6.f, "%.1f");
+
         ImGui::Separator();
         ImGui::TextWrapped("Clicks the exact tick you take KB, cancelling part of it.");
+        ImGui::TextDisabled("Fired %d | dropped by floor %d", m_fired, m_dropped);
+        if (m_dropped > m_fired && m_fired > 4) {
+            ImGui::TextColored(ImVec4(1.f, 0.7f, 0.3f, 1.f),
+                "Mostly dropped: the autoclicker is already saturating the rate");
+        }
     }
 };
