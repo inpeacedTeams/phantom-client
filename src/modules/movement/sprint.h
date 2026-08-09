@@ -1,58 +1,68 @@
 #pragma once
 #include "../module.h"
 #include "../../mc/minecraft.h"
-#include "../../mappings/mcp189.h"
+#include "../../mc/keybinds.h"
 #include <imgui.h>
+#include <Windows.h>
+
+// =================================================================
+// Sprint
+// =================================================================
+// Holds the sprint keybind so you never have to.
+//
+// Calling setSprinting(true) directly does not survive the tick:
+// EntityPlayerSP.onLivingUpdate() recomputes sprint from the keys
+// and clears it. Holding keyBindSprint sits upstream of that and is
+// byte-for-byte what a player with sprint bound would produce.
+// =================================================================
 
 class Sprint : public Module {
 private:
-    bool m_omniSprint = false; // Sprint in all directions
-
-    jmethodID m_setSprinting = nullptr;
-    bool m_resolved = false;
-
-    void ResolveMethod(JNIEnv* env) {
-        if (m_resolved) return;
-        if (ClassResolver::entity) {
-            // Entity.setSprinting(boolean)
-            m_setSprinting = env->GetMethodID(ClassResolver::entity, "func_70031_b", "(Z)V");
-            if (env->ExceptionCheck()) {
-                env->ExceptionClear();
-                m_setSprinting = env->GetMethodID(ClassResolver::entity, "setSprinting", "(Z)V");
-                if (env->ExceptionCheck()) env->ExceptionClear();
-            }
-        }
-        m_resolved = true;
-    }
+    bool m_omniSprint = false;   // sprint sideways and backwards too
+    bool m_held = false;
 
 public:
-    Sprint() : Module("Sprint", "Always sprint without holding key", ModuleCategory::MOVEMENT, VK_CONTROL) {}
+    Sprint() : Module("Sprint", "Always sprint without holding the key",
+                      ModuleCategory::MOVEMENT, VK_CONTROL)
+    {
+        Bind("Omni Sprint", &m_omniSprint);
+    }
 
     void OnTick(JNIEnv* env) override {
-        ResolveMethod(env);
+        if (!KeyBinds::Init(env)) return;
 
         jobject player = Minecraft::GetPlayer(env);
         if (!player) return;
-        if (Minecraft::IsInGui(env)) return;
-
-        // Check if moving forward (or any direction if omniSprint)
-        bool moving;
-        if (m_omniSprint) {
-            moving = (GetAsyncKeyState('W') & 0x8000) ||
-                     (GetAsyncKeyState('A') & 0x8000) ||
-                     (GetAsyncKeyState('S') & 0x8000) ||
-                     (GetAsyncKeyState('D') & 0x8000);
-        } else {
-            moving = (GetAsyncKeyState('W') & 0x8000);
+        if (Minecraft::IsInGui(env)) {
+            if (m_held) { KeyBinds::SetSprint(env, false); m_held = false; }
+            return;
         }
 
-        if (moving && m_setSprinting) {
-            env->CallVoidMethod(player, m_setSprinting, (jboolean)true);
-            if (env->ExceptionCheck()) env->ExceptionClear();
+        bool moving = m_omniSprint
+            ? (KeyBinds::GetForward(env) || KeyBinds::GetBack(env)
+            || KeyBinds::GetLeft(env)    || KeyBinds::GetRight(env))
+            :  KeyBinds::GetForward(env);
+
+        if (moving && !m_held) {
+            KeyBinds::SetSprint(env, true);
+            m_held = true;
+        } else if (!moving && m_held) {
+            KeyBinds::SetSprint(env, false);
+            m_held = false;
         }
+    }
+
+    void OnDisable(JNIEnv* env) override {
+        if (!m_held) return;
+        KeyBinds::SetSprint(env, false);
+        m_held = false;
     }
 
     void RenderSettings() override {
         ImGui::Checkbox("Omni Sprint", &m_omniSprint);
+        if (m_omniSprint) {
+            ImGui::TextColored(ImVec4(1.f, 0.7f, 0.3f, 1.f),
+                "Sideways sprint is not vanilla behaviour");
+        }
     }
 };
