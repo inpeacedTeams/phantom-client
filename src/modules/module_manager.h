@@ -3,6 +3,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <functional>
 #include <Windows.h>
 #include "module.h"
 
@@ -32,15 +33,14 @@
 // =================================================================
 // THREADING CONTRACT
 //
-// Tick() runs on our own client thread, which is attached to the
-// JVM. It is the ONLY place JNI is allowed.
+// Tick() runs on our client thread, which is attached to the JVM.
+// It is the only place JNI may be touched.
 //
-// The render thread (inside the wglSwapBuffers hook) draws the menu
-// and reads module state, but never calls JNI. When the user clicks
-// a toggle we push it onto a queue and apply it here instead, so
-// OnEnable/OnDisable always run with a valid JNIEnv.
+// The render thread draws the menu and reads module state but never
+// calls JNI. Anything the UI wants to do that needs a JNIEnv is
+// pushed onto the action queue and executed here instead.
 //
-// Every tick is wrapped in a JNI local frame. Without it the local
+// Every tick runs inside a JNI local frame. Without it the local
 // reference table fills up within seconds and the JVM aborts.
 // =================================================================
 
@@ -49,41 +49,38 @@ private:
     inline static std::vector<std::shared_ptr<Module>> s_modules;
     inline static bool s_keyStates[256] = {};
 
-    inline static std::vector<Module*> s_pendingToggles;
-    inline static std::mutex s_toggleMutex;
+    inline static std::vector<std::function<void(JNIEnv*)>> s_actions;
+    inline static std::mutex s_actionMutex;
 
     inline static HWND s_gameWindow = nullptr;
     inline static std::shared_ptr<ESP> s_esp;
 
 public:
     static void Init() {
-        // ---- Combat: core ----
+        // Combat, core first so they sit at the top of the tab
         s_modules.push_back(std::make_shared<Velocity>());
         s_modules.push_back(std::make_shared<SprintReset>());
         s_modules.push_back(std::make_shared<AutoBlockhit>());
         s_modules.push_back(std::make_shared<AimAssist>());
-
-        // ---- Combat: extra ----
         s_modules.push_back(std::make_shared<HitSelect>());
         s_modules.push_back(std::make_shared<Backtrack>());
         s_modules.push_back(std::make_shared<ClickAssist>());
         s_modules.push_back(std::make_shared<KillAura>());
 
-        // ---- Movement ----
+        // Movement
         s_modules.push_back(std::make_shared<BridgeAssist>());
         s_modules.push_back(std::make_shared<Sprint>());
         s_modules.push_back(std::make_shared<NoJumpDelay>());
         s_modules.push_back(std::make_shared<Speed>());
         s_modules.push_back(std::make_shared<Fly>());
 
-        // ---- Visual ----
+        // Visual
         s_esp = std::make_shared<ESP>();
         s_modules.push_back(s_esp);
         s_modules.push_back(std::make_shared<Fullbright>());
     }
 
     static void SetGameWindow(HWND hwnd) { s_gameWindow = hwnd; }
-
     static std::shared_ptr<ESP> GetESP() { return s_esp; }
 
     template <typename T>
@@ -95,35 +92,45 @@ public:
         return nullptr;
     }
 
-    // Called from the render thread. Never touches JNI.
+    // Called from the render thread. Never touches JNI itself.
+    static void QueueAction(std::function<void(JNIEnv*)> fn) {
+        if (!fn) return;
+        std::lock_guard<std::mutex> lock(s_actionMutex);
+        s_actions.push_back(std::move(fn));
+    }
+
     static void QueueToggle(Module* mod) {
         if (!mod) return;
-        std::lock_guard<std::mutex> lock(s_toggleMutex);
-        s_pendingToggles.push_back(mod);
+        QueueAction([mod](JNIEnv* env) { mod->Toggle(env); });
     }
 
     static void Tick(JNIEnv* env) {
         if (!env) return;
 
-        // Reserve room for the refs this tick will create. Everything
-        // allocated below is released by PopLocalFrame.
+        // Room for the refs this tick allocates. PopLocalFrame frees
+        // every one of them, including anything the modules made.
         if (env->PushLocalFrame(256) != 0) {
             if (env->ExceptionCheck()) env->ExceptionClear();
             return;
         }
 
-        // ---- Apply toggles requested by the UI ----
+        // ---- Work handed over by the UI ----
         {
-            std::vector<Module*> pending;
+            std::vector<std::function<void(JNIEnv*)>> pending;
             {
-                std::lock_guard<std::mutex> lock(s_toggleMutex);
-                pending.swap(s_pendingToggles);
+                std::lock_guard<std::mutex> lock(s_actionMutex);
+                pending.swap(s_actions);
             }
-            for (Module* m : pending) m->Toggle(env);
+            for (auto& fn : pending) {
+                fn(env);
+                if (env->ExceptionCheck()) { env->ExceptionDescribe(); env->ExceptionClear(); }
+            }
         }
 
-        // ---- Keybinds (only while the game window has focus) ----
-        bool focused = (s_gameWindow == nullptr) || (GetForegroundWindow() == s_gameWindow);
+        // ---- Keybinds, only while the game window is focused ----
+        bool focused = (s_gameWindow == nullptr)
+                    || (GetForegroundWindow() == s_gameWindow);
+
         for (auto& mod : s_modules) {
             int key = mod->GetKeybind();
             if (key <= 0 || key > 255) continue;
@@ -148,16 +155,20 @@ public:
 
     static void Shutdown(JNIEnv* env) {
         if (env) {
-            for (auto& mod : s_modules) {
+            // Disable everything so modules release the keybinds they
+            // took over instead of leaving keys stuck down.
+            for (auto& mod : s_modules)
                 if (mod->IsEnabled()) mod->SetEnabled(false, env);
-            }
+        }
+        {
+            std::lock_guard<std::mutex> lock(s_actionMutex);
+            s_actions.clear();
         }
         s_esp.reset();
         s_modules.clear();
     }
 
     static int GetModuleCount() { return (int)s_modules.size(); }
-
     static std::vector<std::shared_ptr<Module>>& GetModules() { return s_modules; }
 
     static std::vector<std::shared_ptr<Module>> GetModulesByCategory(ModuleCategory cat) {
