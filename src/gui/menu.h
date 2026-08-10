@@ -2,6 +2,7 @@
 #include <imgui.h>
 #include <cstdio>
 #include "../modules/module_manager.h"
+#include "../render/backtrack_vis.h"
 #include "../config/profiles.h"
 
 // =================================================================
@@ -228,9 +229,14 @@ public:
         ImGui::End();
     }
 
-    // World overlays, drawn every frame regardless of menu state
+    // World overlays, drawn every frame regardless of menu state.
+    // Backtrack draws after the ESP so the held position sits on top
+    // of the box marking where the server actually has the player.
     static void RenderOverlays() {
         auto esp = ModuleManager::GetESP();
         if (esp) esp->RenderESP();
+
+        auto bt = ModuleManager::GetBacktrack();
+        if (bt) BacktrackVis::Render(bt.get());
     }
 };
