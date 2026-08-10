@@ -37,12 +37,21 @@
 // PITCH RATIO lives inside Rotation::Step now, not here. Scaling the
 // pitch that Step returned used to knock it straight back off the
 // mouse grid, which is the one thing this module must never do.
+//
+// ROTATION MODE picks the travel shape (Smooth, Linear, Snap) and
+// is passed straight into Step, so the grid snap covers all three.
+// Smooth is the human-looking default; the other two are faster and
+// louder, and the notice says so.
 // =================================================================
 
 class AimAssist : public Module {
 private:
     static constexpr const char* kPriorities[] = {
         "Crosshair", "Closest", "Lowest HP"
+    };
+
+    static constexpr const char* kRotModes[] = {
+        "Smooth", "Linear", "Snap"
     };
 
     // Past this the correction is visible when someone watches a
@@ -54,6 +63,7 @@ private:
     static constexpr int kWanderPeriod = 7;
 
     // ---- Feel ----
+    int   m_rotMode    = 0;      // 0 smooth, 1 linear, 2 snap
     float m_speed      = 3.2f;
     float m_pitchRatio = 0.6f;   // pitch moves slower than yaw, like a wrist
     float m_smoothing  = 0.55f;
@@ -113,6 +123,15 @@ private:
         return d(m_rng);
     }
 
+    // Map the setting index onto the engine enum in one place.
+    Rotation::Mode RotMode() const {
+        switch (m_rotMode) {
+            case 1:  return Rotation::Mode::Linear;
+            case 2:  return Rotation::Mode::Snap;
+            default: return Rotation::Mode::Smooth;
+        }
+    }
+
     void Resolve(JNIEnv* env) {
         if (m_resolved) return;
 
@@ -162,8 +181,14 @@ public:
         BindMode("Priority", &m_targetMode, kPriorities, 3,
                  "Which of several people in reach it helps you with");
 
+        BindMode("Rotation", &m_rotMode, kRotModes, 3,
+                 "Smooth eases in with inertia and reads as a hand. Linear "
+                 "pulls at a steady speed and arrives sooner. Snap turns "
+                 "the whole way in one tick and is for unprotected servers.");
+
         Bind("Speed", &m_speed, 0.5f, 10.0f, "%.1f",
-             "How hard it pulls toward the target");
+             "How hard it pulls toward the target. Under Linear this is read "
+             "as degrees per tick.");
 
         Bind("FOV", &m_fov, 10.0f, 180.0f, "%.0f",
              "How far off centre someone can be and still be picked up");
@@ -177,9 +202,11 @@ public:
              "matching that is most of why a rotation reads as human")
             .Advanced();
 
+        // Smoothing is the Smooth curve's inertia. Linear has none by
+        // definition and Snap is instant, so it only applies to mode 0.
         Bind("Smoothing", &m_smoothing, 0.0f, 0.9f, "%.2f",
              "How much of last tick's movement carries into this one")
-            .Advanced();
+            .When("Rotation", 0).Advanced();
 
         // ---- Targeting ----
         Bind("Sticky", &m_sticky,
@@ -215,9 +242,12 @@ public:
              "Noise on each step, on top of the mouse grid")
             .Advanced();
 
+        // Overshoot is a Smooth-only behaviour: Linear is capped at
+        // the remaining angle and Snap lands exactly on target, so
+        // neither can overrun.
         Bind("Overshoot", &m_overshoot, 0.0f, 0.25f, "%.2f",
              "How often it goes slightly past and corrects back")
-            .Advanced();
+            .When("Rotation", 0).Advanced();
 
         Bind("Breaks", &m_breaks,
              "Deliberate lapses. Perfect tracking forever is a signature in "
@@ -360,12 +390,14 @@ public:
         auto want = Rotation::ToPoint(env, player, tx, ty, tz);
         m_lastAngle = AngleTo(env, player, tx, ty, tz, yaw, pitch);
 
-        // Pitch ratio goes INTO Step so the grid snap and the
-        // velocity carry both act on the value that is written.
-        // Scaling next.pitch here afterwards was the grid violation.
+        // Pitch ratio and the travel mode both go INTO Step so the
+        // grid snap and the velocity carry act on the value that is
+        // written. Scaling next.pitch here afterwards was the grid
+        // violation this module used to have.
         auto next = Rotation::Step(yaw, pitch, want.yaw, want.pitch,
                                    m_speed, m_smoothing,
-                                   m_jitter, m_overshoot, m_pitchRatio);
+                                   m_jitter, m_overshoot,
+                                   m_pitchRatio, RotMode());
 
         Minecraft::SetYaw(env, player, next.yaw);
         Minecraft::SetPitch(env, player, next.pitch);
@@ -388,6 +420,17 @@ public:
             *text = "Your mouse sensitivity could not be read, so a default "
                     "grid is used. Rotations will not line up exactly with "
                     "what your hand can produce.";
+            return NoticeLevel::Warning;
+        }
+        if (m_rotMode == 2) {
+            *text = "Snap turns the whole way to the target in a single tick. "
+                    "Instant and unmistakable on any prediction anticheat. "
+                    "Unprotected servers only.";
+            return NoticeLevel::Danger;
+        }
+        if (m_rotMode == 1) {
+            *text = "Linear pulls at a constant speed with no easing, which "
+                    "arrives faster but reads less like a hand than Smooth.";
             return NoticeLevel::Warning;
         }
         if (!m_requireSwing) {
