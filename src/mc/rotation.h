@@ -37,6 +37,14 @@
 //    a real bug in Aim Assist and is the one thing this file exists
 //    to prevent.
 //
+//    The quantiser CARRIES its remainder (see QuantiseCarry). A
+//    plain truncation threw away any step smaller than one grid
+//    quantum, which near the target is every step, so the crosshair
+//    froze and then lurched a whole quantum at once. A real slow
+//    mouse move does not do that: it emits one count every few
+//    frames. Carrying the leftover reproduces that and is what makes
+//    slow tracking smooth instead of steppy.
+//
 // 2. Zero jerk.
 //    A hand accelerates and decelerates. Interpolating straight to
 //    a target produces a velocity curve no arm can make, so Smooth
@@ -65,6 +73,13 @@ private:
     inline static float s_pitchVelocity = 0.0f;
     inline static float s_sensitivity   = 0.5f;   // the game's slider
     inline static bool  s_haveSens      = false;
+
+    // Sub-grid remainder carried between ticks, one per axis. This
+    // is rotation state exactly like the velocity above: it belongs
+    // to the current, continuous motion toward a target and must be
+    // cleared the moment that situation ends (ResetVelocity).
+    inline static float s_yawResidual   = 0.0f;
+    inline static float s_pitchResidual = 0.0f;
 
     inline static std::mt19937 s_rng{ std::random_device{}() };
 
@@ -96,13 +111,37 @@ public:
     static bool HaveSensitivity() { return s_haveSens; }
     static float Sensitivity() { return s_sensitivity; }
 
-    // Snap a delta to the mouse grid. Called on the DELTA rather
-    // than the absolute angle, because that is what the client
-    // itself quantises.
+    // Snap a delta to the mouse grid, no memory. Kept for callers
+    // that want a one-off quantise; the per-tick rotation path uses
+    // QuantiseCarry instead so slow motion is not discarded.
     static float Quantise(float delta) {
         float g = GCD();
         if (g <= 0.0001f) return delta;
         return (float)((int)(delta / g)) * g;
+    }
+
+    // Snap to the grid while carrying the leftover into the next
+    // call. Rounds to the NEAREST quantum against delta + residual,
+    // then stores what did not fit. Over several ticks a stream of
+    // sub-quantum deltas emits whole quanta at the right average
+    // rate, which is what a slow mouse actually does, rather than
+    // truncating each one to zero and lurching later.
+    static float QuantiseCarry(float delta, float& residual) {
+        float g = GCD();
+        if (g <= 0.0001f) { residual = 0.0f; return delta; }
+
+        float total = delta + residual;
+        float steps = std::floor(total / g + 0.5f);   // nearest, not toward zero
+        float out   = steps * g;
+        residual    = total - out;
+
+        // A runaway residual is impossible in normal use, but a huge
+        // one-off delta (a target teleporting across the map) should
+        // not leave a tail queued for later. Keep it within a
+        // quantum.
+        if (residual >  g) residual =  g;
+        if (residual < -g) residual = -g;
+        return out;
     }
 
     // -------------------------------------------------------------
@@ -220,9 +259,12 @@ public:
         // The grid is the last thing applied, so the value written
         // is one a mouse could actually have produced. Every mode
         // passes through here, which is why none of them may be
-        // scaled by the caller afterwards.
-        stepYaw   = Quantise(stepYaw);
-        stepPitch = Quantise(stepPitch);
+        // scaled by the caller afterwards. The carry means a step
+        // too small for one quantum this tick is not lost: it adds
+        // to the next, and the crosshair advances in smooth minimum
+        // steps rather than freezing and lurching.
+        stepYaw   = QuantiseCarry(stepYaw,   s_yawResidual);
+        stepPitch = QuantiseCarry(stepPitch, s_pitchResidual);
 
         Angles out;
         out.yaw   = curYaw + stepYaw;
@@ -235,10 +277,14 @@ public:
     }
 
     // Rotation carries between ticks, so it has to be cleared when a
-    // module stops or the arm keeps drifting after it is switched off.
+    // module stops or the arm keeps drifting after it is switched
+    // off. The residuals go with it: a leftover from one target must
+    // not seed the first step toward the next.
     static void ResetVelocity() {
         s_yawVelocity = 0.0f;
         s_pitchVelocity = 0.0f;
+        s_yawResidual = 0.0f;
+        s_pitchResidual = 0.0f;
     }
 
     static float YawVelocity()   { return s_yawVelocity; }
