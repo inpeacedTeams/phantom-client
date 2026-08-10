@@ -12,17 +12,17 @@
 // =================================================================
 // Drawn by hand rather than restyled, because the shapes ImGui
 // ships cannot become these. A switch is a pill with a shadowed
-// knob that overshoots slightly on the way across; a segmented
-// control is a sliding capsule under the labels. Neither exists in
-// the stock widget set at any style setting.
+// knob that widens under the finger; a segmented control is a
+// capsule that slides between labels. Neither exists in the stock
+// widget set at any style setting.
 //
-// Every widget takes its animation state from iOS::Anim keyed on
-// the ImGui ID, so nothing has to be stored by the caller.
+// Every widget pulls its animation state from iOS::Anim keyed on
+// the ImGui ID, so callers store nothing.
 // =================================================================
 
 namespace iOS {
 
-// ---- Shadow under a card, faked with two offset rounded rects ----
+// Shadow under a card, faked with two offset rounded rects
 inline void DropShadow(ImDrawList* dl, ImVec2 a, ImVec2 b, float rounding) {
     dl->AddRectFilled(ImVec2(a.x, a.y + 2.0f), ImVec2(b.x, b.y + 3.0f),
                       Col::Shadow2, rounding);
@@ -31,11 +31,7 @@ inline void DropShadow(ImDrawList* dl, ImVec2 a, ImVec2 b, float rounding) {
 }
 
 // =================================================================
-// Switch
-// =================================================================
-// 51x31, the real iOS metrics. The knob eases across and the track
-// crossfades green underneath. Pressing it widens the knob a little,
-// which is the detail that makes the control feel physical.
+// Switch  (51x31, the real iOS metrics)
 // =================================================================
 inline bool Switch(const char* id, bool* v, bool enabled = true) {
     ImGui::PushID(id);
@@ -67,13 +63,13 @@ inline bool Switch(const char* id, bool* v, bool enabled = true) {
                           Col::Alpha(Col::Label, 0.04f), r);
     }
 
-    // Knob. Held widens it toward the direction of travel.
-    float pad   = 2.0f;
-    float kd    = M::SwitchKnob;
-    float grow  = press * 4.0f;
+    // Knob widens toward the direction of travel while held
+    float pad    = 2.0f;
+    float kd     = M::SwitchKnob;
+    float grow   = press * 4.0f;
     float travel = size.x - kd - pad * 2.0f;
-    float kx    = pos.x + pad + travel * t;
-    if (t > 0.5f) kx -= grow;                 // grow backwards when on
+    float kx     = pos.x + pad + travel * t;
+    if (t > 0.5f) kx -= grow;
 
     ImVec2 ka(kx, pos.y + pad);
     ImVec2 kb(kx + kd + grow, pos.y + size.y - pad);
@@ -89,9 +85,6 @@ inline bool Switch(const char* id, bool* v, bool enabled = true) {
 
 // =================================================================
 // Segmented control
-// =================================================================
-// The selected capsule slides between segments instead of snapping,
-// so the eye follows it rather than re-reading the row.
 // =================================================================
 inline bool Segmented(const char* id, const char* const items[], int count,
                       int* current, float width = -1.0f)
@@ -117,7 +110,7 @@ inline bool Segmented(const char* id, const char* const items[], int count,
     }
 
     bool held = ImGui::IsItemActive();
-    float sel = Anim::To(wid, (float)*current, 18.0f);
+    float sel   = Anim::To(wid, (float)*current, 18.0f);
     float press = Anim::To(ImGui::GetID("##segp"), held ? 1.0f : 0.0f, 20.0f);
 
     ImDrawList* dl = ImGui::GetWindowDrawList();
@@ -125,8 +118,7 @@ inline bool Segmented(const char* id, const char* const items[], int count,
     dl->AddRectFilled(pos, ImVec2(pos.x + size.x, pos.y + size.y),
                       Col::Fill, M::SegRadius);
 
-    // Sliding capsule
-    float inset = 2.0f;
+    float inset  = 2.0f;
     float shrink = press * 1.5f;
     ImVec2 ca(pos.x + inset + segW * sel + shrink, pos.y + inset + shrink);
     ImVec2 cb(ca.x + segW - inset * 2.0f - shrink * 2.0f,
@@ -136,7 +128,7 @@ inline bool Segmented(const char* id, const char* const items[], int count,
                       IM_COL32(0, 0, 0, 20), M::SegRadius - 1.0f);
     dl->AddRectFilled(ca, cb, Col::Card, M::SegRadius - 1.0f);
 
-    // Labels. The selected one darkens as the capsule arrives.
+    // The selected label darkens as the capsule arrives under it
     for (int i = 0; i < count; i++) {
         ImVec2 ts = ImGui::CalcTextSize(items[i]);
         float cx = pos.x + segW * i + (segW - ts.x) * 0.5f;
@@ -144,9 +136,7 @@ inline bool Segmented(const char* id, const char* const items[], int count,
 
         float d = std::fabs(sel - (float)i);
         if (d > 1.0f) d = 1.0f;
-        ImU32 col = Col::Mix(Col::Label, Col::Label2, d);
-
-        dl->AddText(ImVec2(cx, cy), col, items[i]);
+        dl->AddText(ImVec2(cx, cy), Col::Mix(Col::Label, Col::Label2, d), items[i]);
     }
 
     ImGui::PopID();
@@ -156,14 +146,15 @@ inline bool Segmented(const char* id, const char* const items[], int count,
 // =================================================================
 // Card
 // =================================================================
-// The white rounded group every iOS settings screen is built from.
-// Height is not known until the content is laid out, so the panel
-// is drawn into a reserved draw-list slot and filled in at End.
+// The white rounded group an iOS settings screen is built from.
+// The height is unknown until the content is laid out, so the
+// background is drawn into a reserved draw-list channel and filled
+// in at End.
 // =================================================================
 struct CardState {
     ImDrawListSplitter splitter;
     ImVec2 start;
-    float  width;
+    float  width = 0.0f;
     bool   active = false;
 };
 
@@ -176,8 +167,6 @@ inline void BeginCard(float width = -1.0f) {
     g_card.width  = width;
     g_card.active = true;
 
-    // Split so the background can be drawn after the content, once
-    // the final height is known, but still appear underneath it.
     g_card.splitter.Split(ImGui::GetWindowDrawList(), 2);
     g_card.splitter.SetCurrentChannel(ImGui::GetWindowDrawList(), 1);
 
@@ -206,7 +195,7 @@ inline void EndCard() {
     ImGui::Dummy(ImVec2(0, 1));
 }
 
-// Uppercase grey caption above a card, the iOS section header
+// Uppercase grey caption above a card
 inline void SectionHeader(const char* text) {
     ImGui::Dummy(ImVec2(0, 8));
     Fonts::Push(Fonts::Caption);
@@ -253,8 +242,7 @@ inline bool SwitchRow(const char* label, bool* v,
     ImVec2 p = ImGui::GetCursorScreenPos();
     ImDrawList* dl = ImGui::GetWindowDrawList();
 
-    // Hit area covers the row minus the switch, so tapping the label
-    // toggles it the way an iOS row does.
+    // Tapping the label toggles too, the way an iOS row does
     ImGui::InvisibleButton("##row", ImVec2(w - M::SwitchW - M::RowPadX * 2.0f, h));
     bool rowClicked = ImGui::IsItemClicked();
     bool rowHeld    = ImGui::IsItemActive();
@@ -262,15 +250,13 @@ inline bool SwitchRow(const char* label, bool* v,
     float pressT = Anim::To(ImGui::GetID("##rowp"), rowHeld ? 1.0f : 0.0f, 20.0f);
     if (pressT > 0.01f) {
         dl->AddRectFilled(p, ImVec2(p.x + w, p.y + h),
-                          Col::Alpha(Col::CardPressed, pressT), 0.0f);
+                          Col::Alpha(Col::CardPressed, pressT));
     }
 
     float textX = p.x + M::RowPadX;
 
-    // Optional colour dot, the category marker
     if (accent) {
-        float cy = p.y + h * 0.5f;
-        dl->AddCircleFilled(ImVec2(textX + 4.0f, cy), 4.0f, accent, 12);
+        dl->AddCircleFilled(ImVec2(textX + 4.0f, p.y + h * 0.5f), 4.0f, accent, 14);
         textX += 18.0f;
     }
 
@@ -284,7 +270,6 @@ inline bool SwitchRow(const char* label, bool* v,
         dl->AddText(ImVec2(textX, p.y + (h - ts.y) * 0.5f), Col::Label, label);
     }
 
-    // Keybind chip
     if (badge && badge[0]) {
         Fonts::Push(Fonts::Caption);
         ImVec2 bs = ImGui::CalcTextSize(badge);
@@ -298,8 +283,6 @@ inline bool SwitchRow(const char* label, bool* v,
         Fonts::Pop(Fonts::Caption);
     }
 
-    // Switch, vertically centred on the right
-    ImGui::SameLine();
     ImGui::SetCursorScreenPos(ImVec2(p.x + w - M::SwitchW - M::RowPadX,
                                      p.y + (h - M::SwitchH) * 0.5f));
     bool swChanged = Switch("sw", v);
@@ -314,7 +297,7 @@ inline bool SwitchRow(const char* label, bool* v,
 }
 
 // =================================================================
-// Disclosure row: label on the left, chevron that rotates open
+// Disclosure row: label left, chevron that rotates open
 // =================================================================
 inline bool DisclosureRow(const char* label, bool* open,
                           const char* value = nullptr, ImU32 accent = 0)
@@ -336,19 +319,18 @@ inline bool DisclosureRow(const char* label, bool* open,
 
     if (pressT > 0.01f) {
         dl->AddRectFilled(p, ImVec2(p.x + w, p.y + h),
-                          Col::Alpha(Col::CardPressed, pressT), 0.0f);
+                          Col::Alpha(Col::CardPressed, pressT));
     }
 
     float textX = p.x + M::RowPadX;
     if (accent) {
-        dl->AddCircleFilled(ImVec2(textX + 4.0f, p.y + h * 0.5f), 4.0f, accent, 12);
+        dl->AddCircleFilled(ImVec2(textX + 4.0f, p.y + h * 0.5f), 4.0f, accent, 14);
         textX += 18.0f;
     }
 
     ImVec2 ts = ImGui::CalcTextSize(label);
     dl->AddText(ImVec2(textX, p.y + (h - ts.y) * 0.5f), Col::Label, label);
 
-    // Chevron, 0 degrees closed and 90 open
     float cx = p.x + w - M::RowPadX - 4.0f;
     float cy = p.y + h * 0.5f;
     float ang = openT * 1.5707963f;
@@ -373,48 +355,53 @@ inline bool DisclosureRow(const char* label, bool* open,
 // =================================================================
 // Animated expanding container
 // =================================================================
-// Measures its content once, then animates a clipped child between
-// zero and that height. The first frame after opening is measured
-// at full height and immediately clipped, so nothing flashes.
+// The content height is not known in advance, and a zero-height
+// child does NOT auto-size in ImGui: zero means "take the rest of
+// the window", which made an earlier version swallow the page.
+//
+// Instead the child is always at least a pixel tall and the real
+// height is read back from the layout cursor. Clipped items still
+// go through ItemSize, so CursorMaxPos is correct even when nothing
+// was actually drawn.
 // =================================================================
 inline bool BeginCollapsible(const char* id, bool open) {
     ImGui::PushID(id);
-    ImGuiID hid = ImGui::GetID("##h");
 
     float measured = Anim::Value(ImGui::GetID("##m"));
     float target   = open ? measured : 0.0f;
-    float h        = Anim::To(hid, target, 15.0f);
+    float h        = Anim::To(ImGui::GetID("##h"), target, 15.0f);
 
-    // Nothing visible and nothing to measure
-    if (h < 0.75f && !open) {
+    // Fully closed and staying closed: draw nothing at all
+    if (!open && h < 0.75f) {
         ImGui::PopID();
         return false;
     }
 
-    // Opening for the first time: no measurement yet, so run one
-    // frame unclipped to learn the height.
-    bool measuring = (measured <= 0.0f && open);
-    float childH = measuring ? 0.0f : h;   // 0 lets the child auto-size
+    // Opening with no measurement yet: one clipped pixel is enough
+    // to lay the content out and learn its height.
+    float childH = h < 1.0f ? 1.0f : h;
 
     ImGui::BeginChild("##col", ImVec2(0, childH),
                       ImGuiChildFlags_None,
                       ImGuiWindowFlags_NoScrollbar |
-                      ImGuiWindowFlags_NoScrollWithMouse);
+                      ImGuiWindowFlags_NoScrollWithMouse |
+                      ImGuiWindowFlags_NoBackground);
     return true;
 }
 
 inline void EndCollapsible() {
-    float content = ImGui::GetCursorPosY() + 4.0f;
+    ImGuiWindow* win = ImGui::GetCurrentWindow();
+    float content = win->DC.CursorMaxPos.y - win->DC.CursorStartPos.y + 6.0f;
+
     ImGui::EndChild();
 
-    ImGuiID mid = ImGui::GetID("##m");
-    if (content > 1.0f) Anim::Set(mid, content);
+    if (content > 1.0f) Anim::Set(ImGui::GetID("##m"), content);
 
     ImGui::PopID();
 }
 
 // =================================================================
-// Slider with the value as a chip on the right
+// Slider with the value as a chip on the left of the track
 // =================================================================
 inline bool SliderRow(const char* label, float* v, float lo, float hi,
                       const char* fmt = "%.2f")
@@ -426,7 +413,7 @@ inline bool SliderRow(const char* label, float* v, float lo, float hi,
     ImDrawList* dl = ImGui::GetWindowDrawList();
 
     float h = 46.0f;
-    float trackW = w * 0.52f;
+    float trackW = w * 0.48f;
     float trackX = p.x + w - M::RowPadX - trackW;
     float trackY = p.y + h * 0.5f;
 
@@ -502,7 +489,7 @@ inline bool Button(const char* label, float width = -1.0f,
     float press = Anim::To(ImGui::GetID("##bp"), held ? 1.0f : 0.0f, 24.0f);
     float hov   = Anim::To(ImGui::GetID("##bh"), hover ? 1.0f : 0.0f, 14.0f);
 
-    // Shrink very slightly under the finger
+    // Shrinks very slightly under the finger
     float s = press * 1.5f;
     ImVec2 a(p.x + s, p.y + s);
     ImVec2 b(p.x + width - s, p.y + h - s);
@@ -510,8 +497,7 @@ inline bool Button(const char* label, float width = -1.0f,
     ImDrawList* dl = ImGui::GetWindowDrawList();
 
     if (filled) {
-        ImU32 bg = Col::Alpha(tint, 1.0f - press * 0.15f);
-        dl->AddRectFilled(a, b, bg, 11.0f);
+        dl->AddRectFilled(a, b, Col::Alpha(tint, 1.0f - press * 0.15f), 11.0f);
     } else {
         dl->AddRectFilled(a, b, Col::Alpha(tint, 0.10f + hov * 0.06f), 11.0f);
     }
