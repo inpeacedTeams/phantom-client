@@ -7,7 +7,6 @@
 
 #include "ios_theme.h"
 #include "ios_widgets.h"
-#include "ios_hud.h"
 #include "notifications.h"
 #include "../config/config_store.h"
 #include "../config/profiles.h"
@@ -31,6 +30,12 @@
 // Lives in its own file because Menu was becoming the sort of class
 // that does everything, and this part has no business knowing how a
 // module row is drawn.
+//
+// The HUD settings used to be duplicated at the bottom of this
+// screen as well as living in the UI tab. Two copies of the same
+// switches is the exact opposite of a product that feels designed,
+// and the drag editor could be switched on from a tab that does not
+// know how to switch it off again. They live in the UI tab only.
 //
 // THREADING
 // Render thread. Loading touches modules and therefore JNI, so it
@@ -326,14 +331,13 @@ public:
         }
 
         Footnote("A preset overwrites your current settings. Save what you "
-                 "have first if you want it back.");
+                 "have first if you want it back. The HUD and the look of "
+                 "the interface live in the UI tab and are never touched by "
+                 "a preset.");
 
         // =====================================================
-        // HUD, then the boring facts
+        // The boring facts
         // =====================================================
-        ImGui::Dummy(ImVec2(0, 8));
-        HUD::RenderSettings();
-
         SectionHeader("About");
         BeginCard();
         ValueRow("Version", "3.0.0");
