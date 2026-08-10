@@ -49,22 +49,12 @@ private:
     static constexpr float kHold      = 3.20f;
     static constexpr float kOut       = 0.70f;
 
-    static float Clamp01(float v) {
-        return v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v);
-    }
-
-    // Decelerating. Fast off the mark, settles softly.
-    static float EaseOut(float t) {
-        float u = 1.0f - Clamp01(t);
-        return 1.0f - u * u * u;
-    }
-
-    // Accelerating. Used on the way out so it leaves with intent
-    // instead of dribbling away.
-    static float EaseIn(float t) {
-        float u = Clamp01(t);
-        return u * u;
-    }
+    // Thin names over the shared curves in iOS::Ease, so there is
+    // one definition of each curve in the client rather than a copy
+    // living in every file that animates.
+    static float Clamp01(float v) { return iOS::Ease::Clamp01(v); }
+    static float EaseOut(float t) { return iOS::Ease::Out(t); }
+    static float EaseIn(float t)  { return iOS::Ease::In(t); }
 
     static float TotalLength() {
         return kHintDelay + kHintIn + kHold + kOut;

@@ -78,6 +78,59 @@ inline void GlowCircle(ImDrawList* dl, ImVec2 c, float r, ImU32 col,
 }
 
 // =================================================================
+// Tooltip
+// =================================================================
+// The one popup the client draws for itself. A small dark plate by
+// the cursor with a thin accent edge, in the same language as the
+// notifications and the hover card, so hovering a chip does not
+// suddenly serve up the stock grey ImGui rectangle. Foreground list
+// so nothing can clip it, and clamped so it never runs off screen.
+//
+// Called on hover, drawn the same frame. It does not carry its own
+// fade because a tooltip that lingers after the pointer has left
+// reads as stuck, not smooth; the chip under it already animated
+// the pointer in.
+// =================================================================
+inline void Tooltip(const char* text) {
+    if (!text || !text[0]) return;
+
+    ImGuiIO& io = ImGui::GetIO();
+    ImDrawList* dl = ImGui::GetForegroundDrawList();
+    if (!dl) return;
+
+    Fonts::Push(Fonts::Caption);
+    ImVec2 ts = ImGui::CalcTextSize(text);
+    Fonts::Pop(Fonts::Caption);
+
+    float padX = 9.0f * UI::scale;
+    float padY = 6.0f * UI::scale;
+    float w = ts.x + padX * 2.0f;
+    float h = ts.y + padY * 2.0f;
+
+    // Below and to the right of the cursor by default, flipped back
+    // onto the screen at either far edge.
+    ImVec2 a(io.MousePos.x + 15.0f, io.MousePos.y + 18.0f);
+    if (a.x + w > io.DisplaySize.x - 6.0f) a.x = io.DisplaySize.x - 6.0f - w;
+    if (a.y + h > io.DisplaySize.y - 6.0f) a.y = io.MousePos.y - 8.0f - h;
+    if (a.x < 6.0f) a.x = 6.0f;
+    if (a.y < 6.0f) a.y = 6.0f;
+    ImVec2 b(a.x + w, a.y + h);
+
+    float r = 7.0f * UI::roundness + 1.0f;
+
+    dl->AddRectFilled(ImVec2(a.x + 1.0f, a.y + 2.0f),
+                      ImVec2(b.x + 1.0f, b.y + 3.0f),
+                      IM_COL32(0, 0, 0, 45), r);
+    dl->AddRectFilled(a, b, IM_COL32(28, 30, 36, 236), r);
+    dl->AddRectFilled(a, ImVec2(a.x + 2.5f, b.y), Col::Alpha(Col::Blue, 0.9f), r);
+
+    Fonts::Push(Fonts::Caption);
+    dl->AddText(ImVec2(a.x + padX, a.y + padY),
+                IM_COL32(240, 242, 248, 255), text);
+    Fonts::Pop(Fonts::Caption);
+}
+
+// =================================================================
 // Switch  (51x31 at 1x, the real iOS metrics)
 // =================================================================
 // Three things move: the track colour crossfades, the knob slides,
@@ -544,7 +597,7 @@ inline bool SliderRow(const char* label, float* v, float lo, float hi,
                     Col::Mix(Col::Label2, Col::Blue, ch), buf);
         Fonts::Pop(Fonts::Caption);
 
-        if (chipHover) ImGui::SetTooltip("Click to type a value");
+        if (chipHover) Tooltip("Click to type a value");
     }
 
     if (editing) {

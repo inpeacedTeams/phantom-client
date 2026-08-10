@@ -112,6 +112,56 @@ namespace M {
 }
 
 // =================================================================
+// Easing
+// =================================================================
+// One-shot curves for progress values that already run 0..1 over
+// time: an intro playing, a notification leaving, a tab arriving.
+//
+// These are STATELESS on purpose. Anything that has to REMEMBER a
+// value between frames uses Anim below; anything that just needs to
+// shape a number it already holds uses these. They live here, once,
+// because the same ease-out cubic hand-copied into three files is
+// how two of the three quietly end up different.
+// =================================================================
+namespace Ease {
+    inline float Clamp01(float v) {
+        return v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v);
+    }
+
+    // Decelerating cubic. Fast off the mark, settles softly, which
+    // is the curve iOS uses for anything entering the screen.
+    inline float Out(float t) {
+        float u = 1.0f - Clamp01(t);
+        return 1.0f - u * u * u;
+    }
+
+    // Accelerating quadratic. Used on the way out so a thing leaves
+    // with intent instead of dribbling away.
+    inline float In(float t) {
+        float u = Clamp01(t);
+        return u * u;
+    }
+
+    // Symmetric, for something that both starts and stops on screen.
+    inline float InOut(float t) {
+        t = Clamp01(t);
+        return t < 0.5f
+            ? 2.0f * t * t
+            : 1.0f - (-2.0f * t + 2.0f) * (-2.0f * t + 2.0f) * 0.5f;
+    }
+
+    // Overshoots a hair past the target and settles back, for a
+    // control that should feel like it carries a little weight.
+    inline float OutBack(float t) {
+        t = Clamp01(t);
+        const float c1 = 1.70158f;
+        const float c3 = c1 + 1.0f;
+        float u = t - 1.0f;
+        return 1.0f + c3 * u * u * u + c1 * u * u;
+    }
+}
+
+// =================================================================
 // Interface settings
 // =================================================================
 // Everything the user can change about the look of the client.
@@ -154,6 +204,24 @@ struct UI {
     inline static int   accent = 0;
     inline static float accentCustom[4] = { 0.00f, 0.48f, 1.00f, 1.00f };
 
+    // -------------------------------------------------------------
+    // Animated live values
+    // -------------------------------------------------------------
+    // The fields above are TARGETS the user sets. These are what the
+    // client actually draws with, eased toward the targets once a
+    // frame so changing the accent, the scale or the corner radius
+    // glides rather than snapping. A slider used to resize the whole
+    // menu one jump per pixel of travel; now it sets a target and
+    // the size slides in.
+    //
+    // Written only from the render thread, inside Apply. Read only
+    // from the render thread while drawing. No second writer.
+    // -------------------------------------------------------------
+    inline static float liveScale     = 1.00f;
+    inline static float liveRoundness = 1.00f;
+    inline static float liveAccent[4] = { 0.00f, 0.48f, 1.00f, 1.00f };
+    inline static bool  liveReady     = false;   // has a render frame primed it
+
     static constexpr int kAccentCount = 8;
 
     static const char* const* AccentNames() {
@@ -177,6 +245,14 @@ struct UI {
                         accentCustom[2], accentCustom[3]));
             default: return IM_COL32(0, 122, 255, 255);
         }
+    }
+
+    // The target accent as straight floats, so the live value can be
+    // eased in colour space rather than by re-packing ImU32 every
+    // frame. Pure maths, safe with no ImGui context.
+    static void AccentColorF(float out[4]) {
+        ImVec4 c = ImGui::ColorConvertU32ToFloat4(AccentColor());
+        out[0] = c.x; out[1] = c.y; out[2] = c.z; out[3] = c.w;
     }
 
     static float Clamp(float v, float lo, float hi) {
@@ -210,20 +286,48 @@ struct UI {
     }
 
     // Push the settings into the palette and the metrics. Called
-    // once per frame before anything draws; it is a handful of
-    // multiplies, so there is no point tracking whether it changed.
+    // once per frame before anything draws.
     //
-    // Safe to call with no ImGui context: the numbers are still
-    // clamped and the palette still updates, and only the parts that
-    // need a context are skipped.
+    // The user's values are TARGETS; the live values chase them with
+    // the same frame-rate-independent smoothing every widget uses,
+    // so the accent, the scale and the roundness all glide. On the
+    // very first render frame, and any time this runs with no ImGui
+    // context (a config load on the client thread), there is nothing
+    // to animate from and no clock to animate against, so it snaps.
     static void Apply() {
         ClampValues();
 
-        Col::Blue     = AccentColor();
+        float tgtAccent[4];
+        AccentColorF(tgtAccent);
+
+        bool  haveCtx = ImGui::GetCurrentContext() != nullptr;
+        float dt = haveCtx ? ImGui::GetIO().DeltaTime : 0.0f;
+        if (dt > 0.1f) dt = 0.1f;    // survive a stall without a jump
+
+        if (!liveReady) {
+            // First sight: snap, because a glide from a default that
+            // was never on screen is just a flash of the wrong theme.
+            liveScale     = scale;
+            liveRoundness = roundness;
+            for (int i = 0; i < 4; i++) liveAccent[i] = tgtAccent[i];
+            if (haveCtx) liveReady = true;   // only once there is a clock
+        } else if (haveCtx) {
+            float k = 1.0f - std::exp(-14.0f * animSpeed * dt);
+            liveScale     += (scale     - liveScale)     * k;
+            liveRoundness += (roundness - liveRoundness) * k;
+            for (int i = 0; i < 4; i++)
+                liveAccent[i] += (tgtAccent[i] - liveAccent[i]) * k;
+        }
+        // else: applied off the render thread after priming. Leave
+        // the live values alone so the next render frame glides from
+        // where the eye last saw them to the new target.
+
+        Col::Blue = ImGui::ColorConvertFloat4ToU32(ImVec4(
+            liveAccent[0], liveAccent[1], liveAccent[2], liveAccent[3]));
         Col::BlueSoft = Col::Alpha(Col::Blue, 0.15f);
 
-        const float s = scale;
-        const float r = scale * roundness;
+        const float s = liveScale;
+        const float r = liveScale * liveRoundness;
 
         M::RowHeight  = M::BaseRowHeight  * s;
         M::RowPadX    = M::BaseRowPadX    * s;
@@ -236,7 +340,7 @@ struct UI {
         M::SegRadius  = M::BaseSegRadius  * r;
         M::SheetRound = M::BaseSheetRound * r;
 
-        if (!ImGui::GetCurrentContext()) return;
+        if (!haveCtx) return;
 
         // Text scales with everything else, or a 1.3x menu is just
         // the same small type in roomier boxes.
@@ -259,6 +363,9 @@ struct UI {
         accent = 0;
         accentCustom[0] = 0.00f; accentCustom[1] = 0.48f;
         accentCustom[2] = 1.00f; accentCustom[3] = 1.00f;
+        // liveReady is left as-is on purpose: the values above are
+        // targets, and the live ones glide to them, so Reset reads
+        // as the interface easing back to default rather than a cut.
     }
 };
 
