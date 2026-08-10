@@ -8,7 +8,8 @@
 
 // =================================================================
 // MouseControl
-// =================================================================// WHY THE MENU CURSOR DID NOT WORK
+// =================================================================
+// WHY THE MENU CURSOR DID NOT WORK
 //
 // Minecraft grabs the mouse while you are in a world. A grabbed
 // mouse is not a pointer: LWJGL hides it, locks it to the centre of
