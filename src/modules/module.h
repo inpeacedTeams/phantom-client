@@ -41,11 +41,17 @@ protected:
     std::string    m_name;
     std::string    m_description;
     ModuleCategory m_category;
-    int            m_keybind;
 
-    // Read from the render thread while the client thread writes it,
-    // so it has to be atomic rather than a plain bool.
+    // Both of these are written on one thread and read on another.
+    //
+    //   m_enabled  the menu queues a toggle, the tick loop applies it
+    //   m_keybind  the picker writes it from the RENDER thread while
+    //              the tick loop is reading it to poll hotkeys
+    //
+    // An int tear is not a real hazard on x86, but a torn read here
+    // would fire the wrong module, and the fix costs nothing.
     std::atomic<bool> m_enabled{ false };
+    std::atomic<int>  m_keybind{ 0 };
 
     std::vector<Setting> m_settings;
 
@@ -62,7 +68,10 @@ protected:
 public:
     Module(const std::string& name, const std::string& desc,
            ModuleCategory cat, int key = 0)
-        : m_name(name), m_description(desc), m_category(cat), m_keybind(key) {}
+        : m_name(name), m_description(desc), m_category(cat)
+    {
+        m_keybind.store(key);
+    }
 
     virtual ~Module() = default;
 
@@ -116,7 +125,7 @@ public:
     const std::string& GetName() const        { return m_name; }
     const std::string& GetDescription() const { return m_description; }
     ModuleCategory     GetCategory() const    { return m_category; }
-    int  GetKeybind() const                   { return m_keybind; }
-    void SetKeybind(int key)                  { m_keybind = key; }
+    int  GetKeybind() const                   { return m_keybind.load(); }
+    void SetKeybind(int key)                  { m_keybind.store(key); }
     bool IsEnabled() const                    { return m_enabled.load(); }
 };
