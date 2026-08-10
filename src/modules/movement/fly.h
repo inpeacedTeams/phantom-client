@@ -3,7 +3,6 @@
 #include "../../mc/minecraft.h"
 #include "../../mc/keybinds.h"
 #include "../../mc/movement.h"
-#include <imgui.h>
 #include <cmath>
 #include <cstdio>
 
@@ -15,7 +14,7 @@
 // your inputs, and "airborne and not falling" fails on the first
 // tick. Unprotected servers only, and the panel says so.
 //
-// The direction maths is shared with Speed now rather than being a
+// The direction maths is shared with Speed rather than being a
 // second hand-written copy that had drifted out of step with it.
 //
 // MODES
@@ -27,6 +26,8 @@
 
 class Fly : public Module {
 private:
+    static constexpr const char* kModes[] = { "Vanilla", "Glide" };
+
     int   m_mode      = 1;      // Glide is the sane default
     float m_speed     = 2.0f;
     float m_glideRate = 0.02f;  // blocks per tick of descent
@@ -36,6 +37,10 @@ private:
     int   m_kickEvery  = 40;
     float m_kickDrop   = 0.04f;
     bool  m_stopOnLand = true;
+
+    // Vertical speed is a fraction of the horizontal figure, so one
+    // slider controls both and they stay in proportion.
+    static constexpr double kVerticalRatio = 0.15;
 
     int  m_tick = 0;
     mutable char m_status[32] = {};
@@ -53,18 +58,46 @@ public:
     Fly() : Module("Fly", "Stay in the air. Detected by prediction anticheats",
                    ModuleCategory::MOVEMENT, 0)
     {
-        Bind("Mode", &m_mode);
-        Bind("Speed", &m_speed);
-        Bind("Glide Rate", &m_glideRate);
-        Bind("Anti Kick", &m_antiKick);
-        Bind("Kick Interval", &m_kickEvery);
-        Bind("Kick Drop", &m_kickDrop);
-        Bind("Stop On Land", &m_stopOnLand);
+        BindMode("Mode", &m_mode, kModes, 2,
+                 "Glide only cancels your fall, which is far quieter than "
+                 "full flight. Neither is safe on a prediction anticheat.");
+
+        Bind("Speed", &m_speed, 0.5f, 5.0f, "%.1f",
+             "Blocks per second, horizontal and vertical")
+            .When("Mode", 0);
+
+        Bind("Fall Rate", &m_glideRate, 0.0f, 0.2f, "%.3f",
+             "Blocks per tick of descent. 0 is a hover.")
+            .When("Mode", 1);
+
+        Bind("Anti Kick", &m_antiKick,
+             "A short dip now and then, so the server does not see a "
+             "constant altitude")
+            .When("Mode", 0).Advanced();
+
+        Bind("Kick Interval", &m_kickEvery, 10, 100,
+             "Ticks between dips")
+            .When("Mode", 0).Advanced();
+
+        Bind("Kick Drop", &m_kickDrop, 0.01f, 0.2f, "%.02f",
+             "How far each dip falls")
+            .When("Mode", 0).Advanced();
+
+        Bind("Stop On Land", &m_stopOnLand,
+             "Hands movement back once you touch the ground, so you can "
+             "still jump normally")
+            .When("Mode", 0).Advanced();
     }
 
     void OnEnable(JNIEnv*) override { m_tick = 0; }
 
     void OnDisable(JNIEnv* env) override {
+        if (env) Stop(env, Minecraft::GetPlayer(env));
+        m_tick = 0;
+        m_status[0] = '\0';
+    }
+
+    void OnReset(JNIEnv* env) override {
         if (env) Stop(env, Minecraft::GetPlayer(env));
         m_tick = 0;
         m_status[0] = '\0';
@@ -105,8 +138,8 @@ public:
         }
 
         double my = 0.0;
-        if (KeyBinds::GetJump(env))  my =  m_speed * 0.15;
-        if (KeyBinds::GetSneak(env)) my = -m_speed * 0.15;
+        if (KeyBinds::GetJump(env))  my =  m_speed * kVerticalRatio;
+        if (KeyBinds::GetSneak(env)) my = -m_speed * kVerticalRatio;
 
         // Servers kick a player who holds a constant altitude in
         // mid-air. A brief dip resets that counter.
@@ -114,50 +147,23 @@ public:
             my = -(double)m_kickDrop;
 
         Minecraft::SetMotionY(env, player, my);
-        Movement::SetHorizontal(env, player, (double)m_speed * 0.15);
+        Movement::SetHorizontal(env, player, (double)m_speed * kVerticalRatio);
 
         snprintf(m_status, sizeof(m_status), "flying");
     }
 
+    NoticeLevel Notice(const char** text) const override {
+        if (m_mode == 0) {
+            *text = "Caught on the first airborne tick by AGC, Grim and "
+                    "Polar. Unprotected servers only.";
+            return NoticeLevel::Danger;
+        }
+        *text = "Slows your fall. Quieter than full flight, still not safe on "
+                "a prediction anticheat.";
+        return NoticeLevel::Warning;
+    }
+
     const char* StatusLine() const override {
         return m_status[0] ? m_status : nullptr;
-    }
-
-    bool HasAdvanced() const override { return true; }
-
-    void RenderSettings() override {
-        const char* modes[] = { "Vanilla", "Glide" };
-        ImGui::Combo("Mode", &m_mode, modes, 2);
-
-        if (m_mode == 0) {
-            ImGui::TextColored(ImVec4(1.f, 0.35f, 0.3f, 1.f),
-                "Caught on the first airborne tick by AGC, Grim and Polar");
-            ImGui::SliderFloat("Speed", &m_speed, 0.5f, 5.0f, "%.1f");
-        } else {
-            ImGui::TextColored(ImVec4(1.f, 0.7f, 0.3f, 1.f),
-                "Slows your fall. Quieter than full flight, still not safe "
-                "on a prediction anticheat.");
-            ImGui::SliderFloat("Fall Rate", &m_glideRate, 0.0f, 0.2f,
-                               "%.3f blocks/tick");
-        }
-    }
-
-    void RenderAdvanced() override {
-        if (m_mode != 0) {
-            ImGui::TextDisabled("These apply to Vanilla mode.");
-            return;
-        }
-
-        ImGui::Checkbox("Anti Kick", &m_antiKick);
-        if (m_antiKick) {
-            ImGui::SliderInt("Kick Interval", &m_kickEvery, 10, 100);
-            ImGui::SliderFloat("Kick Drop", &m_kickDrop, 0.01f, 0.2f, "%.02f");
-            ImGui::TextDisabled("A short dip every so often, so the server "
-                                "does not see a constant altitude.");
-        }
-
-        ImGui::Checkbox("Stop On Land", &m_stopOnLand);
-        ImGui::TextDisabled("Hands movement back once you touch the ground, "
-                            "so you can still jump normally.");
     }
 };
