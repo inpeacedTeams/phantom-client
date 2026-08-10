@@ -6,7 +6,6 @@
 #include "../../mc/rotation.h"
 #include "../../jni/class_resolver.h"
 #include "../../jni/jvmti_util.h"
-#include <imgui.h>
 #include <Windows.h>
 #include <cmath>
 #include <random>
@@ -38,6 +37,18 @@
 
 class AimAssist : public Module {
 private:
+    static constexpr const char* kPriorities[] = {
+        "Crosshair", "Closest", "Lowest HP"
+    };
+
+    // Past this the correction is visible when someone watches a
+    // recording of the fight frame by frame.
+    static constexpr float kVisibleSpeed = 6.0f;
+
+    // How often the aim point is re-rolled, in ticks. Every tick
+    // reads as noise rather than drift.
+    static constexpr int kWanderPeriod = 7;
+
     // ---- Feel ----
     float m_speed      = 3.2f;
     float m_pitchRatio = 0.6f;   // pitch moves slower than yaw, like a wrist
@@ -76,6 +87,7 @@ private:
     float m_lastAngle = 0.0f;
     bool  m_active = false;
     mutable char m_status[80] = {};
+    mutable char m_notice[176] = {};
 
     jmethodID m_getEntityId = nullptr;
     jfieldID  m_fSens = nullptr;
@@ -143,24 +155,80 @@ public:
     AimAssist() : Module("Aim Assist", "Guides the crosshair while you fight",
                          ModuleCategory::COMBAT, 'R')
     {
-        Bind("Speed", &m_speed);
-        Bind("Pitch Ratio", &m_pitchRatio);
-        Bind("Smoothing", &m_smoothing);
-        Bind("FOV", &m_fov);
-        Bind("Range", &m_range);
-        Bind("Target Mode", &m_targetMode);
-        Bind("Sticky", &m_sticky);
-        Bind("Sticky FOV", &m_stickyFov);
-        Bind("Require Swing", &m_requireSwing);
-        Bind("Swing Window", &m_swingWindow);
-        Bind("Aim Height", &m_aimHeight);
-        Bind("Wander", &m_wander);
-        Bind("Jitter", &m_jitter);
-        Bind("Overshoot", &m_overshoot);
-        Bind("Breaks", &m_breaks);
-        Bind("Break Chance", &m_breakChance);
-        Bind("Break Min", &m_breakMin);
-        Bind("Break Max", &m_breakMax);
+        BindMode("Priority", &m_targetMode, kPriorities, 3,
+                 "Which of several people in reach it helps you with");
+
+        Bind("Speed", &m_speed, 0.5f, 10.0f, "%.1f",
+             "How hard it pulls toward the target");
+
+        Bind("FOV", &m_fov, 10.0f, 180.0f, "%.0f",
+             "How far off centre someone can be and still be picked up");
+
+        Bind("Range", &m_range, 1.0f, 6.0f, "%.1f",
+             "How far away it still helps");
+
+        // ---- Feel ----
+        Bind("Pitch Ratio", &m_pitchRatio, 0.1f, 1.0f, "%.2f",
+             "Wrists turn sideways far more readily than they tilt, and "
+             "matching that is most of why a rotation reads as human")
+            .Advanced();
+
+        Bind("Smoothing", &m_smoothing, 0.0f, 0.9f, "%.2f",
+             "How much of last tick's movement carries into this one")
+            .Advanced();
+
+        // ---- Targeting ----
+        Bind("Sticky", &m_sticky,
+             "Keep the current target. Switching mid-exchange produces a "
+             "whip-round that nothing human does.")
+            .Advanced();
+
+        Bind("Sticky FOV", &m_stickyFov, 40.0f, 200.0f, "%.0f",
+             "Give the target up past this angle")
+            .When("Sticky", 1).Advanced();
+
+        Bind("Only While Swinging", &m_requireSwing,
+             "Tracking someone across a lobby while you stand still is the "
+             "loudest thing this module can do")
+            .Advanced();
+
+        Bind("Swing Window", &m_swingWindow, 2, 20,
+             "Ticks after a swing that it keeps helping")
+            .When("Only While Swinging", 1).Advanced();
+
+        // ---- Aim point ----
+        Bind("Aim Height", &m_aimHeight, 0.0f, 1.8f, "%.2f",
+             "Metres up the body it aims for")
+            .Advanced();
+
+        Bind("Wander", &m_wander, 0.0f, 0.5f, "%.2f",
+             "How far the aim point drifts. Near zero means perfect centre "
+             "aim on every single hit.")
+            .Advanced();
+
+        // ---- Humanisation ----
+        Bind("Jitter", &m_jitter, 0.0f, 40.0f, "%.0f%%",
+             "Noise on each step, on top of the mouse grid")
+            .Advanced();
+
+        Bind("Overshoot", &m_overshoot, 0.0f, 0.25f, "%.2f",
+             "How often it goes slightly past and corrects back")
+            .Advanced();
+
+        Bind("Breaks", &m_breaks,
+             "Deliberate lapses. Perfect tracking forever is a signature in "
+             "itself.")
+            .Advanced();
+
+        Bind("Break Chance", &m_breakChance, 1.0f, 25.0f, "%.0f%%")
+            .When("Breaks", 1).Advanced();
+
+        Bind("Break Min", &m_breakMin, 1, 8,
+             "Ticks a lapse lasts")
+            .When("Breaks", 1).Advanced();
+
+        Bind("Break Max", &m_breakMax, 1, 12)
+            .When("Breaks", 1).Advanced();
     }
 
     void OnEnable(JNIEnv*) override {
@@ -175,6 +243,19 @@ public:
         m_targetId = -1;
         m_targetName.clear();
         m_active = false;
+        m_status[0] = '\0';
+    }
+
+    // The target id belongs to the world that just went away, and
+    // holding it means the first entity to reuse that id gets aimed
+    // at for no reason.
+    void OnReset(JNIEnv*) override {
+        Rotation::ResetVelocity();
+        m_targetId = -1;
+        m_targetName.clear();
+        m_breakLeft = 0;
+        m_ticksOnTarget = 0;
+        m_active = false;
     }
 
     void OnTick(JNIEnv* env) override {
@@ -185,11 +266,11 @@ public:
         if (!player) return;
         if (Minecraft::IsInGui(env)) return;
 
+        if (m_breakMin > m_breakMax) m_breakMin = m_breakMax;
+
         RefreshSensitivity(env);
 
-        // Only help while actually fighting. Tracking someone across
-        // a lobby while you stand still is the most visible thing
-        // this module could possibly do.
+        // Only help while actually fighting.
         if (m_requireSwing) {
             bool swinging = CombatState::TicksSinceSwing() <= m_swingWindow;
             bool holding  = (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0;
@@ -200,8 +281,7 @@ public:
             }
         }
 
-        // Deliberate lapses. Perfect tracking forever is a signature
-        // in itself, so the assist drops out now and then.
+        // Deliberate lapses.
         if (m_breakLeft > 0) { m_breakLeft--; return; }
         if (m_breaks && Roll(m_breakChance)) {
             m_breakLeft = Rand(m_breakMin, m_breakMax);
@@ -218,8 +298,6 @@ public:
         // ---- Pick a target ----
         EntityInfo* chosen = nullptr;
 
-        // Sticky first: switching target mid-exchange produces a
-        // whip-round that nothing human does.
         if (m_sticky && m_targetId >= 0) {
             for (auto& e : ents) {
                 if (EntityId(env, e.ref, e.name) != m_targetId) continue;
@@ -264,10 +342,7 @@ public:
         m_ticksOnTarget++;
 
         // ---- Aim point ----
-        // Dead centre every tick is a giveaway, so the point drifts
-        // slowly around the body. Re-rolled every few ticks rather
-        // than every tick, or it reads as noise instead of drift.
-        if (++m_wanderTick >= 7) {
+        if (++m_wanderTick >= kWanderPeriod) {
             m_wanderTick = 0;
             m_wanderX = Randf(-m_wander, m_wander);
             m_wanderY = Randf(-m_wander * 0.7f, m_wander * 0.7f);
@@ -285,9 +360,7 @@ public:
                                    m_speed, m_smoothing,
                                    m_jitter, m_overshoot);
 
-        // Pitch trails yaw. Wrists turn sideways far more readily
-        // than they tilt, and matching that is most of why a
-        // rotation reads as human.
+        // Pitch trails yaw.
         float pitchStep = (next.pitch - pitch) * m_pitchRatio;
 
         Minecraft::SetYaw(env, player, next.yaw);
@@ -298,88 +371,42 @@ public:
 
     const char* StatusLine() const override {
         if (m_active && !m_targetName.empty()) {
-            snprintf(m_status, sizeof(m_status), "tracking %s",
-                     m_targetName.c_str());
+            snprintf(m_status, sizeof(m_status), "tracking %s  (%.1f\xC2\xB0)",
+                     m_targetName.c_str(), m_lastAngle);
         } else {
             snprintf(m_status, sizeof(m_status), "idle");
         }
         return m_status;
     }
 
-    // =============================================================
-    // Everyday panel
-    // =============================================================
-    void RenderSettings() override {
-        const char* modes[] = { "Crosshair", "Closest", "Lowest HP" };
-        ImGui::Combo("Priority", &m_targetMode, modes, 3);
-
-        ImGui::SliderFloat("Speed", &m_speed, 0.5f, 10.f, "%.1f");
-        ImGui::SliderFloat("FOV", &m_fov, 10.f, 180.f, "%.0f");
-        ImGui::SliderFloat("Range", &m_range, 1.f, 6.f, "%.1f");
-
-        ImGui::Spacing();
-        if (m_active && !m_targetName.empty()) {
-            ImGui::TextColored(ImVec4(0.2f, 0.8f, 0.4f, 1.f),
-                "Tracking %s  (%.1f deg off)", m_targetName.c_str(), m_lastAngle);
-        } else {
-            ImGui::TextDisabled("Idle");
-        }
-
-        if (m_speed > 6.f) {
-            ImGui::TextColored(ImVec4(1.f, 0.5f, 0.35f, 1.f),
-                "Above 6 the correction is visible in a replay");
-        }
+    NoticeLevel Notice(const char** text) const override {
         if (!Rotation::HaveSensitivity()) {
-            ImGui::TextColored(ImVec4(1.f, 0.7f, 0.3f, 1.f),
-                "Sensitivity unresolved: using a default mouse grid");
+            *text = "Your mouse sensitivity could not be read, so a default "
+                    "grid is used. Rotations will not line up exactly with "
+                    "what your hand can produce.";
+            return NoticeLevel::Warning;
         }
-    }
-
-    bool HasAdvanced() const override { return true; }
-
-    void RenderAdvanced() override {
-        ImGui::TextColored(ImVec4(1.f, 0.6f, 0.3f, 1.f), "Feel");
-        ImGui::SliderFloat("Pitch Ratio", &m_pitchRatio, 0.1f, 1.f, "%.2f");
-        ImGui::TextDisabled("Wrists turn sideways more readily than they tilt.");
-        ImGui::SliderFloat("Smoothing", &m_smoothing, 0.f, 0.9f, "%.2f");
-
-        ImGui::Separator();
-        ImGui::TextColored(ImVec4(0.5f, 0.8f, 1.f, 1.f), "Targeting");
-        ImGui::Checkbox("Sticky", &m_sticky);
-        if (m_sticky)
-            ImGui::SliderFloat("Sticky FOV", &m_stickyFov, 40.f, 200.f, "%.0f");
-        ImGui::Checkbox("Only While Swinging", &m_requireSwing);
-        if (m_requireSwing)
-            ImGui::SliderInt("Swing Window", &m_swingWindow, 2, 20, "%d ticks");
-        else
-            ImGui::TextColored(ImVec4(1.f, 0.5f, 0.35f, 1.f),
-                "Tracking people across a lobby is the loudest thing this does");
-
-        ImGui::Separator();
-        ImGui::TextColored(ImVec4(0.6f, 1.f, 0.7f, 1.f), "Aim point");
-        ImGui::SliderFloat("Height", &m_aimHeight, 0.f, 1.8f, "%.2f");
-        ImGui::SliderFloat("Wander", &m_wander, 0.f, 0.5f, "%.2f");
+        if (!m_requireSwing) {
+            *text = "Only While Swinging is off, so it will track people "
+                    "across a lobby while you stand still. That is the "
+                    "loudest thing this module can do.";
+            return NoticeLevel::Warning;
+        }
+        if (m_speed > kVisibleSpeed) {
+            *text = "Above 6 the correction is visible when someone watches "
+                    "the fight back.";
+            return NoticeLevel::Warning;
+        }
         if (m_wander < 0.05f) {
-            ImGui::TextColored(ImVec4(1.f, 0.7f, 0.3f, 1.f),
-                "Near-zero wander means perfect centre aim every hit");
+            *text = "Near-zero wander means the exact centre of the hitbox on "
+                    "every hit, which no hand produces.";
+            return NoticeLevel::Warning;
         }
-
-        ImGui::Separator();
-        ImGui::TextColored(ImVec4(1.f, 0.85f, 0.4f, 1.f), "Humanisation");
-        ImGui::SliderFloat("Jitter", &m_jitter, 0.f, 40.f, "%.0f%%");
-        ImGui::SliderFloat("Overshoot", &m_overshoot, 0.f, 0.25f, "%.2f");
-        ImGui::Checkbox("Breaks", &m_breaks);
-        if (m_breaks) {
-            ImGui::SliderFloat("Break Chance", &m_breakChance, 1.f, 25.f, "%.0f%%");
-            ImGui::SliderInt("Break Min", &m_breakMin, 1, 8);
-            ImGui::SliderInt("Break Max", &m_breakMax, 1, 12);
-            if (m_breakMin > m_breakMax) m_breakMin = m_breakMax;
-        }
-
-        if (Rotation::HaveSensitivity()) {
-            ImGui::Separator();
-            ImGui::TextDisabled("Mouse grid %.4f deg at sensitivity %.2f",
-                Rotation::GCD(), Rotation::Sensitivity());
-        }
+        snprintf(m_notice, sizeof(m_notice),
+                 "Every rotation is a multiple of your mouse grid, %.4f\xC2\xB0 "
+                 "at sensitivity %.2f.",
+                 Rotation::GCD(), Rotation::Sensitivity());
+        *text = m_notice;
+        return NoticeLevel::Info;
     }
 };
