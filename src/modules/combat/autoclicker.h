@@ -459,13 +459,20 @@ public:
         }
 
         // ---- The one decision per tick ----
+        // Every tick spends one tick of the countdown, INCLUDING the
+        // one we fire on. Crediting the fire tick for free (only
+        // decrementing on non-firing ticks) stretches the real
+        // period to 1 + interval, so a 12 CPS request came out around
+        // 7. Decrement first, then fire when the debt is paid and add
+        // the next interval; the average rate now matches the target.
+        // The interval floor of 1.0 plus a single queued click keeps
+        // this to at most one click per tick regardless.
+        m_nextInTicks -= 1.0f;
         if (m_nextInTicks <= 0.0f) {
             int done = (m_button == 1) ? KeyBinds::QueueUse(env, 1)
                                        : KeyBinds::QueueAttack(env, 1);
             if (done > 0) NoteFire();
             m_nextInTicks += RollIntervalTicks();
-        } else {
-            m_nextInTicks -= 1.0f;
         }
 
         m_why = "clicking";
