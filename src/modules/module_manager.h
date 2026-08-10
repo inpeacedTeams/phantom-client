@@ -71,7 +71,9 @@
 //   5. CombatState, so every module reads the same facts about this
 //      tick rather than each deriving its own from the mouse.
 //   6. Mouse grab follows the menu.
-//   7. UI actions, keybinds, then the modules themselves.
+//   7. UI actions, keybinds, then the modules themselves. While the
+//      menu is open the gameplay modules are held down, because the
+//      cursor is the UI's and their input would be aimed at it.
 //   8. Queued clicks are handed to the game LAST, so a click fired
 //      by a module this tick goes out on this tick.
 //   9. Key reconciliation, after everything has had its say.
@@ -148,6 +150,13 @@ private:
     // on the render side; this is only how the client thread learns
     // that it should hand the cursor back to the player.
     inline static std::atomic<bool> s_menuOpen{ false };
+
+    // Latches the menu-open edge on the client thread. While the
+    // menu is up the cursor belongs to the UI, so gameplay modules
+    // stand down: one that kept moving the camera or firing clicks
+    // would be acting on input the player is aiming at a switch. The
+    // edge is where held keys and any queued clicks are let go, once.
+    inline static bool s_gameplayHalted = false;
 
     // A packed lobby can hold 60+ players, and the entity scan takes
     // a couple of refs each on top of whatever the modules allocate.
@@ -357,9 +366,17 @@ public:
     }
 
     // Called from the window thread when INSERT is pressed. Does no
-    // work itself: releasing the grab is a JNI call and belongs on
-    // the client thread.
-    static void SetMenuOpen(bool open) { s_menuOpen.store(open); }
+    // JNI work itself: releasing the grab is a JNI call and belongs
+    // on the client thread, which reads s_menuOpen next tick.
+    //
+    // The click engine, though, polls the mouse on its own thread
+    // and cannot wait for a tick to learn the menu opened, so its
+    // flag is pushed straight through here. That is safe off-thread:
+    // it only touches an atomic.
+    static void SetMenuOpen(bool open) {
+        s_menuOpen.store(open);
+        ClickScheduler::SetMenuOpen(open);
+    }
     static bool IsMenuOpen()           { return s_menuOpen.load(); }
 
     static std::shared_ptr<ESP> GetESP() { return s_esp; }
@@ -407,6 +424,7 @@ public:
         MouseControl::Shutdown();   // the next world re-resolves and re-grabs
         s_faults.clear();           // a world change is not a module fault
         s_wasDead = false;
+        s_gameplayHalted = false;   // re-entry re-evaluates the menu edge cleanly
 
         if (env) {
             // Modules are still enabled and will run again the
@@ -528,14 +546,45 @@ public:
         }
 
         // ---- Run enabled modules ----
+        // While the Phantom menu is open the mouse is the UI's, not
+        // the game's. A combat or movement module ticking then acts
+        // on input the player is aiming at a control: it whips the
+        // crosshair around or fires an attack behind the menu. So
+        // gameplay stands down while it is open. Visual modules (ESP,
+        // Fullbright) are pure rendering state and stay live, so
+        // their boxes and brightness do not blink in the menu.
+        //
+        // The open EDGE lets go of everything held for the player,
+        // once. Modules stay enabled and resume the moment it
+        // closes; this is the same clean slate a world change hands
+        // them, not a disable.
+        bool menuOpen = s_menuOpen.load();
+
+        if (menuOpen && !s_gameplayHalted) {
+            KeyBinds::ReleaseAll(env);
+            KeyBinds::ClearClickQueue(env);
+            ClickScheduler::ClearPending();
+            ClearJavaException(env);
+            s_gameplayHalted = true;
+        } else if (!menuOpen) {
+            s_gameplayHalted = false;
+        }
+
         for (auto& mod : s_modules) {
             if (!mod->IsEnabled()) continue;
+            if (menuOpen && mod->GetCategory() != ModuleCategory::VISUAL)
+                continue;
             RunModule(env, mod);
         }
 
         // ---- Clicks, last, so this tick's requests go out now ----
-        DispatchClicks(env);
-        ClearJavaException(env);
+        // Skipped while the menu is open: the engine is already muted
+        // on the same edge, but draining into the game here would
+        // still be wrong.
+        if (!menuOpen) {
+            DispatchClicks(env);
+            ClearJavaException(env);
+        }
 
         // ---- Key reconciliation ----
         // The reason a sprint reset could freeze you: pressed is
@@ -543,7 +592,9 @@ public:
         // holding it never came back on its own. Anything we are no
         // longer driving gets put back in line with the hardware
         // here, so a missed release costs one tick instead of the
-        // rest of the fight.
+        // rest of the fight. This still runs while the menu is up, so
+        // a key the player is physically holding stays correct even
+        // with gameplay halted.
         //
         // Skipped inside a GUI, where the game clears every key on
         // purpose and we would be fighting it.
