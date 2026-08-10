@@ -51,6 +51,7 @@ inline void Callout(Module::NoticeLevel level, const char* text) {
     float pad = 11.0f * UI::scale;
     float bar = 3.0f * UI::scale;
     float wrap = w - pad * 2.0f - bar;
+    if (wrap < 40.0f) wrap = 40.0f;
 
     Fonts::Push(Fonts::Caption);
     ImVec2 ts = ImGui::CalcTextSize(text, nullptr, false, wrap);
@@ -58,9 +59,8 @@ inline void Callout(Module::NoticeLevel level, const char* text) {
 
     float h = ts.y + pad * 2.0f;
 
-    ImVec2 p = ImGui::GetCursorScreenPos();
-    ImVec2 a = p;
-    ImVec2 b(p.x + w, p.y + h);
+    ImVec2 a = ImGui::GetCursorScreenPos();
+    ImVec2 b(a.x + w, a.y + h);
 
     ImDrawList* dl = ImGui::GetWindowDrawList();
     float r = 10.0f * UI::roundness;
@@ -92,7 +92,8 @@ inline bool SettingVisible(const std::vector<Setting>& all, const Setting& s) {
               ? (gov.AsBool() ? 1 : 0)
               : gov.AsInt();
 
-    return s.dependEqual ? (v == s.dependValue) : (v != s.dependValue);
+    bool inMask = (v >= 0 && v < 32) && ((s.dependMask >> v) & 1u) != 0u;
+    return s.dependNegate ? !inMask : inMask;
 }
 
 // One control. Returns true when the value changed, which the
