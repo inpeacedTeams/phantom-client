@@ -36,10 +36,10 @@
 // can open and fix by hand is worth more than a tidy one they
 // cannot.
 //
-//     # Phantom config v1
+//     # Phantom config v2
 //     ui.scale=1.00
 //     ui.accent=2
-//     hud.corner=1
+//     hud.wmX=0.012
 //     module.AutoClicker.enabled=1
 //     module.AutoClicker.key=82
 //     module.AutoClicker.set.CPS=13.000000
@@ -57,6 +57,12 @@
 //   truncated by a crash mid-write still loads everything up to
 //   the break.
 //
+//   A key that has been REPLACED is migrated rather than dropped.
+//   hud.corner is the first of those: the HUD used to be one of
+//   four corner presets and is now a free position, so an old
+//   config is translated into the equivalent coordinates instead
+//   of silently resetting someone's layout.
+//
 // Because every module setting is already registered through
 // Bind(), modules need no per-module code here at all: a new module
 // is saved correctly the day it is written.
@@ -68,6 +74,7 @@ public:
         int  applied = 0;
         int  unknown = 0;
         int  malformed = 0;
+        int  migrated = 0;
         bool ok = false;
         std::string message;
     };
@@ -77,7 +84,7 @@ private:
     inline static std::string s_current = "default";
     inline static Report s_lastReport;
 
-    static constexpr int kFormatVersion = 1;
+    static constexpr int kFormatVersion = 2;
 
     // Everything after the first '=' is the value, so a value may
     // contain one. Keys may not, which is fine: we generate them.
@@ -109,6 +116,10 @@ private:
         if (!end || end == s.c_str()) return false;
         *out = v;
         return true;
+    }
+
+    static float Clamp01(float v) {
+        return v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v);
     }
 
     // A module name can contain spaces ("Auto Blockhit"), and so can
@@ -208,7 +219,8 @@ public:
         {
             std::ofstream f(tempPath, std::ios::out | std::ios::trunc);
             if (!f.is_open()) {
-                s_lastReport = { 0, 0, 0, false, "Could not write " + name };
+                s_lastReport = Report{};
+                s_lastReport.message = "Could not write " + name;
                 return false;
             }
 
@@ -241,7 +253,10 @@ public:
             f << "hud.watermark="  << (HUD::watermark ? 1 : 0) << "\n";
             f << "hud.moduleList=" << (HUD::moduleList ? 1 : 0) << "\n";
             f << "hud.fps="        << (HUD::showFps ? 1 : 0) << "\n";
-            f << "hud.corner="     << HUD::corner << "\n";
+            f << "hud.wmX="        << HUD::wmX << "\n";
+            f << "hud.wmY="        << HUD::wmY << "\n";
+            f << "hud.mlX="        << HUD::mlX << "\n";
+            f << "hud.mlY="        << HUD::mlY << "\n";
             f << "\n";
 
             // ---- Modules ----
@@ -251,15 +266,15 @@ public:
                 f << "module." << n << ".enabled=" << (m->IsEnabled() ? 1 : 0) << "\n";
                 f << "module." << n << ".key=" << m->GetKeybind() << "\n";
 
-                for (const auto& s : m->GetSettings()) {
-                    f << "module." << n << ".set." << s.name << "=";
-                    switch (s.type) {
-                        case Setting::Type::Bool:  f << (s.AsBool() ? 1 : 0); break;
-                        case Setting::Type::Int:   f << s.AsInt();   break;
-                        default:                   f << s.AsFloat(); break;
-                    }
-                    f << "\n";
-                }
+                // Setting::Read gives the stored value for whatever
+                // the type is. Writing this by hand is how a mode,
+                // which is an int, was being printed as a float read
+                // off an int pointer: garbage in the file and a
+                // random mode on load.
+                for (const auto& s : m->GetSettings())
+                    f << "module." << n << ".set." << s.name << "="
+                      << s.Read() << "\n";
+
                 f << "\n";
             }
         }
@@ -268,12 +283,15 @@ public:
         if (!MoveFileExA(tempPath.c_str(), finalPath.c_str(),
                          MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
             DeleteFileA(tempPath.c_str());
-            s_lastReport = { 0, 0, 0, false, "Could not replace " + name };
+            s_lastReport = Report{};
+            s_lastReport.message = "Could not replace " + name;
             return false;
         }
 
         s_current = name;
-        s_lastReport = { 0, 0, 0, true, "Saved " + name };
+        s_lastReport = Report{};
+        s_lastReport.ok = true;
+        s_lastReport.message = "Saved " + name;
         return true;
     }
 
@@ -344,9 +362,21 @@ public:
                 if      (k == "watermark")  HUD::watermark = (v != 0.0f);
                 else if (k == "moduleList") HUD::moduleList = (v != 0.0f);
                 else if (k == "fps")        HUD::showFps = (v != 0.0f);
+                else if (k == "wmX")        HUD::wmX = Clamp01(v);
+                else if (k == "wmY")        HUD::wmY = Clamp01(v);
+                else if (k == "mlX")        HUD::mlX = Clamp01(v);
+                else if (k == "mlY")        HUD::mlY = Clamp01(v);
                 else if (k == "corner") {
+                    // v1 config. Both elements shared one corner, so
+                    // the old look is reproduced by putting them in
+                    // the same place and letting the module list sit
+                    // under the watermark.
                     int c = (int)v;
-                    HUD::corner = (c >= 0 && c <= 3) ? c : 1;
+                    bool right  = (c == 1 || c == 3);
+                    bool bottom = (c == 2 || c == 3);
+                    HUD::wmX = HUD::mlX = right  ? 0.988f : 0.012f;
+                    HUD::wmY = HUD::mlY = bottom ? 0.955f : 0.020f;
+                    r.migrated++;
                 }
                 else { r.unknown++; continue; }
 
@@ -380,6 +410,9 @@ public:
                 mod->SetKeybind((k > 0 && k < 256) ? k : 0);
                 r.applied++;
             } else if (field == "set") {
+                // SetValue clamps to the setting's own range, so a
+                // hand-edited or outdated file cannot push a module
+                // somewhere its interface could never reach.
                 if (mod->SetValue(setting, v)) r.applied++;
                 else r.unknown++;   // a setting that has been renamed
             } else {
@@ -409,6 +442,9 @@ public:
         if (r.unknown || r.malformed) {
             snprintf(buf, sizeof(buf), "%d values restored, %d skipped",
                      r.applied, r.unknown + r.malformed);
+        } else if (r.migrated) {
+            snprintf(buf, sizeof(buf), "%d values restored, layout updated",
+                     r.applied);
         } else {
             snprintf(buf, sizeof(buf), "%d values restored", r.applied);
         }
@@ -425,13 +461,16 @@ public:
 
     static bool Delete(const std::string& name) {
         if (!DeleteFileA(PathFor(name).c_str())) {
-            s_lastReport = { 0, 0, 0, false, "Could not delete " + name };
+            s_lastReport = Report{};
+            s_lastReport.message = "Could not delete " + name;
             return false;
         }
         // Deleting the config you are running would leave the panel
         // pointing at a file that no longer exists.
         if (s_current == name) s_current = "default";
-        s_lastReport = { 0, 0, 0, true, "Deleted " + name };
+        s_lastReport = Report{};
+        s_lastReport.ok = true;
+        s_lastReport.message = "Deleted " + name;
         return true;
     }
 
