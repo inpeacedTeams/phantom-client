@@ -28,6 +28,14 @@
 //    naive aim assist. Quantising to the step removes the tell
 //    completely.
 //
+//    This applies to BOTH axes. A caller that wants pitch to move
+//    at a different rate than yaw (a wrist tilts less readily than
+//    it turns) must pass that ratio INTO Step via pitchRatio, not
+//    scale the returned delta itself: scaling after Step has already
+//    quantised puts the value straight back off the grid, which was
+//    a real bug in Aim Assist and is the one thing this file exists
+//    to prevent.
+//
 // 2. Zero jerk.
 //    A hand accelerates and decelerates. Interpolating straight to
 //    a target produces a velocity curve no arm can make, so the
@@ -88,11 +96,18 @@ public:
     // speed        degrees per tick at full commitment
     // smoothing    0 snaps, 1 barely moves
     // overshoot    fraction of the remaining angle to overrun by
+    // pitchRatio   how fast pitch moves relative to yaw. A wrist
+    //              tilts less readily than it turns, so callers pass
+    //              < 1 here. Applied INSIDE, before the velocity
+    //              integrate and the grid snap, so the written pitch
+    //              stays a real mouse value. Scaling the result
+    //              afterwards would break both.
     // -------------------------------------------------------------
     static Angles Step(float curYaw, float curPitch,
                        float targetYaw, float targetPitch,
                        float speed, float smoothing,
-                       float jitterPct, float overshoot)
+                       float jitterPct, float overshoot,
+                       float pitchRatio = 1.0f)
     {
         float dYaw   = Wrap(targetYaw - curYaw);
         float dPitch = targetPitch - curPitch;
@@ -114,8 +129,13 @@ public:
         float yawEase   = std::fmin(1.0f, std::fabs(dYaw)   / 28.0f);
         float pitchEase = std::fmin(1.0f, std::fabs(dPitch) / 20.0f);
 
+        // pitchRatio is applied HERE so everything downstream — the
+        // velocity carry, the jitter, and above all the grid snap —
+        // acts on the value that is actually written. Applying it
+        // after Step returned left the integrator chasing a step it
+        // never took and put the final pitch off the mouse grid.
         float wantYaw   = dYaw   * speed * 0.02f * yawEase;
-        float wantPitch = dPitch * speed * 0.016f * pitchEase;
+        float wantPitch = dPitch * speed * 0.016f * pitchEase * pitchRatio;
 
         // Carry velocity so the arm has inertia instead of teleporting
         float k = 1.0f - smoothing;
@@ -139,7 +159,8 @@ public:
         if (std::fabs(stepPitch) > std::fabs(dPitch)) stepPitch = dPitch;
 
         // The grid is the last thing applied, so the value written
-        // is one a mouse could actually have produced.
+        // is one a mouse could actually have produced. This is why
+        // pitchRatio cannot be applied by the caller after the fact.
         stepYaw   = Quantise(stepYaw);
         stepPitch = Quantise(stepPitch);
 
