@@ -2,7 +2,8 @@
 #include "../module.h"
 #include "../../mc/minecraft.h"
 #include "../../mc/keybinds.h"
-#include <imgui.h>
+#include "../../mc/movement.h"
+#include <Windows.h>
 
 // =================================================================
 // Sprint
@@ -34,11 +35,18 @@ private:
     bool m_omniSprint = false;   // sprint in any direction, not just forward
     bool m_held = false;
 
+    void Release(JNIEnv* env) {
+        if (!m_held) return;
+        if (env) KeyBinds::ReleaseSprint(env);
+        m_held = false;
+    }
+
 public:
     Sprint() : Module("Sprint", "Always sprint without holding the key",
                       ModuleCategory::MOVEMENT, VK_CONTROL)
     {
-        Bind("Omni Sprint", &m_omniSprint);
+        Bind("Omni Sprint", &m_omniSprint,
+             "Also sprint sideways and backwards, which vanilla cannot do");
     }
 
     void OnTick(JNIEnv* env) override {
@@ -46,22 +54,14 @@ public:
         if (!KeyBinds::HasSprint()) return;
 
         jobject player = Minecraft::GetPlayer(env);
-        if (!player) {
-            if (m_held) { KeyBinds::ReleaseSprint(env); m_held = false; }
-            return;
-        }
+        if (!player) { Release(env); return; }
 
-        if (Minecraft::IsInGui(env)) {
-            if (m_held) { KeyBinds::ReleaseSprint(env); m_held = false; }
-            return;
-        }
+        if (Minecraft::IsInGui(env)) { Release(env); return; }
 
         // Read the game's movement state rather than raw scancodes,
         // so rebound keys and other modules are both accounted for.
-        bool moving = m_omniSprint
-            ? (KeyBinds::GetForward(env) || KeyBinds::GetBack(env)
-            || KeyBinds::GetLeft(env)    || KeyBinds::GetRight(env))
-            :  KeyBinds::GetForward(env);
+        Movement::Input in = Movement::Read(env);
+        bool moving = m_omniSprint ? in.moving : (in.forward > 0.0f);
 
         if (moving) {
             // Re-asserted every tick on purpose: another module may
@@ -69,27 +69,28 @@ public:
             // write, and the edge-only version never noticed.
             KeyBinds::SetSprint(env, true);
             m_held = true;
-        } else if (m_held) {
-            KeyBinds::ReleaseSprint(env);
-            m_held = false;
+        } else {
+            Release(env);
         }
     }
 
-    void OnDisable(JNIEnv* env) override {
-        if (!m_held) return;
-        KeyBinds::ReleaseSprint(env);
-        m_held = false;
-    }
+    void OnDisable(JNIEnv* env) override { Release(env); }
 
-    void RenderSettings() override {
-        ImGui::Checkbox("Omni Sprint", &m_omniSprint);
-        if (m_omniSprint) {
-            ImGui::TextColored(ImVec4(1.f, 0.7f, 0.3f, 1.f),
-                "Sprinting sideways or backwards is not vanilla behaviour");
-        }
+    // A reconnect can happen with the key held on our behalf, and
+    // the new world would start with a phantom ctrl down.
+    void OnReset(JNIEnv* env) override { Release(env); }
+
+    NoticeLevel Notice(const char** text) const override {
         if (!KeyBinds::HasSprint()) {
-            ImGui::TextColored(ImVec4(1.f, 0.8f, 0.3f, 1.f),
-                "Sprint keybind unresolved: module inactive");
+            *text = "The sprint keybind could not be found in this build of "
+                    "the game, so the module cannot do anything.";
+            return NoticeLevel::Warning;
         }
+        if (m_omniSprint) {
+            *text = "Sprinting sideways or backwards is not something vanilla "
+                    "can produce, and a prediction anticheat will see it.";
+            return NoticeLevel::Warning;
+        }
+        return NoticeLevel::None;
     }
 };
