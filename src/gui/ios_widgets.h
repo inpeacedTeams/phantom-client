@@ -150,11 +150,18 @@ inline bool Segmented(const char* id, const char* const items[], int count,
     ImGui::PushID(id);
     ImGuiID wid = ImGui::GetID("##seg");
 
+    if (count <= 0) { ImGui::PopID(); return false; }
     if (width <= 0.0f) width = ImGui::GetContentRegionAvail().x;
     ImVec2 pos = ImGui::GetCursorScreenPos();
     ImVec2 size(width, M::SegHeight);
 
     ImGui::InvisibleButton("##seg", size);
+
+    // An out of range value would put the capsule off the control.
+    // Configs are clamped on load, but a mode removed in a later
+    // build should still land somewhere sane rather than nowhere.
+    if (*current < 0) *current = 0;
+    if (*current >= count) *current = count - 1;
 
     bool changed = false;
     float segW = size.x / (float)count;
@@ -186,15 +193,23 @@ inline bool Segmented(const char* id, const char* const items[], int count,
                       IM_COL32(0, 0, 0, 20), M::SegRadius - 1.0f);
     dl->AddRectFilled(ca, cb, Col::Card, M::SegRadius - 1.0f);
 
-    // The selected label darkens as the capsule arrives under it
+    // The selected label darkens as the capsule arrives under it.
+    // Labels are clipped to their segment: a long mode name used to
+    // run straight over its neighbour.
     for (int i = 0; i < count; i++) {
+        float sx = pos.x + segW * i;
         ImVec2 ts = ImGui::CalcTextSize(items[i]);
-        float cx = pos.x + segW * i + (segW - ts.x) * 0.5f;
+        float cx = sx + (segW - ts.x) * 0.5f;
+        if (cx < sx + 4.0f) cx = sx + 4.0f;
         float cy = pos.y + (size.y - ts.y) * 0.5f;
 
         float d = std::fabs(sel - (float)i);
         if (d > 1.0f) d = 1.0f;
+
+        dl->PushClipRect(ImVec2(sx + 2.0f, pos.y),
+                         ImVec2(sx + segW - 2.0f, pos.y + size.y), true);
         dl->AddText(ImVec2(cx, cy), Col::Mix(Col::Label, Col::Label2, d), items[i]);
+        dl->PopClipRect();
     }
 
     ImGui::PopID();
@@ -208,47 +223,62 @@ inline bool Segmented(const char* id, const char* const items[], int count,
 // The height is unknown until the content is laid out, so the
 // background is drawn into a reserved draw-list channel and filled
 // in at End.
+//
+// This used to keep exactly one state, which was fine right up
+// until a card contained a card: the inner End marked the state
+// inactive and the outer End then quietly did nothing, so the outer
+// background never appeared. A small fixed stack costs nothing and
+// removes the whole class of problem. Four deep is far more than
+// any screen here needs, and going past it draws without a
+// background rather than corrupting the draw list.
 // =================================================================
 struct CardState {
     ImDrawListSplitter splitter;
+    ImDrawList* target = nullptr;
     ImVec2 start;
     float  width = 0.0f;
-    bool   active = false;
 };
 
-inline CardState g_card;
+inline constexpr int kMaxCardDepth = 4;
+inline CardState g_cards[kMaxCardDepth];
+inline int g_cardDepth = 0;
 
 inline void BeginCard(float width = -1.0f) {
+    if (g_cardDepth >= kMaxCardDepth) { g_cardDepth++; return; }
+
+    CardState& c = g_cards[g_cardDepth++];
+
     if (width <= 0.0f) width = ImGui::GetContentRegionAvail().x;
 
-    g_card.start  = ImGui::GetCursorScreenPos();
-    g_card.width  = width;
-    g_card.active = true;
+    c.target = ImGui::GetWindowDrawList();
+    c.start  = ImGui::GetCursorScreenPos();
+    c.width  = width;
 
-    g_card.splitter.Split(ImGui::GetWindowDrawList(), 2);
-    g_card.splitter.SetCurrentChannel(ImGui::GetWindowDrawList(), 1);
+    c.splitter.Split(c.target, 2);
+    c.splitter.SetCurrentChannel(c.target, 1);
 
     ImGui::Dummy(ImVec2(0, 2));
 }
 
 inline void EndCard() {
-    if (!g_card.active) return;
+    if (g_cardDepth <= 0) return;
+    if (g_cardDepth > kMaxCardDepth) { g_cardDepth--; return; }
+
+    CardState& c = g_cards[--g_cardDepth];
 
     ImGui::Dummy(ImVec2(0, 2));
 
     ImVec2 end = ImGui::GetCursorScreenPos();
-    ImDrawList* dl = ImGui::GetWindowDrawList();
 
-    g_card.splitter.SetCurrentChannel(dl, 0);
+    c.splitter.SetCurrentChannel(c.target, 0);
 
-    ImVec2 a = g_card.start;
-    ImVec2 b(a.x + g_card.width, end.y);
+    ImVec2 a = c.start;
+    ImVec2 b(a.x + c.width, end.y);
 
-    DropShadow(dl, a, b, M::CardRadius);
-    dl->AddRectFilled(a, b, Col::Card, M::CardRadius);
+    DropShadow(c.target, a, b, M::CardRadius);
+    c.target->AddRectFilled(a, b, Col::Card, M::CardRadius);
 
-    g_card.splitter.Merge(dl);
-    g_card.active = false;
+    c.splitter.Merge(c.target);
 
     ImGui::Dummy(ImVec2(0, 1));
 }
@@ -322,14 +352,27 @@ inline bool SwitchRow(const char* label, bool* v,
         textX += 18.0f;
     }
 
+    // Neither line may run under the switch. A long subtitle is
+    // wrapped rather than clipped, because a sentence cut off
+    // mid-word explains nothing.
+    float textRoom = (p.x + w - M::SwitchW - M::RowPadX * 2.0f) - textX;
+    if (textRoom < 40.0f) textRoom = 40.0f;
+
     if (subtitle) {
+        dl->PushClipRect(ImVec2(textX, p.y),
+                         ImVec2(textX + textRoom, p.y + h), true);
         dl->AddText(ImVec2(textX, p.y + 10.0f), Col::Label, label);
         Fonts::Push(Fonts::Caption);
-        dl->AddText(ImVec2(textX, p.y + 32.0f), Col::Label2, subtitle);
+        dl->AddText(Fonts::Caption, 0.0f, ImVec2(textX, p.y + 32.0f),
+                    Col::Label2, subtitle, nullptr, textRoom);
         Fonts::Pop(Fonts::Caption);
+        dl->PopClipRect();
     } else {
         ImVec2 ts = ImGui::CalcTextSize(label);
+        dl->PushClipRect(ImVec2(textX, p.y),
+                         ImVec2(textX + textRoom, p.y + h), true);
         dl->AddText(ImVec2(textX, p.y + (h - ts.y) * 0.5f), Col::Label, label);
+        dl->PopClipRect();
     }
 
     if (badge && badge[0]) {
@@ -427,6 +470,13 @@ inline bool SliderRow(const char* label, float* v, float lo, float hi,
 {
     ImGui::PushID(label);
 
+    if (!fmt) fmt = "%.2f";
+
+    // Whatever happens, the value on screen is inside the range the
+    // control can express.
+    if (*v < lo) *v = lo;
+    if (*v > hi) *v = hi;
+
     float w = ImGui::GetContentRegionAvail().x;
     ImVec2 p = ImGui::GetCursorScreenPos();
     ImDrawList* dl = ImGui::GetWindowDrawList();
@@ -437,17 +487,6 @@ inline bool SliderRow(const char* label, float* v, float lo, float hi,
     float trackW = w * 0.40f;
     float trackX = p.x + w - M::RowPadX - trackW;
     float trackY = rowMid;
-
-    // ---- Label ----
-    ImVec2 ts = ImGui::CalcTextSize(label);
-    dl->AddText(ImVec2(p.x + M::RowPadX, rowMid - ts.y * 0.5f), Col::Label, label);
-
-    if (hint) {
-        Fonts::Push(Fonts::Caption);
-        dl->AddText(ImVec2(p.x + M::RowPadX, rowMid + ts.y * 0.5f + 4.0f),
-                    Col::Label2, hint);
-        Fonts::Pop(Fonts::Caption);
-    }
 
     bool changed = false;
 
@@ -464,6 +503,24 @@ inline bool SliderRow(const char* label, float* v, float lo, float hi,
     float chipH = 22.0f * UI::scale;
     ImVec2 ca(trackX - chipW - 10.0f, rowMid - chipH * 0.5f);
     ImVec2 cb(ca.x + chipW, ca.y + chipH);
+
+    // ---- Label, clipped so it stops at the chip ----
+    ImVec2 ts = ImGui::CalcTextSize(label);
+    float labelRoom = ca.x - 8.0f - (p.x + M::RowPadX);
+    if (labelRoom < 40.0f) labelRoom = 40.0f;
+
+    dl->PushClipRect(ImVec2(p.x + M::RowPadX, p.y),
+                     ImVec2(p.x + M::RowPadX + labelRoom, p.y + h), true);
+    dl->AddText(ImVec2(p.x + M::RowPadX, rowMid - ts.y * 0.5f), Col::Label, label);
+    dl->PopClipRect();
+
+    if (hint) {
+        Fonts::Push(Fonts::Caption);
+        dl->AddText(Fonts::Caption, 0.0f,
+                    ImVec2(p.x + M::RowPadX, rowMid + ts.y * 0.5f + 4.0f),
+                    Col::Label2, hint, nullptr, w - M::RowPadX * 2.0f);
+        Fonts::Pop(Fonts::Caption);
+    }
 
     ImGuiID editId = ImGui::GetID("##edit");
     bool editing = (g_sliderEdit == editId);
@@ -539,6 +596,18 @@ inline bool SliderRow(const char* label, float* v, float lo, float hi,
         if (local > 1.0f) local = 1.0f;
         float nv = lo + (hi - lo) * local;
         if (nv != *v) { *v = nv; changed = true; }
+    }
+
+    // The wheel nudges by a hundredth of the range, which is how you
+    // land on an exact value without opening the text field.
+    if (hover && !editing) {
+        float wheel = ImGui::GetIO().MouseWheel;
+        if (wheel != 0.0f) {
+            float nv = *v + (hi - lo) * 0.01f * wheel;
+            if (nv < lo) nv = lo;
+            if (nv > hi) nv = hi;
+            if (nv != *v) { *v = nv; changed = true; }
+        }
     }
 
     float pressT = Anim::To(ImGui::GetID("##slp"), active ? 1.0f : 0.0f, 20.0f);
@@ -728,11 +797,18 @@ inline void ValueRow(const char* label, const char* value) {
     ImVec2 p = ImGui::GetCursorScreenPos();
     ImDrawList* dl = ImGui::GetWindowDrawList();
 
+    ImVec2 vs = ImGui::CalcTextSize(value);
     ImVec2 ls = ImGui::CalcTextSize(label);
+
+    float labelRoom = w - M::RowPadX * 2.0f - vs.x - 12.0f;
+    if (labelRoom < 40.0f) labelRoom = 40.0f;
+
+    dl->PushClipRect(ImVec2(p.x + M::RowPadX, p.y),
+                     ImVec2(p.x + M::RowPadX + labelRoom, p.y + h), true);
     dl->AddText(ImVec2(p.x + M::RowPadX, p.y + (h - ls.y) * 0.5f),
                 Col::Label, label);
+    dl->PopClipRect();
 
-    ImVec2 vs = ImGui::CalcTextSize(value);
     dl->AddText(ImVec2(p.x + w - M::RowPadX - vs.x, p.y + (h - vs.y) * 0.5f),
                 Col::Label2, value);
 
@@ -793,12 +869,17 @@ inline void HoverCard(ImVec2 anchor, const char* title, const char* body,
     ImVec2 a(anchor.x - (1.0f - alpha) * 8.0f, anchor.y);
     ImVec2 b(a.x + w, a.y + h);
 
-    // Keep it on screen when the panel is dragged to the right edge
+    // Keep it on screen when the panel is dragged to an edge
     ImGuiIO& io = ImGui::GetIO();
     if (b.x > io.DisplaySize.x - 8.0f) {
         float shift = b.x - (io.DisplaySize.x - 8.0f);
         a.x -= shift; b.x -= shift;
     }
+    if (b.y > io.DisplaySize.y - 8.0f) {
+        float shift = b.y - (io.DisplaySize.y - 8.0f);
+        a.y -= shift; b.y -= shift;
+    }
+    if (a.y < 8.0f) { float d = 8.0f - a.y; a.y += d; b.y += d; }
 
     dl->AddRectFilled(ImVec2(a.x + 2, a.y + 4), ImVec2(b.x + 2, b.y + 5),
                       IM_COL32(0, 0, 0, (int)(40 * alpha)), M::CardRadius);
