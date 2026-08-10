@@ -18,6 +18,13 @@
 // one across ticks and never touch it from the render thread. For
 // rendering, convert to EntitySnapshot, which is plain data.
 //
+// IDENTITY
+// Snapshots carry the entity id. Without it the renderer cannot
+// tell one player from another between frames, so it cannot fade
+// anything in or out and every momentary gap in the scan shows up
+// as a flicker. Names are not a substitute: they are not unique and
+// they cost a string compare per entity per frame.
+//
 // CACHING
 // Five modules ask for the player list every tick (ESP, AimAssist,
 // KillAura, HitSelect, AutoBlockhit). Each scan used to allocate
@@ -29,22 +36,29 @@
 
 struct EntityInfo {
     jobject ref = nullptr;
+    int    id = -1;
     double posX = 0, posY = 0, posZ = 0;
     double prevPosX = 0, prevPosY = 0, prevPosZ = 0;
     float  yaw = 0, pitch = 0;
     float  health = 20.f, maxHealth = 20.f;
     int    hurtTime = 0;
     bool   onGround = false;
+    bool   sneaking = false;
+    float  width = 0.6f, height = 1.8f;
     double distanceToPlayer = 0;
     std::string name;
 };
 
 // JNI-free copy for the render thread
 struct EntitySnapshot {
+    int    id = -1;
     double posX = 0, posY = 0, posZ = 0;
     double prevPosX = 0, prevPosY = 0, prevPosZ = 0;
+    float  yaw = 0;
     float  health = 20.f, maxHealth = 20.f;
     int    hurtTime = 0;
+    bool   sneaking = false;
+    float  width = 0.6f, height = 1.8f;
     double distanceToPlayer = 0;
     std::string name;
 };
@@ -57,6 +71,8 @@ private:
     inline static jmethodID mGetName  = nullptr;
     inline static jmethodID mGetHealth = nullptr;
     inline static jmethodID mGetMaxHealth = nullptr;
+    inline static jmethodID mGetEntityId = nullptr;
+    inline static jmethodID mIsSneaking  = nullptr;
 
     inline static jfieldID fHurtTime = nullptr;
     inline static jfieldID fIsDead   = nullptr;
@@ -64,6 +80,7 @@ private:
     inline static jfieldID fPosX = nullptr, fPosY = nullptr, fPosZ = nullptr;
     inline static jfieldID fPrevPosX = nullptr, fPrevPosY = nullptr, fPrevPosZ = nullptr;
     inline static jfieldID fYaw = nullptr, fPitch = nullptr;
+    inline static jfieldID fWidth = nullptr, fHeight = nullptr;
 
     inline static jclass listClass = nullptr;
     inline static bool s_ready = false;
@@ -135,6 +152,12 @@ private:
 
             info.ref = ent;   // kept: freed when the tick's frame pops
 
+            if (mGetEntityId) {
+                jint eid = env->CallIntMethod(ent, mGetEntityId);
+                if (env->ExceptionCheck()) env->ExceptionClear();
+                else info.id = (int)eid;
+            }
+
             info.prevPosX = fPrevPosX ? env->GetDoubleField(ent, fPrevPosX) : info.posX;
             info.prevPosY = fPrevPosY ? env->GetDoubleField(ent, fPrevPosY) : info.posY;
             info.prevPosZ = fPrevPosZ ? env->GetDoubleField(ent, fPrevPosZ) : info.posZ;
@@ -142,6 +165,19 @@ private:
             info.pitch    = fPitch ? env->GetFloatField(ent, fPitch) : 0.f;
             info.hurtTime = fHurtTime ? env->GetIntField(ent, fHurtTime) : 0;
             info.onGround = fOnGround ? env->GetBooleanField(ent, fOnGround) : false;
+
+            // The real hitbox, so a box drawn round a sneaking player
+            // does not float above their head.
+            if (fWidth)  info.width  = env->GetFloatField(ent, fWidth);
+            if (fHeight) info.height = env->GetFloatField(ent, fHeight);
+            if (info.width  < 0.05f || info.width  > 4.0f) info.width  = 0.6f;
+            if (info.height < 0.05f || info.height > 4.0f) info.height = 1.8f;
+
+            if (mIsSneaking) {
+                jboolean sn = env->CallBooleanMethod(ent, mIsSneaking);
+                if (env->ExceptionCheck()) env->ExceptionClear();
+                else info.sneaking = (sn != 0);
+            }
 
             if (mGetMaxHealth) {
                 info.maxHealth = env->CallFloatMethod(ent, mGetMaxHealth);
@@ -224,7 +260,13 @@ public:
             fPitch    = JvmtiUtil::FindField(env, e, { "field_70125_A", "rotationPitch" });
             fOnGround = JvmtiUtil::FindField(env, e, { "field_70122_E", "onGround" });
             fIsDead   = JvmtiUtil::FindField(env, e, { "field_70128_L", "isDead" });
+            fWidth    = JvmtiUtil::FindField(env, e, { "field_70130_N", "width" });
+            fHeight   = JvmtiUtil::FindField(env, e, { "field_70131_O", "height" });
             mGetName  = JvmtiUtil::FindMethod(env, e, { "func_70005_c_", "getName" }, 0);
+            mGetEntityId = JvmtiUtil::FindMethod(env, e,
+                { "func_145782_y", "getEntityId" }, 0);
+            mIsSneaking  = JvmtiUtil::FindMethod(env, e,
+                { "func_70093_af", "isSneaking" }, 0);
         }
 
         // Health lives in the DataWatcher in 1.8, so it has to come
@@ -237,8 +279,9 @@ public:
         }
 
         s_ready = (fPlayerEntities && mListSize && mListGet && fPosX);
-        printf("[EntityList] ready=%d list=%p health=%p name=%p\n",
-            (int)s_ready, (void*)fPlayerEntities, (void*)mGetHealth, (void*)mGetName);
+        printf("[EntityList] ready=%d list=%p health=%p name=%p id=%p\n",
+            (int)s_ready, (void*)fPlayerEntities, (void*)mGetHealth,
+            (void*)mGetName, (void*)mGetEntityId);
         return s_ready;
     }
 
@@ -268,10 +311,14 @@ public:
         out.reserve(in.size());
         for (const auto& e : in) {
             EntitySnapshot s;
+            s.id = e.id;
             s.posX = e.posX; s.posY = e.posY; s.posZ = e.posZ;
             s.prevPosX = e.prevPosX; s.prevPosY = e.prevPosY; s.prevPosZ = e.prevPosZ;
+            s.yaw = e.yaw;
             s.health = e.health; s.maxHealth = e.maxHealth;
             s.hurtTime = e.hurtTime;
+            s.sneaking = e.sneaking;
+            s.width = e.width; s.height = e.height;
             s.distanceToPlayer = e.distanceToPlayer;
             s.name = e.name;
             out.push_back(std::move(s));
