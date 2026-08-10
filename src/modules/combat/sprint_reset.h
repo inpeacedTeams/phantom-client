@@ -254,6 +254,14 @@ public:
 
         jobject player = Minecraft::GetPlayer(env);
 
+        // The mouse edge is tracked every tick, not only inside the
+        // branch that uses it. Updating it lazily meant switching
+        // trigger modes with the button already held read as a fresh
+        // press and fired one reset for free.
+        bool lmb = (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0;
+        bool lmbEdge = lmb && !m_lastLMB;
+        m_lastLMB = lmb;
+
         // No player means we cannot even read state. Unwind first so
         // a respawn or a dimension change cannot strand a key.
         if (!player) {
@@ -330,9 +338,7 @@ public:
             trigger = CombatState::AttackedThisTick();
             if (CombatState::SwungThisTick() && !trigger) m_skipped++;
         } else {
-            bool lmb = (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0;
-            trigger = lmb && !m_lastLMB;
-            m_lastLMB = lmb;
+            trigger = lmbEdge;
         }
 
         if (!trigger) {
@@ -368,11 +374,35 @@ public:
         m_why = "off";
     }
 
+    // -------------------------------------------------------------
+    // World change, respawn, reconnect.
+    //
+    // A reset is at most a few ticks long, so one is almost
+    // certainly in flight when a fight ends in a death. The keys
+    // have already been released underneath us; what is left is the
+    // bookkeeping, and leaving that set means the next world starts
+    // with the module convinced it is mid-reset and refusing to
+    // start another one.
+    // -------------------------------------------------------------
+    void OnReset(JNIEnv* env) override {
+        m_resetting       = false;
+        m_rearming        = false;
+        m_rearmLeft       = 0;
+        m_resetCountdown  = 0;
+        m_delayCountdown  = 0;
+        m_waitingForDelay = false;
+        m_heldTicks       = 0;
+        m_lastLMB         = false;
+        m_why             = "idle";
+        (void)env;   // keys are already released by the manager
+    }
+
     const char* StatusLine() const override {
         static const char* names[] = { "W-Tap", "S-Tap", "Blockhit",
                                        "Sneak", "Ctrl", "Packet" };
-        snprintf(m_status, sizeof(m_status), "%s  ·  %d resets",
-                 names[m_method], m_resets);
+        int m = (m_method >= 0 && m_method < 6) ? m_method : 0;
+        snprintf(m_status, sizeof(m_status), "%s  \xc2\xb7  %d resets",
+                 names[m], m_resets);
         return m_status;
     }
 
