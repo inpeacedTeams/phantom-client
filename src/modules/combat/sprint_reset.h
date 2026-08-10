@@ -5,7 +5,6 @@
 #include "../../mc/combat_state.h"
 #include "../../jni/class_resolver.h"
 #include "../../jni/jvmti_util.h"
-#include <imgui.h>
 #include <Windows.h>
 #include <cstdio>
 #include <random>
@@ -71,8 +70,14 @@
 
 class SprintReset : public Module {
 private:
+    enum Method { WTAP = 0, STAP, BLOCKHIT, SNEAK, CTRL, PACKET };
+
+    static constexpr const char* kMethods[] = {
+        "W-Tap", "S-Tap", "Block", "Sneak", "Ctrl", "Packet"
+    };
+
     // ---- Core ----
-    int   m_method = 0;
+    int   m_method = WTAP;
     float m_chance = 100.0f;
 
     // ---- Advanced ----
@@ -94,7 +99,7 @@ private:
     int  m_delayCountdown  = 0;
     bool m_waitingForDelay = false;
     bool m_lastLMB         = false;
-    int  m_activeMethod    = 0;   // method that started the current reset
+    int  m_activeMethod    = WTAP;   // method that started the current reset
 
     // No reset has any business lasting longer than this. If one
     // does, something ate a tick and a key is about to get stuck.
@@ -106,6 +111,7 @@ private:
     int m_rescued = 0;
     const char* m_why = "idle";
     mutable char m_status[48] = "";
+    mutable char m_notice[192] = "";
 
     jmethodID m_setSprinting = nullptr;
     bool m_resolved = false;
@@ -146,12 +152,12 @@ private:
     // Only these three actually stop the sprint by cutting movement,
     // so only these need it started again afterwards.
     static bool MethodBreaksSprint(int m) {
-        return m == 0 || m == 1 || m == 4;
+        return m == WTAP || m == STAP || m == CTRL;
     }
 
     void StopRearm(JNIEnv* env) {
         if (!m_rearming) return;
-        KeyBinds::ReleaseSprint(env);
+        if (env) KeyBinds::ReleaseSprint(env);
         m_rearming = false;
         m_rearmLeft = 0;
     }
@@ -180,13 +186,15 @@ private:
     // Release() puts the key back to whatever the hardware says now,
     // so letting go of W mid-reset does not strand you moving.
     void EndReset(JNIEnv* env, jobject player) {
-        switch (m_activeMethod) {
-            case 0: KeyBinds::ReleaseForward(env); break;
-            case 1: KeyBinds::ReleaseBack(env);    break;
-            case 2: KeyBinds::ReleaseUseItem(env); break;
-            case 3: KeyBinds::ReleaseSneak(env);   break;
-            case 4: KeyBinds::ReleaseSprint(env);  break;
-            default: break;
+        if (env) {
+            switch (m_activeMethod) {
+                case WTAP:     KeyBinds::ReleaseForward(env); break;
+                case STAP:     KeyBinds::ReleaseBack(env);    break;
+                case BLOCKHIT: KeyBinds::ReleaseUseItem(env); break;
+                case SNEAK:    KeyBinds::ReleaseSneak(env);   break;
+                case CTRL:     KeyBinds::ReleaseSprint(env);  break;
+                default: break;
+            }
         }
 
         m_resetting = false;
@@ -201,12 +209,12 @@ private:
         m_resets++;
 
         switch (m_method) {
-            case 0: KeyBinds::SetForward(env, false); break;
-            case 1: KeyBinds::SetBack(env, true);     break;
-            case 2: KeyBinds::SetUseItem(env, true);  break;
-            case 3: KeyBinds::SetSneak(env, true);    break;
-            case 4: KeyBinds::SetSprint(env, false);  break;
-            case 5:
+            case WTAP:     KeyBinds::SetForward(env, false); break;
+            case STAP:     KeyBinds::SetBack(env, true);     break;
+            case BLOCKHIT: KeyBinds::SetUseItem(env, true);  break;
+            case SNEAK:    KeyBinds::SetSneak(env, true);    break;
+            case CTRL:     KeyBinds::SetSprint(env, false);  break;
+            case PACKET:
                 SetSprintFlag(env, player, false);
                 SetSprintFlag(env, player, true);
                 return;   // instant, nothing to unwind
@@ -234,23 +242,56 @@ public:
         : Module("Sprint Reset", "Reset sprint on every landed hit for full knockback",
                  ModuleCategory::COMBAT, 0)
     {
-        Bind("Method", &m_method);
-        Bind("Chance", &m_chance);
-        Bind("Reset Ticks Min", &m_resetTicksMin);
-        Bind("Reset Ticks Max", &m_resetTicksMax);
-        Bind("Hit Delay", &m_hitDelay);
-        Bind("Rearm Sprint", &m_rearmSprint);
-        Bind("Rearm Ticks", &m_rearmTicks);
-        Bind("Only While Moving", &m_onlyWhileMoving);
-        Bind("Only On Hit", &m_onlyOnHit);
-        Bind("Require Sprint", &m_requireSprint);
+        BindMode("Method", &m_method, kMethods, 6,
+                 "How the sprint is broken. W-Tap works everywhere; Ctrl "
+                 "loses the least momentum; Packet is the fastest and the "
+                 "only one a server can see.");
+
+        Bind("Chance", &m_chance, 10.0f, 100.0f, "%.0f%%",
+             "How many of your hits get a reset");
+
+        Bind("Hold Min", &m_resetTicksMin, 1, 5,
+             "Ticks the key is held. One tick is 50ms, and longer costs more "
+             "momentum than it gains in knockback.")
+            .Advanced();
+
+        Bind("Hold Max", &m_resetTicksMax, 1, 5)
+            .Advanced();
+
+        Bind("Hit Delay", &m_hitDelay, 0, 5,
+             "Ticks between the hit landing and the reset starting")
+            .Advanced();
+
+        Bind("Re-arm Sprint", &m_rearmSprint,
+             "Taps the sprint key afterwards so the game restarts your "
+             "sprint itself. Without this, double-tap sprinters walk.")
+            .Advanced();
+
+        Bind("Re-arm Ticks", &m_rearmTicks, 1, 4,
+             "How long the sprint key is held afterwards")
+            .When("Re-arm Sprint", 1).Advanced();
+
+        Bind("Only On Landed Hits", &m_onlyOnHit,
+             "Fire on a real swing with a target in reach, not on every "
+             "click at thin air")
+            .Advanced();
+
+        Bind("Only While Moving", &m_onlyWhileMoving,
+             "There is nothing to reset if you are standing still")
+            .Advanced();
+
+        Bind("Require Sprint", &m_requireSprint,
+             "Resetting a sprint you do not have just costs momentum")
+            .Advanced();
     }
 
     void OnTick(JNIEnv* env) override {
         Resolve(env);
 
         // Packet mode is the only one that does not need keybinds
-        if (!KeyBinds::Init(env) && m_method != 5) return;
+        if (!KeyBinds::Init(env) && m_method != PACKET) return;
+
+        if (m_resetTicksMin > m_resetTicksMax) m_resetTicksMin = m_resetTicksMax;
 
         jobject player = Minecraft::GetPlayer(env);
 
@@ -358,7 +399,7 @@ public:
 
     void OnDisable(JNIEnv* env) override {
         if (m_resetting) {
-            jobject player = Minecraft::GetPlayer(env);
+            jobject player = env ? Minecraft::GetPlayer(env) : nullptr;
             EndReset(env, player);
         }
         StopRearm(env);
@@ -372,6 +413,7 @@ public:
         m_delayCountdown  = 0;
         m_heldTicks       = 0;
         m_why = "off";
+        m_status[0] = '\0';
     }
 
     // -------------------------------------------------------------
@@ -393,108 +435,62 @@ public:
         m_waitingForDelay = false;
         m_heldTicks       = 0;
         m_lastLMB         = false;
+        m_resets          = 0;
         m_why             = "idle";
         (void)env;   // keys are already released by the manager
     }
 
     const char* StatusLine() const override {
-        static const char* names[] = { "W-Tap", "S-Tap", "Blockhit",
-                                       "Sneak", "Ctrl", "Packet" };
         int m = (m_method >= 0 && m_method < 6) ? m_method : 0;
         snprintf(m_status, sizeof(m_status), "%s  \xc2\xb7  %d resets",
-                 names[m], m_resets);
+                 kMethods[m], m_resets);
         return m_status;
     }
 
-    bool HasAdvanced() const override { return true; }
-
-    // -------------------------------------------------------------
-    // Core panel: which reset, how often. Nothing else changes the
-    // outcome enough to be worth a slider on the front page.
-    // -------------------------------------------------------------
-    void RenderSettings() override {
-        const char* methods[] = {
-            "W-Tap", "S-Tap", "Blockhit", "Sneak Tap", "Ctrl Spam", "Packet"
-        };
-        ImGui::Combo("Method", &m_method, methods, 6);
-
-        switch (m_method) {
-            case 0: ImGui::TextDisabled("Releases forward for a tick. Works everywhere."); break;
-            case 1: ImGui::TextDisabled("Taps back. Stops you faster and opens distance."); break;
-            case 2: ImGui::TextDisabled("Holds block. Also halves damage. Sword only."); break;
-            case 3: ImGui::TextDisabled("Taps sneak. No speed loss, common in sumo."); break;
-            case 4: ImGui::TextDisabled("Re-presses sprint. Loses the least momentum."); break;
-            case 5: ImGui::TextDisabled("Toggles sprint inside one tick. Fastest."); break;
+    NoticeLevel Notice(const char** text) const override {
+        if (!KeyBinds::HasMovement() && m_method != PACKET) {
+            *text = "The movement keybinds could not be found in this build "
+                    "of the game. Only Packet works here.";
+            return NoticeLevel::Danger;
         }
-        if (m_method == 5) {
-            ImGui::TextColored(ImVec4(1.f, 0.4f, 0.4f, 1.f),
-                "Packet mode is detected by Polar and AGC");
+        if (m_method == PACKET) {
+            *text = "Packet mode toggles the sprint flag directly, which "
+                    "Polar and AGC both look for. Every other method is "
+                    "indistinguishable from a good player.";
+            return NoticeLevel::Danger;
         }
-
-        ImGui::SliderFloat("Chance", &m_chance, 10.f, 100.f, "%.0f%%");
-
-        // Failure states belong up front: without these the module
-        // silently does nothing.
-        if (!CombatState::IsUsable() && m_onlyOnHit) {
-            ImGui::TextColored(ImVec4(1.f, 0.5f, 0.35f, 1.f),
-                "Swing detection unresolved: turn off Only On Landed Hits");
+        if (m_onlyOnHit && !CombatState::IsUsable()) {
+            *text = "Swing detection could not be resolved, so nothing will "
+                    "ever trigger. Turn off Only On Landed Hits.";
+            return NoticeLevel::Warning;
         }
-        if (!KeyBinds::HasMovement()) {
-            ImGui::TextColored(ImVec4(1.f, 0.8f, 0.3f, 1.f),
-                "Keybinds unresolved: only Packet mode works");
+        if (!m_rearmSprint && MethodBreaksSprint(m_method)) {
+            *text = "Re-arm Sprint is off. If you sprint by double-tapping W "
+                    "you will stay at walking speed after every hit.";
+            return NoticeLevel::Warning;
         }
         if (m_rescued > 0) {
-            ImGui::TextColored(ImVec4(1.f, 0.7f, 0.3f, 1.f),
-                "Watchdog freed a stuck key %d time(s)", m_rescued);
-        }
-    }
-
-    void RenderAdvanced() override {
-        const char* state = m_resetting ? "RESETTING"
-                          : m_rearming  ? "RE-ARMING"
-                                        : "idle";
-        ImGui::TextDisabled("%s (%s) | air swings ignored %d | your CPS %.1f",
-            state, m_why, m_skipped, CombatState::CPS());
-        if (KeyBinds::Repairs() > 0) {
-            ImGui::TextDisabled("Key reconcile repaired %d desync(s)",
-                KeyBinds::Repairs());
-        }
-        if (!KeyBinds::CanReadHardware()) {
-            ImGui::TextColored(ImVec4(1.f, 0.7f, 0.3f, 1.f),
-                "Cannot read the keyboard directly: keys restore from "
-                "the saved value instead");
+            snprintf(m_notice, sizeof(m_notice),
+                     "The watchdog freed a stuck key %d time(s) this session. "
+                     "Nothing is broken, but a tick was lost somewhere.",
+                     m_rescued);
+            *text = m_notice;
+            return NoticeLevel::Info;
         }
 
-        ImGui::SeparatorText("Timing");
-        ImGui::SliderInt("Hold Min (ticks)", &m_resetTicksMin, 1, 5);
-        ImGui::SliderInt("Hold Max (ticks)", &m_resetTicksMax, 1, 5);
-        if (m_resetTicksMin > m_resetTicksMax) m_resetTicksMin = m_resetTicksMax;
-        ImGui::SliderInt("Hit Delay (ticks)", &m_hitDelay, 0, 5);
-        ImGui::TextDisabled("1 tick is 50ms. Longer holds cost more momentum "
-                            "than they gain in knockback.");
-
-        ImGui::SeparatorText("Sprint recovery");
-        ImGui::Checkbox("Re-arm Sprint", &m_rearmSprint);
-        if (m_rearmSprint) {
-            ImGui::SliderInt("Re-arm Ticks", &m_rearmTicks, 1, 4);
-            ImGui::TextDisabled("Taps the sprint key after the reset so the "
-                                "game restarts your sprint itself.");
-            if (!KeyBinds::HasSprint()) {
-                ImGui::TextColored(ImVec4(1.f, 0.8f, 0.3f, 1.f),
-                    "Sprint keybind unresolved: cannot re-arm");
-            }
-        } else {
-            ImGui::TextColored(ImVec4(1.f, 0.5f, 0.35f, 1.f),
-                "Off: if you sprint by double-tapping W you will stay "
-                "at walking speed after every hit");
+        switch (m_method) {
+            case WTAP:  *text = "Releases forward for a tick. Works on every "
+                                "server and costs a little momentum."; break;
+            case STAP:  *text = "Taps back. Stops you faster and opens "
+                                "distance, which suits reach fights."; break;
+            case BLOCKHIT: *text = "Holds block, which also halves the damage "
+                                   "you take. Sword only."; break;
+            case SNEAK: *text = "Taps sneak. No speed loss at all, which is "
+                                "why it is the sumo standard."; break;
+            case CTRL:  *text = "Re-presses the sprint key. Loses the least "
+                                "momentum of any real method."; break;
+            default:    return NoticeLevel::None;
         }
-
-        ImGui::SeparatorText("Trigger");
-        ImGui::Checkbox("Only On Landed Hits", &m_onlyOnHit);
-        ImGui::TextDisabled(m_onlyOnHit
-            ? "Fires on a real swing with a target in reach."
-            : "Fires on any mouse click, including air swings.");
-        ImGui::Checkbox("Only While Moving", &m_onlyWhileMoving);
-        ImGui::Checkbox("Require Sprint", &m_requireSprint);
+        return NoticeLevel::Info;
     }
 };
