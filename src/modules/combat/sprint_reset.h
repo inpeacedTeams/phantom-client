@@ -21,7 +21,7 @@
 // as a fresh sprint hit.
 //
 // -----------------------------------------------------------------
-// WHY YOU FROZE AFTER EVERY HIT: TWO SEPARATE BUGS
+// WHY YOU FROZE AFTER EVERY HIT: THREE SEPARATE BUGS
 // -----------------------------------------------------------------
 // FIRST, the key never came back.
 //
@@ -31,10 +31,10 @@
 // Once we cleared the field the game had no reason to set it back:
 // no event was coming. You stood still until you let go of W and
 // pressed it again. That half is fixed in KeyBinds, which now
-// restores the key from the live hardware state.
+// restores the key from the live hardware state, and backed up by
+// the per-tick reconcile pass in ModuleManager.
 //
-// SECOND, and this is the half that was still broken: even with
-// forward restored, THE SPRINT ITSELF DOES NOT COME BACK.
+// SECOND, even with forward restored, THE SPRINT DID NOT COME BACK.
 //
 // EntityPlayerSP.onLivingUpdate only starts sprinting again when:
 //
@@ -43,13 +43,20 @@
 //
 // or when the double-tap timer is running. If you sprint by
 // double-tapping W, as most people in PvP do, the sprint key is not
-// held and the double-tap timer only advances on a real key event.
-// So after the reset you kept walking, at walking speed, forever.
+// held and that timer only advances on a real key event. So after
+// the reset you kept walking, at walking speed, forever.
 //
-// The fix is to re-arm: hold the sprint key for a tick after the
-// reset. That satisfies the game's own condition, so IT decides to
-// sprint and sends the packet itself. Identical to a player tapping
-// ctrl after a W-tap, which is exactly what good players do.
+// The fix is to re-arm: hold the sprint key for a tick afterwards.
+// That satisfies the game's own condition, so IT decides to sprint
+// and sends the packet itself. Identical to a player tapping ctrl
+// after a W-tap, which is exactly what good players do.
+//
+// THIRD, a "1 tick" reset held the key for two.
+//
+// The countdown was set to N and then tested before decrementing,
+// so the minimum hold was 2 ticks, 100ms. That is long enough to
+// visibly stall you on every single hit, and it doubled the
+// momentum the reset costs for no extra knockback.
 //
 // -----------------------------------------------------------------
 // METHODS
@@ -211,9 +218,15 @@ private:
         if (MethodBreaksSprint(m_method))
             SetSprintFlag(env, player, false);
 
-        m_resetting      = true;
-        m_resetCountdown = RandTicks();
-        m_heldTicks      = 0;
+        m_resetting = true;
+        m_heldTicks = 0;
+
+        // Minus one because the tick that starts the reset IS the
+        // first tick the key is held. Without this a setting of 1
+        // held for two ticks, which is 100ms of standing still on
+        // every hit.
+        m_resetCountdown = RandTicks() - 1;
+        if (m_resetCountdown < 0) m_resetCountdown = 0;
     }
 
 public:
@@ -371,6 +384,10 @@ public:
             ImGui::TextColored(ImVec4(1.f, 0.7f, 0.3f, 1.f),
                 "Watchdog fired %d time(s): the game is dropping ticks", m_rescued);
         }
+        if (KeyBinds::Repairs() > 0) {
+            ImGui::TextDisabled("Key reconcile repaired %d desync(s)",
+                KeyBinds::Repairs());
+        }
         if (!KeyBinds::CanReadHardware()) {
             ImGui::TextColored(ImVec4(1.f, 0.7f, 0.3f, 1.f),
                 "Cannot read the keyboard directly: keys restore from "
@@ -394,8 +411,8 @@ public:
         ImGui::SliderInt("Reset Ticks Max", &m_resetTicksMax, 1, 5);
         if (m_resetTicksMin > m_resetTicksMax) m_resetTicksMin = m_resetTicksMax;
         ImGui::SliderInt("Hit Delay (ticks)", &m_hitDelay, 0, 5);
-        ImGui::TextDisabled("Longer holds cost more momentum than they "
-                            "gain in knockback.");
+        ImGui::TextDisabled("1 tick is 50ms. Longer holds cost more momentum "
+                            "than they gain in knockback.");
 
         ImGui::Separator();
         ImGui::TextColored(ImVec4(0.4f, 1.f, 0.6f, 1.f), "Sprint recovery");
