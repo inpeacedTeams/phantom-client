@@ -36,7 +36,7 @@ enum class ModuleCategory {
 // exposed at all.
 // =================================================================
 struct Setting {
-    enum class Type { Bool, Int, Float, Mode };
+    enum class Type { Bool, Int, Float, Mode, Color };
 
     std::string name;               // config key and on-screen label
     const char* hint = nullptr;     // one line under the control
@@ -72,14 +72,31 @@ struct Setting {
     int   AsInt()   const { return *(int*)ptr; }
     float AsFloat() const { return *(float*)ptr; }
 
+    // How many scalars this setting is made of. A colour is four
+    // (RGBA); everything else is one. Used by the config layer to
+    // persist a colour as four keys instead of packing four channels
+    // into a single float and losing them to ostream formatting.
+    int Components() const { return type == Type::Color ? 4 : 1; }
+
     // The value a config file stores, whatever the type underneath.
     float Read() const {
         switch (type) {
             case Type::Bool:  return *(bool*)ptr ? 1.0f : 0.0f;
             case Type::Int:
             case Type::Mode:  return (float)*(int*)ptr;
+            case Type::Color: return ((const float*)ptr)[0];
             default:          return *(float*)ptr;
         }
+    }
+
+    // One channel of a colour, or the scalar value for everything
+    // else. i is 0..3 for RGBA.
+    float ReadComp(int i) const {
+        if (type == Type::Color) {
+            const float* c = (const float*)ptr;
+            return (i >= 0 && i < 4) ? c[i] : 0.0f;
+        }
+        return Read();
     }
 
     // Clamped on the way in, so a hand-edited or outdated config
@@ -102,10 +119,28 @@ struct Setting {
                 *(int*)ptr = (int)(c + (c < 0.0f ? -0.5f : 0.5f));
                 break;
             }
+            case Type::Color: {
+                // The scalar path only ever reaches the first
+                // channel; the loader uses WriteComp for the rest.
+                float* c = (float*)ptr;
+                c[0] = v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v);
+                break;
+            }
             default:
                 *(float*)ptr = v < lo ? lo : (v > hi ? hi : v);
                 break;
         }
+    }
+
+    // One channel of a colour, clamped to 0..1. Anything else falls
+    // through to the scalar Write.
+    void WriteComp(int i, float v) {
+        if (type == Type::Color) {
+            if (i < 0 || i > 3) return;
+            ((float*)ptr)[i] = v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v);
+            return;
+        }
+        Write(v);
     }
 };
 
@@ -221,6 +256,20 @@ protected:
         return Push(s);
     }
 
+    // A colour: four contiguous floats, RGBA, each 0..1. Drawn as a
+    // swatch that opens a picker, and persisted as four suffixed
+    // keys rather than one packed float, so no precision is lost.
+    // The pointer is to the first of the four.
+    SettingRef BindColor(const char* name, float* rgba,
+                         const char* hint = nullptr)
+    {
+        Setting s;
+        s.name = name; s.hint = hint;
+        s.type = Setting::Type::Color; s.ptr = rgba;
+        s.lo = 0.0f; s.hi = 1.0f;
+        return Push(s);
+    }
+
 public:
     Module(const std::string& name, const std::string& desc,
            ModuleCategory cat, int key = 0)
@@ -303,6 +352,19 @@ public:
         for (auto& s : m_settings) {
             if (s.name != setting) continue;
             s.Write(value);
+            return true;
+        }
+        return false;
+    }
+
+    // Route one channel of a colour setting, used by the config
+    // loader for the suffixed .r/.g/.b/.a keys. Returns false when
+    // the name is not a colour, so a scalar key that happens to end
+    // in .r still falls through to SetValue rather than being eaten.
+    bool SetColorComponent(const std::string& setting, int comp, float value) {
+        for (auto& s : m_settings) {
+            if (s.name != setting || s.type != Setting::Type::Color) continue;
+            s.WriteComp(comp, value);
             return true;
         }
         return false;

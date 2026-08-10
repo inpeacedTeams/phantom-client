@@ -111,6 +111,11 @@ inline bool DrawSetting(Setting& s) {
             return SliderRow(s.name.c_str(), (float*)s.ptr,
                              s.lo, s.hi, s.fmt, s.hint);
 
+        case Setting::Type::Color:
+            // A colour is four floats behind the pointer; the row
+            // draws a swatch and opens a picker. No per-module code.
+            return ColorRow(s.name.c_str(), (float*)s.ptr, s.hint);
+
         case Setting::Type::Mode: {
             // Segmented controls need room to breathe and read badly
             // squeezed between switch rows, so a mode always gets its
