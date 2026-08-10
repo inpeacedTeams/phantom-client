@@ -3,12 +3,12 @@
 #include <chrono>
 #include <deque>
 #include <cmath>
-#include <cstdio>
 
 #include "minecraft.h"
 #include "entity_list.h"
 #include "../jni/class_resolver.h"
 #include "../jni/jvmti_util.h"
+#include "../util/log.h"
 
 // =================================================================
 // CombatState
@@ -47,6 +47,25 @@ private:
     using Clock = std::chrono::steady_clock;
     using Ms    = std::chrono::milliseconds;
 
+    // ---- Tuning ----
+    // Vanilla melee reach is 3.0 blocks and the server allows a
+    // little more. Anything inside this counts as "that swing had
+    // somebody in front of it".
+    static constexpr double kAttackReach = 3.5;
+    static constexpr float  kScanRange   = 6.0f;
+
+    // Two seconds either side of an exchange still counts as being
+    // in a fight, so modules do not flicker between combos.
+    static constexpr int kCombatTailTicks = 40;
+
+    // Swing gaps outside this band are duplicates or pauses and say
+    // nothing about click rate.
+    static constexpr long long kMinGapMs = 40;
+    static constexpr long long kMaxGapMs = 2000;
+    static constexpr size_t    kGapWindow = 10;
+
+    static constexpr int kNever = 9999;
+
     // ---- Per-tick facts ----
     inline static bool s_swung        = false;
     inline static bool s_attacked     = false;
@@ -66,9 +85,9 @@ private:
     inline static bool s_everAttacked = false;
     inline static bool s_everHit   = false;
 
-    inline static int s_ticksSinceSwing  = 9999;
-    inline static int s_ticksSinceAttack = 9999;
-    inline static int s_ticksSinceHit    = 9999;
+    inline static int s_ticksSinceSwing  = kNever;
+    inline static int s_ticksSinceAttack = kNever;
+    inline static int s_ticksSinceHit    = kNever;
 
     // Rolling CPS, measured from real swings rather than clicks
     inline static std::deque<long long> s_swingGaps;
@@ -111,7 +130,7 @@ private:
         s_usable = (s_fSwingInt != nullptr || s_fSwingFlag != nullptr);
         s_resolved = true;
 
-        printf("[Combat] swingInt=%p swingFlag=%p usable=%d\n",
+        PH_LOG("[Combat] swingInt=%p swingFlag=%p usable=%d",
             (void*)s_fSwingInt, (void*)s_fSwingFlag, (int)s_usable);
     }
 
@@ -130,9 +149,9 @@ public:
         jobject player = Minecraft::GetPlayer(env);
         if (!player) { Reset(); return; }
 
-        if (s_ticksSinceSwing  < 9999) s_ticksSinceSwing++;
-        if (s_ticksSinceAttack < 9999) s_ticksSinceAttack++;
-        if (s_ticksSinceHit    < 9999) s_ticksSinceHit++;
+        if (s_ticksSinceSwing  < kNever) s_ticksSinceSwing++;
+        if (s_ticksSinceAttack < kNever) s_ticksSinceAttack++;
+        if (s_ticksSinceHit    < kNever) s_ticksSinceHit++;
 
         // ---- Did our arm move ----
         // swingProgressInt resets to 0 at the start of a swing and
@@ -160,9 +179,9 @@ public:
             if (s_everSwung) {
                 long long gap = MsSince(s_lastSwing);
                 // Ignore duplicates and pauses that say nothing
-                if (gap >= 40 && gap <= 2000) {
+                if (gap >= kMinGapMs && gap <= kMaxGapMs) {
                     s_swingGaps.push_back(gap);
-                    if (s_swingGaps.size() > 10) s_swingGaps.pop_front();
+                    if (s_swingGaps.size() > kGapWindow) s_swingGaps.pop_front();
 
                     long long sum = 0;
                     for (auto v : s_swingGaps) sum += v;
@@ -191,13 +210,13 @@ public:
         s_targetDist = 99.0;
 
         if (EntityList::Init(env)) {
-            auto ents = EntityList::GetPlayers(env, 6.0f);
+            auto ents = EntityList::GetPlayers(env, kScanRange);
             for (auto& e : ents) {
                 if (e.distanceToPlayer < s_targetDist)
                     s_targetDist = e.distanceToPlayer;
             }
             s_hasTarget = !ents.empty();
-            s_targetInReach = (s_targetDist <= 3.5);
+            s_targetInReach = (s_targetDist <= kAttackReach);
         }
 
         // A swing only counts as an attack if something was there to
@@ -213,7 +232,8 @@ public:
         // ---- Engagement ----
         // Being in a fight is the union of hitting and being hit,
         // with a tail so it does not flicker between exchanges.
-        bool active = (s_ticksSinceAttack < 40) || (s_ticksSinceHit < 40);
+        bool active = (s_ticksSinceAttack < kCombatTailTicks)
+                   || (s_ticksSinceHit    < kCombatTailTicks);
         if (active) {
             s_inCombat = true;
             s_combatTicks++;
@@ -223,13 +243,22 @@ public:
         }
     }
 
+    // Called on a world change, death or reconnect. Everything here
+    // describes a fight that is over.
     static void Reset() {
         s_swung = s_attacked = s_hitTaken = false;
         s_hasTarget = s_targetInReach = false;
+        s_targetDist = 99.0;
         s_inCombat = false;
         s_combatTicks = 0;
         s_lastSwingInt = 0;
         s_lastSwingFlag = false;
+        s_hurtTime = 0;
+        s_lastHurt = 0;
+        s_ticksSinceSwing  = kNever;
+        s_ticksSinceAttack = kNever;
+        s_ticksSinceHit    = kNever;
+        s_everSwung = s_everAttacked = s_everHit = false;
         s_swingGaps.clear();
         s_cps = 0.0f;
     }
@@ -245,9 +274,9 @@ public:
     static int TicksSinceHit()    { return s_ticksSinceHit; }
 
     // ---- Recency, in milliseconds ----
-    static long long MsSinceSwing()  { return s_everSwung  ? MsSince(s_lastSwing)  : 999999; }
+    static long long MsSinceSwing()  { return s_everSwung    ? MsSince(s_lastSwing)  : 999999; }
     static long long MsSinceAttack() { return s_everAttacked ? MsSince(s_lastAttack) : 999999; }
-    static long long MsSinceHit()    { return s_everHit    ? MsSince(s_lastHit)    : 999999; }
+    static long long MsSinceHit()    { return s_everHit      ? MsSince(s_lastHit)    : 999999; }
 
     // ---- Situation ----
     static bool   HasTarget()     { return s_hasTarget; }
