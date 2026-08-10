@@ -9,6 +9,8 @@
 #include <cstdio>
 
 #include "../gui/menu.h"
+#include "../gui/splash.h"
+#include "../input/key_capture.h"
 #include "../mc/mouse_control.h"
 #include "../modules/module_manager.h"
 
@@ -32,6 +34,14 @@ typedef BOOL(WINAPI* fnWglSwapBuffers)(HDC);
 // Releasing that grab is a call into Minecraft, and JNI is only
 // legal on the client thread, so this file does not do it. It sets
 // a flag and ModuleManager acts on it next tick, 50ms at worst.
+//
+// THE KEYBIND PICKER
+// A picker needs the next key the user presses, in order, whatever
+// it is. Polling cannot do that: scanning 256 keys a frame picks up
+// modifiers, repeats and whatever was already held. The window
+// procedure already sees every key event exactly once, so capture
+// lives here and runs BEFORE the menu hotkeys. Otherwise binding
+// ESC or INSERT would close the menu instead of binding anything.
 //
 // EJECT IS THE DANGEROUS PART
 // The render thread runs this hook while the client thread tears
@@ -60,9 +70,40 @@ private:
     static void ApplyMenuState(bool open) {
         s_menuOpen.store(open);
         ModuleManager::SetMenuOpen(open);
+        if (!open) KeyCapture::Cancel();   // no picker left waiting offscreen
     }
 
     static LRESULT CALLBACK HookedWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+        // ---- Keybind capture comes first ----
+        // While a picker is open every key belongs to it, including
+        // the ones that would otherwise toggle the menu.
+        if (!s_shuttingDown.load() && KeyCapture::IsActive()) {
+            switch (msg) {
+                case WM_KEYDOWN:
+                case WM_SYSKEYDOWN:
+                    if (KeyCapture::OnKeyDown((int)wParam)) return 0;
+                    break;
+                case WM_MBUTTONDOWN:
+                    if (KeyCapture::OnMouseButton(VK_MBUTTON)) return 0;
+                    break;
+                case WM_XBUTTONDOWN:
+                    if (KeyCapture::OnMouseButton(
+                            GET_XBUTTON_WPARAM(wParam) == XBUTTON1
+                                ? VK_XBUTTON1 : VK_XBUTTON2)) return 0;
+                    break;
+                // Swallow the matching releases too, or the game sees
+                // a key going up that it never saw go down.
+                case WM_KEYUP:
+                case WM_SYSKEYUP:
+                case WM_MBUTTONUP:
+                case WM_XBUTTONUP:
+                case WM_CHAR:
+                    return 0;
+                default:
+                    break;
+            }
+        }
+
         if (!s_shuttingDown.load() && msg == WM_KEYDOWN) {
             if (wParam == VK_INSERT) {
                 ApplyMenuState(!s_menuOpen.load());
@@ -206,6 +247,10 @@ private:
             // off mid-dissolve.
             Menu::Render(open);
 
+            // Last, on the foreground list, so the intro sits over
+            // everything the client just drew.
+            iOS::Splash::Render();
+
             ImGui::Render();
             ImGui_ImplOpenGL2_RenderDrawData(ImGui::GetDrawData());
 
@@ -256,6 +301,7 @@ public:
         // Closing first means the client thread hands the mouse back
         // before anything is torn down.
         ApplyMenuState(false);
+        iOS::Splash::Skip();
 
         s_shuttingDown.store(true);
 
