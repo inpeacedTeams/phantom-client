@@ -5,7 +5,6 @@
 #include "../../mc/combat_state.h"
 #include "../../jni/class_resolver.h"
 #include "../../jni/jvmti_util.h"
-#include <imgui.h>
 #include <unordered_map>
 #include <deque>
 #include <vector>
@@ -47,6 +46,13 @@
 // checks that the ref we kept is still the same object, and starts
 // fresh when it is not. Without that check the restore pass writes
 // one player's position into another.
+//
+// THE OVERLAY HAS NO COLOUR PICKER
+// It used to carry its own RGBA, which meant the client had one
+// accent colour and this module had another, and changing the
+// accent left the rewind markers looking like a different program.
+// It draws in the client accent now. One fewer setting, and the
+// screen finally looks like one product.
 //
 // STAYING QUIET
 //   - per-target delay drawn from a band, re-rolled periodically
@@ -90,9 +96,16 @@ private:
         unsigned long long lastSeen = 0;
     };
 
+    enum Mode { CONSTANT = 0, PULSE, ADAPTIVE };
+    enum Pick { OLDEST = 0, INTERSECT, NEAREST };
+
+    static constexpr const char* kModes[]     = { "Constant", "Pulse", "Adaptive" };
+    static constexpr const char* kTargeting[] = { "Oldest", "Intersect", "Nearest" };
+    static constexpr const char* kStyles[]    = { "Box", "Wire", "Trail", "Marker", "Text" };
+
     // ---- Core ----
-    int   m_mode       = 1;      // 0 Constant, 1 Pulse, 2 Adaptive
-    int   m_targeting  = 1;      // 0 Oldest, 1 Intersect, 2 Nearest
+    int   m_mode       = PULSE;
+    int   m_targeting  = INTERSECT;
     int   m_delayMinMs = 60;
     int   m_delayMaxMs = 120;
     int   m_hardCapMs  = 180;
@@ -130,13 +143,12 @@ private:
 
     // ---- Visibility ----
     bool  m_visEnabled   = true;
-    int   m_visStyle     = 0;    // 0 Box, 1 Wireframe, 2 Trail, 3 Marker, 4 Text
+    int   m_visStyle     = 0;
     bool  m_visLink      = true;
     bool  m_visShowMs    = true;
     bool  m_visShowDist  = true;
     bool  m_visGhost     = true;
     float m_visThickness = 1.6f;
-    float m_visColor[4]  = { 0.45f, 0.85f, 1.00f, 0.95f };
     float m_visGhostA    = 0.30f;
 
     // ---- State ----
@@ -154,6 +166,7 @@ private:
     double m_maxOffsetSeen = 0.0;
 
     mutable char m_status[64] = { 0 };
+    mutable char m_notice[200] = { 0 };
 
     // Snapshot handed to the render thread
     std::vector<VisTarget> m_vis;
@@ -170,6 +183,10 @@ private:
     static constexpr size_t kMaxSamples  = 40;
     static constexpr long long kMaxAgeMs = 1000;
     static constexpr unsigned long long kForgetTicks = 40;
+
+    // A sample younger than this is indistinguishable from now and
+    // gains nothing, so it is never chosen.
+    static constexpr long long kMinUsefulAgeMs = 10;
 
     std::mt19937 m_rng{ std::random_device{}() };
 
@@ -271,7 +288,7 @@ private:
 
         const int cap = EffectiveCap();
 
-        if (m_targeting == 0) {
+        if (m_targeting == OLDEST) {
             for (auto it = t.history.rbegin(); it != t.history.rend(); ++it) {
                 auto age = std::chrono::duration_cast<std::chrono::milliseconds>(
                     now - it->at).count();
@@ -290,13 +307,13 @@ private:
             auto age = std::chrono::duration_cast<std::chrono::milliseconds>(
                 now - s.at).count();
             if (age > cap) continue;
-            if (age < 10) continue;
+            if (age < kMinUsefulAgeMs) continue;
 
             double dx = s.x - pX, dy = s.y - pY, dz = s.z - pZ;
             double dist = std::sqrt(dx*dx + dy*dy + dz*dz);
             if (dist > m_reachAssist) continue;
 
-            double score = (m_targeting == 1)
+            double score = (m_targeting == INTERSECT)
                 ? AngleTo(env, player, s.x, s.y, s.z, yaw, pitch)
                 : dist;
 
@@ -360,42 +377,150 @@ public:
     Backtrack() : Module("Backtrack", "Hit players at their past positions",
                          ModuleCategory::COMBAT, 0)
     {
-        Bind("Mode", &m_mode);
-        Bind("Targeting", &m_targeting);
-        Bind("Delay Min", &m_delayMinMs);
-        Bind("Delay Max", &m_delayMaxMs);
-        Bind("Hard Cap", &m_hardCapMs);
-        Bind("Aim Lock", &m_aimLock);
-        Bind("Aim Lock Speed", &m_aimLockSpeed);
-        Bind("Aim Lock FOV", &m_aimLockFov);
-        Bind("Swing Sync", &m_swingSync);
-        Bind("Swing Window", &m_swingWindow);
-        Bind("Hold Through", &m_holdThrough);
-        Bind("Hold Ticks", &m_holdTicks);
-        Bind("Reach Assist", &m_reachAssist);
-        Bind("Use Range Window", &m_useRangeWindow);
-        Bind("Range Min", &m_rangeMin);
-        Bind("Range Max", &m_rangeMax);
-        Bind("Pulse On Min", &m_pulseOnMin);
-        Bind("Pulse On Max", &m_pulseOnMax);
-        Bind("Pulse Off Min", &m_pulseOffMin);
-        Bind("Pulse Off Max", &m_pulseOffMax);
-        Bind("Ping Aware", &m_pingAware);
-        Bind("Compensation Window", &m_compensationMs);
-        Bind("Safety Margin", &m_safetyMarginMs);
-        Bind("Restore On Damage", &m_restoreOnDamage);
-        Bind("Only In Combat", &m_onlyInCombat);
-        Bind("Pause After Flag", &m_pauseAfterFlagTicks);
-        Bind("Ramp Ticks", &m_rampTicks);
-        Bind("Per Target Jitter", &m_perTargetJitter);
-        Bind("Visibility", &m_visEnabled);
-        Bind("Vis Style", &m_visStyle);
-        Bind("Vis Link", &m_visLink);
-        Bind("Vis Ghost", &m_visGhost);
-        Bind("Vis Ghost Alpha", &m_visGhostA);
-        Bind("Vis Show Delay", &m_visShowMs);
-        Bind("Vis Show Offset", &m_visShowDist);
-        Bind("Vis Thickness", &m_visThickness);
+        BindMode("Mode", &m_mode, kModes, 3,
+                 "Pulse rewinds in bursts and is clean in between, which is "
+                 "much harder to fingerprint than a constant delay.");
+
+        BindMode("Targeting", &m_targeting, kTargeting, 3,
+                 "Intersect scans the whole history and takes the past spot "
+                 "closest to your crosshair. That is where the strength "
+                 "comes from, not from a longer delay.");
+
+        Bind("Delay Min", &m_delayMinMs, 10, 250,
+             "Milliseconds of rewind, lower bound");
+
+        Bind("Delay Max", &m_delayMaxMs, 10, 300,
+             "Milliseconds of rewind, upper bound");
+
+        Bind("Show Rewind", &m_visEnabled,
+             "Draw where each target is actually being held");
+
+        // ---- Strength ----
+        Bind("Reach Assist", &m_reachAssist, 2.5f, 4.5f, "%.2f",
+             "Samples further away than this are never chosen, so your "
+             "apparent reach never changes")
+            .Advanced();
+
+        Bind("Swing Sync", &m_swingSync,
+             "Only rewind around the ticks you are actually swinging")
+            .Advanced();
+
+        Bind("Swing Window", &m_swingWindow, 1, 8,
+             "Ticks after a swing that the rewind stays on")
+            .When("Swing Sync", 1).Advanced();
+
+        Bind("Hold Through Swing", &m_holdThrough,
+             "Keep it a few ticks longer so a swing already in flight lands")
+            .When("Swing Sync", 1).Advanced();
+
+        Bind("Hold Ticks", &m_holdTicks, 1, 6)
+            .When("Swing Sync", 1).Advanced();
+
+        Bind("Aim Lock", &m_aimLock,
+             "Nudge the crosshair onto the held pose. This is a rotation "
+             "change and carries the same risk as any aim assist.")
+            .Advanced();
+
+        Bind("Lock Speed", &m_aimLockSpeed, 0.5f, 10.0f, "%.1f")
+            .When("Aim Lock", 1).Advanced();
+
+        Bind("Lock FOV", &m_aimLockFov, 10.0f, 180.0f, "%.0f")
+            .When("Aim Lock", 1).Advanced();
+
+        // ---- Delay band ----
+        Bind("Hard Cap", &m_hardCapMs, 40, 400,
+             "Absolute ceiling on the rewind, whatever else asks for")
+            .Advanced();
+
+        Bind("Per-Target Jitter", &m_perTargetJitter, 0.0f, 50.0f, "%.0f%%",
+             "Everyone gets a slightly different delay")
+            .Advanced();
+
+        Bind("Ramp Ticks", &m_rampTicks, 0, 12,
+             "Ease into the full delay rather than snapping to it")
+            .Advanced();
+
+        // ---- Range window ----
+        Bind("Use Range Window", &m_useRangeWindow,
+             "Rewinding someone across the map buys nothing and is one more "
+             "thing to be seen doing")
+            .Advanced();
+
+        Bind("Range Min", &m_rangeMin, 1.0f, 4.0f, "%.1f")
+            .When("Use Range Window", 1).Advanced();
+
+        Bind("Range Max", &m_rangeMax, 3.0f, 8.0f, "%.1f")
+            .When("Use Range Window", 1).Advanced();
+
+        // ---- Pulse timing ----
+        Bind("Rewind Ticks Min", &m_pulseOnMin, 2, 40,
+             "How long each burst of rewinding lasts")
+            .When("Mode", PULSE).Advanced();
+
+        Bind("Rewind Ticks Max", &m_pulseOnMax, 2, 50)
+            .When("Mode", PULSE).Advanced();
+
+        Bind("Clean Ticks Min", &m_pulseOffMin, 2, 40,
+             "How long it stays completely clean in between")
+            .When("Mode", PULSE).Advanced();
+
+        Bind("Clean Ticks Max", &m_pulseOffMax, 2, 60)
+            .When("Mode", PULSE).Advanced();
+
+        // ---- Safety ----
+        Bind("Ping Aware", &m_pingAware,
+             "Keep your ping plus the rewind inside the server's lag "
+             "compensation window, or the hits simply do not register")
+            .Advanced();
+
+        Bind("Comp Window", &m_compensationMs, 100, 400,
+             "How far back the server is willing to look")
+            .When("Ping Aware", 1).Advanced();
+
+        Bind("Safety Margin", &m_safetyMarginMs, 0, 120,
+             "Headroom left inside that window")
+            .When("Ping Aware", 1).Advanced();
+
+        Bind("Restore On Damage", &m_restoreOnDamage,
+             "Drop the desync the moment you take a hit")
+            .Advanced();
+
+        Bind("Only In Combat", &m_onlyInCombat,
+             "Stay completely clean until you are actually fighting")
+            .Advanced();
+
+        Bind("Pause After Flag", &m_pauseAfterFlagTicks, 0, 100,
+             "Ticks of quiet after the server corrects your position")
+            .Advanced();
+
+        // ---- Visibility ----
+        BindMode("Style", &m_visStyle, kStyles, 5,
+                 "Box is solid, Wire is the hitbox outline, Trail shows the "
+                 "path back to where they really are, Marker is a small "
+                 "cross and Text is just the numbers.")
+            .When("Show Rewind", 1).Advanced();
+
+        Bind("Link Line", &m_visLink,
+             "Line from the held position to the real one")
+            .When("Show Rewind", 1).Advanced();
+
+        Bind("Ghost At True Position", &m_visGhost,
+             "Faint marker where the server actually has them")
+            .When("Show Rewind", 1).Advanced();
+
+        Bind("Ghost Alpha", &m_visGhostA, 0.05f, 0.8f, "%.2f")
+            .When("Show Rewind", 1).Advanced();
+
+        Bind("Show Delay", &m_visShowMs,
+             "Print the rewind in milliseconds")
+            .When("Show Rewind", 1).Advanced();
+
+        Bind("Show Offset", &m_visShowDist,
+             "Print how far back they are being held, in metres")
+            .When("Show Rewind", 1).Advanced();
+
+        Bind("Thickness", &m_visThickness, 1.0f, 4.0f, "%.1f")
+            .When("Show Rewind", 1).Advanced();
     }
 
     // -------------------------------------------------------------
@@ -429,6 +554,7 @@ public:
     void OnDisable(JNIEnv* env) override {
         RestoreBeforeScan(env);
         DropAllTargets(env);
+        m_status[0] = '\0';
         std::lock_guard<std::mutex> lock(m_visMutex);
         m_vis.clear();
     }
@@ -455,6 +581,7 @@ public:
         m_activeCount    = 0;
         m_swingTicksLeft = 0;
         m_holdLeft       = 0;
+        m_maxOffsetSeen  = 0.0;
 
         std::lock_guard<std::mutex> lock(m_visMutex);
         m_vis.clear();
@@ -477,6 +604,13 @@ public:
         if (!player) return;
         if (Minecraft::IsInGui(env)) return;   // restored above already
 
+        // Hand-edited configs can invert any of these pairs, and an
+        // inverted band silently disables the module.
+        if (m_delayMinMs  > m_delayMaxMs)  m_delayMinMs  = m_delayMaxMs;
+        if (m_rangeMin    > m_rangeMax)    m_rangeMin    = m_rangeMax;
+        if (m_pulseOnMin  > m_pulseOnMax)  m_pulseOnMin  = m_pulseOnMax;
+        if (m_pulseOffMin > m_pulseOffMax) m_pulseOffMin = m_pulseOffMax;
+
         m_tick++;
         if (m_rampCounter < m_rampTicks) m_rampCounter++;
 
@@ -488,19 +622,12 @@ public:
         }
 
         // ---- Taking a hit: drop the desync immediately ----
-        // CombatState already watches hurtTime for the whole client,
-        // so this is the same edge every other module reacts to
-        // rather than a second private copy of the same tracking.
         if (m_restoreOnDamage && CombatState::HitTakenThisTick()) {
             PublishVis();
             return;
         }
 
         // ---- Swing tracking ----
-        // The mouse button is not a swing. It is true while you hold
-        // it over a menu, a block or empty air, and it is false for
-        // every click the client generates itself. swingProgressInt
-        // is the animation the server actually receives.
         if (CombatState::SwungThisTick()) {
             m_swingTicksLeft = m_swingWindow;
             m_holdLeft = m_holdThrough ? m_holdTicks : 0;
@@ -510,7 +637,7 @@ public:
         }
 
         // ---- Pulse cycling ----
-        if (m_mode == 1) {
+        if (m_mode == PULSE) {
             if (++m_pulseCounter >= m_pulseTarget) {
                 m_rewinding = !m_rewinding;
                 m_pulseCounter = 0;
@@ -522,10 +649,6 @@ public:
             m_rewinding = true;
         }
 
-        // Swing sync keeps the desync to the ticks that matter. Hold
-        // Through extends it a few ticks so a swing already in flight
-        // still lands, but it has to expire: leaving it permanently
-        // true made the whole option a no-op.
         bool swingOk = !m_swingSync
                     || m_swingTicksLeft > 0
                     || m_holdLeft > 0;
@@ -577,8 +700,6 @@ public:
 
             t.history.push_back({ e.posX, e.posY, e.posZ, now });
 
-            // A second of history bounds the memory and is far more
-            // than any comp window will accept.
             while (t.history.size() > kMaxSamples) t.history.pop_front();
             while (!t.history.empty()) {
                 auto age = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -594,7 +715,7 @@ public:
             if (m_useRangeWindow && (dist < m_rangeMin || dist > m_rangeMax))
                 continue;
 
-            if (m_mode == 2) {
+            if (m_mode == ADAPTIVE) {
                 float span = m_rangeMax - m_rangeMin;
                 float f = span > 0.f ? (float)((dist - m_rangeMin) / span) : 0.5f;
                 if (f < 0.f) f = 0.f;
@@ -634,9 +755,6 @@ public:
         }
 
         // ---- Aim lock ----
-        // Rewinding puts the hitbox somewhere your crosshair is not.
-        // This nudges it onto the held pose. It is a rotation change
-        // like any aim assist and carries the same risk.
         if (m_aimLock && haveLock) {
             auto rot = Minecraft::GetRotationsToPos(env, player,
                 lockBuf[0], lockBuf[1] + 1.0, lockBuf[2]);
@@ -678,7 +796,6 @@ public:
     bool  VisShowDist() const   { return m_visShowDist; }
     float VisThickness() const  { return m_visThickness; }
     float VisGhostAlpha() const { return m_visGhostA; }
-    const float* VisColor() const { return m_visColor; }
 
     const char* StatusLine() const override {
         if (m_activeCount > 0) {
@@ -692,130 +809,29 @@ public:
         return m_status;
     }
 
-    // =============================================================
-    // Everyday panel: how it behaves, who it picks, how far back.
-    // =============================================================
-    void RenderSettings() override {
+    NoticeLevel Notice(const char** text) const override {
         if (!Ready()) {
-            ImGui::TextColored(ImVec4(1.f, 0.8f, 0.3f, 1.f),
-                "Entity fields unresolved: join a world first");
-            return;
+            *text = "The entity position fields have not been found yet. "
+                    "Join a world and it will resolve itself.";
+            return NoticeLevel::Warning;
         }
-
-        const char* modes[] = { "Constant", "Pulse", "Adaptive" };
-        ImGui::Combo("Mode", &m_mode, modes, 3);
-        switch (m_mode) {
-            case 0: ImGui::TextColored(ImVec4(1.f, 0.5f, 0.35f, 1.f),
-                        "A constant delay is the easiest pattern to fingerprint"); break;
-            case 1: ImGui::TextDisabled("Rewinds in bursts, clean in between."); break;
-            case 2: ImGui::TextDisabled("Scales the delay with distance."); break;
+        if (m_mode == CONSTANT) {
+            *text = "A constant delay is the easiest possible pattern to "
+                    "fingerprint. Pulse exists for a reason.";
+            return NoticeLevel::Warning;
         }
-
-        const char* targeting[] = { "Oldest", "Intersect", "Nearest" };
-        ImGui::Combo("Targeting", &m_targeting, targeting, 3);
-        switch (m_targeting) {
-            case 0: ImGui::TextDisabled("Holds the oldest sample inside the delay."); break;
-            case 1: ImGui::TextDisabled("Picks the past spot closest to your crosshair."); break;
-            case 2: ImGui::TextDisabled("Picks the closest past spot. Easiest to land."); break;
+        if (EffectiveCap() < 20) {
+            snprintf(m_notice, sizeof(m_notice),
+                     "At %d ping there is almost no budget left inside the "
+                     "server's compensation window, so this will do very "
+                     "little.", m_measuredPing);
+            *text = m_notice;
+            return NoticeLevel::Warning;
         }
-
-        ImGui::SliderInt("Delay Min (ms)", &m_delayMinMs, 10, 250);
-        ImGui::SliderInt("Delay Max (ms)", &m_delayMaxMs, 10, 300);
-        if (m_delayMinMs > m_delayMaxMs) m_delayMinMs = m_delayMaxMs;
-
-        if (m_pingAware) {
-            ImGui::TextDisabled("Effective cap %d ms at %d ping",
-                EffectiveCap(), m_measuredPing);
-        }
-
-        ImGui::Checkbox("Show Rewind", &m_visEnabled);
-    }
-
-    bool HasAdvanced() const override { return true; }
-
-    void RenderAdvanced() override {
-        ImGui::SeparatorText("Strength");
-        ImGui::SliderFloat("Reach Assist", &m_reachAssist, 2.5f, 4.5f, "%.2f");
-        ImGui::TextDisabled("Samples further than this are never chosen.");
-        ImGui::Checkbox("Swing Sync", &m_swingSync);
-        if (m_swingSync) {
-            ImGui::SliderInt("Swing Window", &m_swingWindow, 1, 8);
-            ImGui::Checkbox("Hold Through Swing", &m_holdThrough);
-            if (m_holdThrough) ImGui::SliderInt("Hold Ticks", &m_holdTicks, 1, 6);
-        }
-        ImGui::Checkbox("Aim Lock", &m_aimLock);
-        if (m_aimLock) {
-            ImGui::SliderFloat("Lock Speed", &m_aimLockSpeed, 0.5f, 10.f, "%.1f");
-            ImGui::SliderFloat("Lock FOV", &m_aimLockFov, 10.f, 180.f, "%.0f");
-            ImGui::TextColored(ImVec4(1.f, 0.5f, 0.35f, 1.f),
-                "Aim lock is a rotation change and carries aim-assist risk");
-        }
-
-        ImGui::SeparatorText("Delay band");
-        ImGui::SliderInt("Hard Cap (ms)", &m_hardCapMs, 40, 400);
-        ImGui::SliderFloat("Per-Target Jitter", &m_perTargetJitter, 0.f, 50.f, "%.0f%%");
-        ImGui::SliderInt("Ramp Ticks", &m_rampTicks, 0, 12);
-
-        ImGui::SeparatorText("Range window");
-        ImGui::Checkbox("Use Range Window", &m_useRangeWindow);
-        if (m_useRangeWindow) {
-            ImGui::SliderFloat("Range Min", &m_rangeMin, 1.f, 4.f, "%.1f");
-            ImGui::SliderFloat("Range Max", &m_rangeMax, 3.f, 8.f, "%.1f");
-            if (m_rangeMin > m_rangeMax) m_rangeMin = m_rangeMax;
-        }
-
-        if (m_mode == 1) {
-            ImGui::SeparatorText("Pulse timing");
-            ImGui::SliderInt("Rewind Ticks Min", &m_pulseOnMin, 2, 40);
-            ImGui::SliderInt("Rewind Ticks Max", &m_pulseOnMax, 2, 50);
-            if (m_pulseOnMin > m_pulseOnMax) m_pulseOnMin = m_pulseOnMax;
-            ImGui::SliderInt("Clean Ticks Min", &m_pulseOffMin, 2, 40);
-            ImGui::SliderInt("Clean Ticks Max", &m_pulseOffMax, 2, 60);
-            if (m_pulseOffMin > m_pulseOffMax) m_pulseOffMin = m_pulseOffMax;
-        }
-
-        ImGui::SeparatorText("Safety");
-        ImGui::Checkbox("Ping Aware", &m_pingAware);
-        if (m_pingAware) {
-            ImGui::SliderInt("Comp Window (ms)", &m_compensationMs, 100, 400);
-            ImGui::SliderInt("Safety Margin (ms)", &m_safetyMarginMs, 0, 120);
-        }
-        ImGui::Checkbox("Restore On Damage", &m_restoreOnDamage);
-        ImGui::Checkbox("Only In Combat", &m_onlyInCombat);
-        ImGui::TextDisabled("Stays clean until you are actually fighting somebody.");
-        ImGui::SliderInt("Pause After Flag", &m_pauseAfterFlagTicks, 0, 100);
-
-        if (m_visEnabled) {
-            ImGui::SeparatorText("Visibility");
-            const char* styles[] = { "Box", "Wireframe", "Trail", "Marker", "Text Only" };
-            ImGui::Combo("Style", &m_visStyle, styles, 5);
-            switch (m_visStyle) {
-                case 0: ImGui::TextDisabled("Filled box at the held position."); break;
-                case 1: ImGui::TextDisabled("Hitbox outline, all twelve edges."); break;
-                case 2: ImGui::TextDisabled("Path from the held spot to the real one."); break;
-                case 3: ImGui::TextDisabled("Small cross at the held position."); break;
-                case 4: ImGui::TextDisabled("Just the numbers, no geometry."); break;
-            }
-            ImGui::Checkbox("Link Line", &m_visLink);
-            ImGui::Checkbox("Ghost At True Position", &m_visGhost);
-            if (m_visGhost)
-                ImGui::SliderFloat("Ghost Alpha", &m_visGhostA, 0.05f, 0.8f, "%.2f");
-            ImGui::Checkbox("Show Delay (ms)", &m_visShowMs);
-            ImGui::Checkbox("Show Offset (m)", &m_visShowDist);
-            ImGui::SliderFloat("Thickness", &m_visThickness, 1.f, 4.f, "%.1f");
-            ImGui::ColorEdit4("Color", m_visColor);
-        }
-
-        ImGui::SeparatorText("Diagnostics");
-        ImGui::TextDisabled("Rewound %d | tracked %d | %s",
-            m_activeCount, (int)m_targets.size(),
-            m_rewinding ? "active" : "clean");
-        ImGui::TextDisabled("Peak offset this session: %.2f m", m_maxOffsetSeen);
-        if (ImGui::SmallButton("Reset peak")) m_maxOffsetSeen = 0.0;
-
-        ImGui::TextWrapped(
-            "Rewinds only between your ticks, since there is no packet hook "
-            "holding updates at the source. On a low-ping duel server there "
-            "is little natural jitter to hide inside, so keep the band short.");
+        snprintf(m_notice, sizeof(m_notice),
+                 "Effective cap %d ms at %d ping. Peak rewind this session "
+                 "%.2f m.", EffectiveCap(), m_measuredPing, m_maxOffsetSeen);
+        *text = m_notice;
+        return NoticeLevel::Info;
     }
 };
