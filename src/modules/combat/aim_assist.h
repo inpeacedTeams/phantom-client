@@ -11,6 +11,7 @@
 #include <cmath>
 #include <random>
 #include <string>
+#include <cstdio>
 
 // =================================================================
 // Aim Assist
@@ -74,6 +75,7 @@ private:
     std::string m_targetName;
     float m_lastAngle = 0.0f;
     bool  m_active = false;
+    mutable char m_status[80] = {};
 
     jmethodID m_getEntityId = nullptr;
     jfieldID  m_fSens = nullptr;
@@ -294,45 +296,73 @@ public:
         m_active = true;
     }
 
+    const char* StatusLine() const override {
+        if (m_active && !m_targetName.empty()) {
+            snprintf(m_status, sizeof(m_status), "tracking %s",
+                     m_targetName.c_str());
+        } else {
+            snprintf(m_status, sizeof(m_status), "idle");
+        }
+        return m_status;
+    }
+
+    // =============================================================
+    // Everyday panel
+    // =============================================================
     void RenderSettings() override {
-        // ---- Live ----
+        const char* modes[] = { "Crosshair", "Closest", "Lowest HP" };
+        ImGui::Combo("Priority", &m_targetMode, modes, 3);
+
+        ImGui::SliderFloat("Speed", &m_speed, 0.5f, 10.f, "%.1f");
+        ImGui::SliderFloat("FOV", &m_fov, 10.f, 180.f, "%.0f");
+        ImGui::SliderFloat("Range", &m_range, 1.f, 6.f, "%.1f");
+
+        ImGui::Spacing();
         if (m_active && !m_targetName.empty()) {
             ImGui::TextColored(ImVec4(0.2f, 0.8f, 0.4f, 1.f),
                 "Tracking %s  (%.1f deg off)", m_targetName.c_str(), m_lastAngle);
         } else {
             ImGui::TextDisabled("Idle");
         }
-        if (Rotation::HaveSensitivity()) {
-            ImGui::TextDisabled("Mouse grid %.4f deg  (sens %.2f)",
-                Rotation::GCD(), Rotation::Sensitivity());
-        } else {
-            ImGui::TextColored(ImVec4(1.f, 0.7f, 0.3f, 1.f),
-                "Sensitivity unresolved: using a default grid");
-        }
 
-        ImGui::Separator();
+        if (m_speed > 6.f) {
+            ImGui::TextColored(ImVec4(1.f, 0.5f, 0.35f, 1.f),
+                "Above 6 the correction is visible in a replay");
+        }
+        if (!Rotation::HaveSensitivity()) {
+            ImGui::TextColored(ImVec4(1.f, 0.7f, 0.3f, 1.f),
+                "Sensitivity unresolved: using a default mouse grid");
+        }
+    }
+
+    bool HasAdvanced() const override { return true; }
+
+    void RenderAdvanced() override {
         ImGui::TextColored(ImVec4(1.f, 0.6f, 0.3f, 1.f), "Feel");
-        ImGui::SliderFloat("Speed", &m_speed, 0.5f, 10.f, "%.1f");
         ImGui::SliderFloat("Pitch Ratio", &m_pitchRatio, 0.1f, 1.f, "%.2f");
+        ImGui::TextDisabled("Wrists turn sideways more readily than they tilt.");
         ImGui::SliderFloat("Smoothing", &m_smoothing, 0.f, 0.9f, "%.2f");
-        ImGui::SliderFloat("FOV", &m_fov, 10.f, 180.f, "%.0f");
-        ImGui::SliderFloat("Range", &m_range, 1.f, 6.f, "%.1f");
 
         ImGui::Separator();
         ImGui::TextColored(ImVec4(0.5f, 0.8f, 1.f, 1.f), "Targeting");
-        const char* modes[] = { "Crosshair", "Closest", "Lowest HP" };
-        ImGui::Combo("Priority", &m_targetMode, modes, 3);
         ImGui::Checkbox("Sticky", &m_sticky);
         if (m_sticky)
             ImGui::SliderFloat("Sticky FOV", &m_stickyFov, 40.f, 200.f, "%.0f");
         ImGui::Checkbox("Only While Swinging", &m_requireSwing);
         if (m_requireSwing)
-            ImGui::SliderInt("Swing Window", &m_swingWindow, 2, 20);
+            ImGui::SliderInt("Swing Window", &m_swingWindow, 2, 20, "%d ticks");
+        else
+            ImGui::TextColored(ImVec4(1.f, 0.5f, 0.35f, 1.f),
+                "Tracking people across a lobby is the loudest thing this does");
 
         ImGui::Separator();
         ImGui::TextColored(ImVec4(0.6f, 1.f, 0.7f, 1.f), "Aim point");
         ImGui::SliderFloat("Height", &m_aimHeight, 0.f, 1.8f, "%.2f");
         ImGui::SliderFloat("Wander", &m_wander, 0.f, 0.5f, "%.2f");
+        if (m_wander < 0.05f) {
+            ImGui::TextColored(ImVec4(1.f, 0.7f, 0.3f, 1.f),
+                "Near-zero wander means perfect centre aim every hit");
+        }
 
         ImGui::Separator();
         ImGui::TextColored(ImVec4(1.f, 0.85f, 0.4f, 1.f), "Humanisation");
@@ -346,13 +376,10 @@ public:
             if (m_breakMin > m_breakMax) m_breakMin = m_breakMax;
         }
 
-        if (m_speed > 6.f) {
-            ImGui::TextColored(ImVec4(1.f, 0.5f, 0.35f, 1.f),
-                "Above 6 the correction is visible in a replay");
-        }
-        if (m_wander < 0.05f) {
-            ImGui::TextColored(ImVec4(1.f, 0.7f, 0.3f, 1.f),
-                "Near-zero wander means perfect centre aim every hit");
+        if (Rotation::HaveSensitivity()) {
+            ImGui::Separator();
+            ImGui::TextDisabled("Mouse grid %.4f deg at sensitivity %.2f",
+                Rotation::GCD(), Rotation::Sensitivity());
         }
     }
 };
