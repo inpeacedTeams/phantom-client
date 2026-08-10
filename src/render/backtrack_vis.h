@@ -5,6 +5,7 @@
 #include <vector>
 
 #include "camera.h"
+#include "../gui/ios_theme.h"
 #include "../modules/combat/backtrack.h"
 
 // =================================================================
@@ -15,6 +16,12 @@
 //
 // Runs on the render thread. Reads only the plain-data snapshot the
 // module publishes, so no JNI here.
+//
+// COLOUR
+// The client accent, not a colour of its own. The module used to
+// carry an RGBA picker, which meant the interface had one accent
+// and the world overlay had another and they drifted apart the
+// moment anyone touched either.
 //
 // STYLES
 //   0 Box        filled quad at the held position
@@ -134,7 +141,12 @@ public:
         double camX, camY, camZ;
         view.EyeAt(alpha, &camX, &camY, &camZ);
 
-        const float* c = bt->VisColor();
+        // The client accent, so the world overlay and the interface
+        // are the same colour without anyone having to keep two
+        // settings in step.
+        ImVec4 accent = ImGui::ColorConvertU32ToFloat4(iOS::UI::AccentColor());
+        const float c[4] = { accent.x, accent.y, accent.z, 0.95f };
+
         const ImU32 col = ImGui::ColorConvertFloat4ToU32(
             ImVec4(c[0], c[1], c[2], c[3]));
         const ImU32 fill = ImGui::ColorConvertFloat4ToU32(
@@ -245,8 +257,9 @@ public:
                 snprintf(buf, sizeof(buf), "%.2f m", t.offset);
 
             float tx, ty;
+            ImVec2 ts = ImGui::CalcTextSize(buf);
+
             if (held.ok) {
-                ImVec2 ts = ImGui::CalcTextSize(buf);
                 tx = held.minX + (held.maxX - held.minX - ts.x) * 0.5f;
                 ty = held.minY - ts.y - 4.0f;
             } else {
@@ -254,12 +267,10 @@ public:
                 if (!Camera::Project(view, t.backX, t.backY + kHeight,
                                      t.backZ, camX, camY, camZ,
                                      sw, sh, &x, &y)) continue;
-                ImVec2 ts = ImGui::CalcTextSize(buf);
                 tx = x - ts.x * 0.5f;
                 ty = y - ts.y - 4.0f;
             }
 
-            ImVec2 ts = ImGui::CalcTextSize(buf);
             dl->AddRectFilled(ImVec2(tx - 3, ty - 1),
                               ImVec2(tx + ts.x + 3, ty + ts.y + 1),
                               IM_COL32(0, 0, 0, 150), 3.0f);
