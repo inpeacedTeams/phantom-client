@@ -26,39 +26,26 @@
 //   Watermark   the client name and your frame rate
 //   Module list what is currently running
 //
-// -----------------------------------------------------------------
-// PLACEMENT
-// -----------------------------------------------------------------
-// This used to be a segmented control with four corners in it, and
-// that is not a HUD layout, it is an apology for not having one.
-// Every element now owns a NORMALISED anchor, 0..1 of the screen,
-// and you place it by dragging it where you want it.
+// LAYOUT
+// This used to be four corner presets shared by both elements, so
+// the watermark and the module list were welded together and three
+// quarters of the screen were unreachable. Now each element owns a
+// normalised position and you drag it where you want it.
 //
-// Normalised rather than pixels because the game window gets
-// resized, alt-tabbed and thrown onto a second monitor, and a HUD
-// stored in pixels ends up off screen the first time any of that
-// happens. Everything is additionally clamped into the safe margin
-// each frame, so even a hand-edited config cannot hide it.
+// Normalised, not pixels, because the game window gets resized and
+// goes fullscreen. A HUD pinned at x=1600 vanishes the moment you
+// drop to a smaller window; a HUD at x=0.98 does not.
 //
-// The anchor is the corner NEAREST the screen edge it sits by:
-//
-//   anchor x > 0.5  the element is right aligned and grows left
-//   anchor y > 0.5  the element is bottom anchored and grows up
-//
-// That one rule is why there is no "direction" setting. Drop the
-// module list in the bottom right and new modules appear above the
-// old ones, which is the only thing that could sensibly happen.
+// Alignment is DERIVED from the position rather than being another
+// setting to get wrong: an element in the right half of the screen
+// grows leftward, one in the bottom half grows upward. Drag it to
+// the bottom right and the module list stacks the sensible way
+// without being told.
 //
 // ANIMATION
 // Every pill owns its position and opacity. A module switched off
 // slides toward the edge and fades, and only leaves the list once
 // it has finished going, so nothing ever pops.
-//
-// COST
-// Two allocations at startup and none afterwards: the item list is
-// reused between frames, animation keys are addresses rather than
-// built strings, and the whole thing early-outs to nothing when
-// both elements are off.
 // =================================================================
 
 namespace iOS {
@@ -67,18 +54,17 @@ class HUD {
 public:
     // Public so ConfigStore can persist them. A HUD you have to
     // rearrange after every inject is not a HUD anyone leaves on.
-    inline static bool watermark  = true;
+    inline static bool watermark = true;
     inline static bool moduleList = true;
-    inline static bool showFps    = true;
+    inline static bool showFps = true;
 
-    // Normalised anchors. Defaults put the watermark in the top
-    // right with the module list directly under it.
-    inline static float wmX = 1.0f, wmY = 0.0f;
-    inline static float mlX = 1.0f, mlY = 0.062f;
+    // Normalised anchors, 0..1 of the screen.
+    inline static float wmX = 0.012f, wmY = 0.020f;
+    inline static float mlX = 0.988f, mlY = 0.020f;
 
     static void ResetLayout() {
-        wmX = 1.0f; wmY = 0.0f;
-        mlX = 1.0f; mlY = 0.062f;
+        wmX = 0.012f; wmY = 0.020f;
+        mlX = 0.988f; mlY = 0.020f;
     }
 
     static void Reset() {
@@ -86,41 +72,17 @@ public:
         ResetLayout();
         s_pills.clear();
         s_editing = false;
-        s_drag = -1;
+        s_drag = Drag::None;
     }
 
-    // Configs written before the HUD could be dragged only stored a
-    // corner index. Reading one has to place the elements somewhere
-    // sensible rather than throwing the setting away, or upgrading
-    // the client silently moves your HUD.
-    static void ApplyCornerPreset(int corner) {
-        const bool right  = (corner == 1 || corner == 3);
-        const bool bottom = (corner == 2 || corner == 3);
-        wmX = right  ? 1.0f : 0.0f;
-        wmY = bottom ? 1.0f : 0.0f;
-        mlX = wmX;
-        mlY = bottom ? 0.938f : 0.062f;
+    static void SetEditing(bool on) {
+        if (!on) s_drag = Drag::None;
+        s_editing = on;
     }
-
-    // Read from the window procedure as well as the render thread.
-    // A bool is a single aligned byte on every target this client
-    // runs on, so the worst case is acting one frame late.
-    static bool IsEditing() { return s_editing; }
-    static void BeginEdit() { s_editing = true;  s_drag = -1; }
-    static void EndEdit()   { s_editing = false; s_drag = -1; }
+    static bool IsEditing()  { return s_editing; }
+    static bool IsDragging() { return s_drag != Drag::None; }
 
 private:
-    // ---- Metrics. Named, because a HUD full of loose numbers is
-    // impossible to adjust without breaking the alignment. ----
-    static constexpr float kMargin   = 14.0f;   // safe area from the edge
-    static constexpr float kSnapPx   = 9.0f;    // how close before it snaps
-    static constexpr float kBlockGap = 10.0f;   // between watermark and list
-    static constexpr float kPillPadX = 12.0f;
-    static constexpr float kPillPadY = 6.0f;
-    static constexpr float kPillGap  = 6.0f;
-    static constexpr float kDotR     = 3.5f;
-    static constexpr float kSlideIn  = 26.0f;   // travel of an arriving pill
-
     struct Pill {
         float anim = 0.0f;      // 0 hidden, 1 fully in
         float y = 0.0f;         // animated vertical slot
@@ -131,27 +93,42 @@ private:
 
     inline static std::unordered_map<std::string, Pill> s_pills;
     inline static float s_fps = 0.0f;
-    inline static char  s_fpsText[24] = {};
 
     // Reused between frames rather than rebuilt, which is the
     // difference between two allocations a frame and none.
     struct Item {
         const std::string* name;
         ImU32 color;
-        float width;        // full pill width, not just the text
+        float width;
     };
     inline static std::vector<Item> s_items;
-    inline static bool s_ghosts = false;   // showing placeholders, not modules
 
-    // ---- Editor state ----
-    inline static bool   s_editing = false;
-    inline static int    s_drag = -1;
-    inline static ImVec2 s_grab{ 0, 0 };
-    inline static float  s_guideX = -1.0f;
-    inline static float  s_guideY = -1.0f;
+    // ---- Editor ----
+    enum class Drag { None, Watermark, ModuleList };
+    inline static bool  s_editing = false;
+    inline static Drag  s_drag = Drag::None;
+    inline static ImVec2 s_grab{ 0, 0 };    // pointer offset inside the box
 
-    static float Clamp(float v, float lo, float hi) {
-        return v < lo ? lo : (v > hi ? hi : v);
+    // Last frame's bounds, used for hit testing and for the editor
+    // outline. One frame behind, which at 60 FPS is 16ms and cannot
+    // be perceived while dragging something with the mouse.
+    struct Rect { ImVec2 a{ 0, 0 }, b{ 0, 0 }; bool valid = false; };
+    inline static Rect s_wmRect, s_mlRect;
+
+    // ---- Layout constants ----
+    // Named, because "14.0f" appearing in nine places is how two of
+    // them end up different.
+    static constexpr float kEdgeMargin   = 14.0f;   // resting distance from a screen edge
+    static constexpr float kSnapPixels   = 10.0f;   // how close counts as snapped
+    static constexpr float kPillGap      = 6.0f;
+    static constexpr float kPillPadX     = 12.0f;
+    static constexpr float kPillPadY     = 6.0f;
+    static constexpr float kCardPadX     = 14.0f;
+    static constexpr float kCardPadY     = 9.0f;
+    static constexpr float kSlideOut     = 26.0f;   // how far a leaving pill travels
+
+    static float Clamp01(float v) {
+        return v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v);
     }
 
     static ImU32 CategoryColor(ModuleCategory c) {
@@ -164,42 +141,8 @@ private:
         }
     }
 
-    // ---------------------------------------------------------
-    // Anchor <-> pixels
-    // ---------------------------------------------------------
-    // Resolve is the only place that decides which way an element
-    // is aligned, and Store is its exact inverse, so dragging
-    // something and letting go can never move it by a pixel.
-    // ---------------------------------------------------------
-    static ImVec2 Resolve(float ax, float ay, ImVec2 size, float sw, float sh) {
-        const bool right = ax > 0.5f;
-        const bool up    = ay > 0.5f;
-
-        float x = right ? ax * sw - size.x : ax * sw;
-        float y = up    ? ay * sh - size.y : ay * sh;
-
-        float maxX = sw - kMargin - size.x;
-        float maxY = sh - kMargin - size.y;
-        if (maxX < kMargin) maxX = kMargin;   // element wider than the screen
-        if (maxY < kMargin) maxY = kMargin;
-
-        return ImVec2(Clamp(x, kMargin, maxX), Clamp(y, kMargin, maxY));
-    }
-
-    static void Store(ImVec2 pos, ImVec2 size, float sw, float sh,
-                      float* ax, float* ay)
-    {
-        if (sw < 1.0f || sh < 1.0f) return;
-        const bool right = (pos.x + size.x * 0.5f) > sw * 0.5f;
-        const bool up    = (pos.y + size.y * 0.5f) > sh * 0.5f;
-        *ax = (right ? pos.x + size.x : pos.x) / sw;
-        *ay = (up    ? pos.y + size.y : pos.y) / sh;
-    }
-
-    // ---------------------------------------------------------
     // The card look: soft shadow, translucent white, light hairline
     // along the top edge.
-    // ---------------------------------------------------------
     static void GlassPanel(ImDrawList* dl, ImVec2 a, ImVec2 b,
                            float rounding, float alpha)
     {
@@ -219,103 +162,118 @@ private:
         dl->AddRect(a, b, IM_COL32(0, 0, 0, (int)(18 * alpha)), rounding, 0, 1.0f);
     }
 
+    static void DrawPill(ImDrawList* dl, float anchorX, float y,
+                         float textW, float h, const char* text,
+                         ImU32 accent, float t, bool rightAlign)
+    {
+        if (t < 0.01f) return;
+
+        float w = textW + kPillPadX * 2.0f + 14.0f;
+
+        // Slides toward whichever edge it is anchored to
+        float slide = (1.0f - t) * kSlideOut;
+        float x = rightAlign ? (anchorX - w + slide) : (anchorX - slide);
+
+        ImVec2 a(x, y);
+        ImVec2 b(x + w, y + h);
+
+        GlassPanel(dl, a, b, h * 0.5f, t);
+
+        float dotR = 3.5f;
+        float cy = a.y + h * 0.5f;
+        dl->AddCircleFilled(ImVec2(a.x + kPillPadX + dotR - 2.0f, cy), dotR,
+                            Col::Alpha(accent, t), 14);
+
+        Fonts::Push(Fonts::Body);
+        ImVec2 ts = ImGui::CalcTextSize(text);
+        dl->AddText(ImVec2(a.x + kPillPadX + dotR * 2.0f + 6.0f, cy - ts.y * 0.5f),
+                    Col::Alpha(Col::Label, t), text);
+        Fonts::Pop(Fonts::Body);
+    }
+
     // ---------------------------------------------------------
     // Watermark
     // ---------------------------------------------------------
-    static ImVec2 MeasureWatermark() {
+    // Returns its own height so the caller can hang it above the
+    // anchor when it lives in the bottom half.
+    static float MeasureWatermark(const char* fps, ImVec2* nameSize,
+                                  ImVec2* fpsSize)
+    {
+        Fonts::Push(Fonts::BodyBold);
+        *nameSize = ImGui::CalcTextSize("Phantom");
+        Fonts::Pop(Fonts::BodyBold);
+
+        *fpsSize = ImVec2(0, 0);
+        if (showFps) {
+            Fonts::Push(Fonts::Caption);
+            *fpsSize = ImGui::CalcTextSize(fps);
+            Fonts::Pop(Fonts::Caption);
+        }
+        return kCardPadY * 2.0f + nameSize->y;
+    }
+
+    static void DrawWatermark(ImDrawList* dl, float x, float y,
+                              bool rightAlign, bool bottom)
+    {
         ImGuiIO& io = ImGui::GetIO();
 
         // Smoothed, or the number is an unreadable blur of digits
         s_fps += (io.Framerate - s_fps) * 0.06f;
 
-        s_fpsText[0] = '\0';
-        if (showFps) snprintf(s_fpsText, sizeof(s_fpsText), "%.0f FPS", s_fps);
+        char fps[24] = {};
+        if (showFps) snprintf(fps, sizeof(fps), "%.0f FPS", s_fps);
+
+        ImVec2 ns, fs;
+        float h = MeasureWatermark(fps, &ns, &fs);
+
+        float gap = showFps ? 14.0f : 0.0f;
+        float w = kCardPadX * 2.0f + 8.0f + ns.x + gap + fs.x;
+
+        ImVec2 a(rightAlign ? x - w : x, bottom ? y - h : y);
+        ImVec2 b(a.x + w, a.y + h);
+
+        s_wmRect = { a, b, true };
+
+        GlassPanel(dl, a, b, h * 0.5f, 1.0f);
+
+        float dotR = 4.0f;
+        float dotX = a.x + kCardPadX + dotR;
+        float cy   = a.y + h * 0.5f;
+        dl->AddCircleFilled(ImVec2(dotX, cy), dotR, Col::Blue, 16);
 
         Fonts::Push(Fonts::BodyBold);
-        ImVec2 ns = ImGui::CalcTextSize("Phantom");
-        Fonts::Pop(Fonts::BodyBold);
-
-        ImVec2 fs(0, 0);
-        if (showFps) {
-            Fonts::Push(Fonts::Caption);
-            fs = ImGui::CalcTextSize(s_fpsText);
-            Fonts::Pop(Fonts::Caption);
-        }
-
-        const float padX = 14.0f, padY = 9.0f;
-        const float gap = showFps ? 14.0f : 0.0f;
-
-        return ImVec2(padX * 2.0f + 8.0f + ns.x + gap + fs.x,
-                      padY * 2.0f + ns.y);
-    }
-
-    static void DrawWatermark(ImDrawList* dl, ImVec2 a, ImVec2 size, float alpha) {
-        ImVec2 b(a.x + size.x, a.y + size.y);
-        GlassPanel(dl, a, b, size.y * 0.5f, alpha);
-
-        const float padX = 14.0f;
-        const float dotR = 4.0f;
-        const float dotX = a.x + padX + dotR;
-        const float cy   = a.y + size.y * 0.5f;
-
-        dl->AddCircleFilled(ImVec2(dotX, cy), dotR, Col::Alpha(Col::Blue, alpha), 16);
-
-        Fonts::Push(Fonts::BodyBold);
-        ImVec2 ns = ImGui::CalcTextSize("Phantom");
         dl->AddText(ImVec2(dotX + dotR + 8.0f, cy - ns.y * 0.5f),
-                    Col::Alpha(Col::Label, alpha), "Phantom");
+                    Col::Label, "Phantom");
         Fonts::Pop(Fonts::BodyBold);
 
         if (showFps) {
             Fonts::Push(Fonts::Caption);
-            ImVec2 fs = ImGui::CalcTextSize(s_fpsText);
-            dl->AddText(ImVec2(b.x - padX - fs.x, cy - fs.y * 0.5f),
-                        Col::Alpha(Col::Label2, alpha), s_fpsText);
+            dl->AddText(ImVec2(b.x - kCardPadX - fs.x, cy - fs.y * 0.5f),
+                        Col::Label2, fps);
             Fonts::Pop(Fonts::Caption);
         }
     }
 
     // ---------------------------------------------------------
-    // Module list
+    // Module pills
     // ---------------------------------------------------------
-    // Builds the frame's items and returns the block size. In the
-    // editor with nothing enabled it fills in three placeholders,
-    // because you cannot position a list you cannot see.
-    // ---------------------------------------------------------
-    static ImVec2 MeasureList(bool editing, float* pillH, float* step) {
-        static const std::string kGhost[3] = {
-            std::string("Velocity"), std::string("AutoClicker"), std::string("ESP")
-        };
-        static const ImU32 kGhostCol[3] = { Col::Red, Col::Red, Col::Purple };
+    static void DrawModuleList(ImDrawList* dl, float anchorX, float startY,
+                               bool rightAlign, bool upward)
+    {
+        for (auto& kv : s_pills) kv.second.seen = false;
 
         s_items.clear();
-        s_ghosts = false;
 
         Fonts::Push(Fonts::Body);
-
         for (auto& mod : ModuleManager::GetModules()) {
             if (!mod->IsEnabled()) continue;
             Item it;
             it.name  = &mod->GetName();
             it.color = CategoryColor(mod->GetCategory());
-            it.width = ImGui::CalcTextSize(it.name->c_str()).x
-                     + kPillPadX * 2.0f + 14.0f;
+            it.width = ImGui::CalcTextSize(it.name->c_str()).x;
             s_items.push_back(it);
         }
-
-        if (editing && s_items.empty()) {
-            s_ghosts = true;
-            for (int i = 0; i < 3; i++) {
-                Item it;
-                it.name  = &kGhost[i];
-                it.color = kGhostCol[i];
-                it.width = ImGui::CalcTextSize(kGhost[i].c_str()).x
-                         + kPillPadX * 2.0f + 14.0f;
-                s_items.push_back(it);
-            }
-        }
-
-        const float lineH = ImGui::GetTextLineHeight();
+        float lineH = ImGui::GetTextLineHeight();
         Fonts::Pop(Fonts::Body);
 
         // Widest first reads as a deliberate shape rather than a
@@ -323,88 +281,43 @@ private:
         std::sort(s_items.begin(), s_items.end(),
                   [](const Item& a, const Item& b) { return a.width > b.width; });
 
-        *pillH = lineH + kPillPadY * 2.0f;
-        *step  = *pillH + kPillGap;
+        float pillH = lineH + kPillPadY * 2.0f;
+        float step  = pillH + kPillGap;
 
-        float w = 0.0f;
-        for (auto& it : s_items) if (it.width > w) w = it.width;
+        // Bounds for the editor, so an empty list can still be
+        // grabbed and placed before you turn anything on.
+        float widest = 0.0f;
+        for (auto& it : s_items)
+            if (it.width > widest) widest = it.width;
+        if (widest < 60.0f) widest = 60.0f;
 
-        float h = s_items.empty() ? 0.0f
-                : (*step) * (float)s_items.size() - kPillGap;
+        float boxW = widest + kPillPadX * 2.0f + 14.0f;
+        float boxH = s_items.empty() ? pillH
+                   : step * (float)s_items.size() - kPillGap;
 
-        return ImVec2(w, h);
-    }
-
-    static void DrawPill(ImDrawList* dl, float anchorX, float y,
-                         float w, float h, const char* text,
-                         ImU32 accent, float t, bool rightAlign)
-    {
-        if (t < 0.01f) return;
-
-        // Slides in from whichever edge it is anchored to
-        const float slide = (1.0f - t) * kSlideIn;
-        const float x = rightAlign ? (anchorX - w + slide) : (anchorX - slide);
-
-        ImVec2 a(x, y);
-        ImVec2 b(x + w, y + h);
-
-        GlassPanel(dl, a, b, h * 0.5f, t);
-
-        const float cy = a.y + h * 0.5f;
-        dl->AddCircleFilled(ImVec2(a.x + kPillPadX + kDotR - 2.0f, cy), kDotR,
-                            Col::Alpha(accent, t), 14);
-
-        Fonts::Push(Fonts::Body);
-        ImVec2 ts = ImGui::CalcTextSize(text);
-        dl->AddText(ImVec2(a.x + kPillPadX + kDotR * 2.0f + 6.0f, cy - ts.y * 0.5f),
-                    Col::Alpha(Col::Label, t), text);
-        Fonts::Pop(Fonts::Body);
-    }
-
-    static void DrawList(ImDrawList* dl, ImVec2 pos, ImVec2 size,
-                         float pillH, float step, bool rightAlign, bool up,
-                         float alpha)
-    {
-        const float anchorX = rightAlign ? pos.x + size.x : pos.x;
-
-        // Placeholders never enter the animation store: they do not
-        // belong to a module and would animate out the moment the
-        // editor closed.
-        if (s_ghosts) {
-            for (size_t i = 0; i < s_items.size(); i++) {
-                float y = pos.y + step * (float)i;
-                DrawPill(dl, anchorX, y, s_items[i].width, pillH,
-                         s_items[i].name->c_str(), s_items[i].color,
-                         alpha * 0.5f, rightAlign);
-            }
-            return;
+        {
+            float x0 = rightAlign ? anchorX - boxW : anchorX;
+            float y0 = upward ? startY - boxH : startY;
+            s_mlRect = { ImVec2(x0, y0), ImVec2(x0 + boxW, y0 + boxH), true };
         }
 
-        for (auto& kv : s_pills) kv.second.seen = false;
-
-        const int n = (int)s_items.size();
-        for (int i = 0; i < n; i++) {
-            Item& it = s_items[i];
+        int idx = 0;
+        for (auto& it : s_items) {
             Pill& p = s_pills[*it.name];
-            const bool isNew = !p.seen && p.anim <= 0.001f;
+            bool isNew = !p.seen && p.anim <= 0.001f;
 
             p.seen  = true;
             p.width = it.width;
             p.color = it.color;
 
-            // Growing upward means the block is bottom anchored, so
-            // index 0 sits at the bottom and the list pushes up.
-            const float targetY = up
-                ? pos.y + size.y - pillH - step * (float)i
-                : pos.y + step * (float)i;
-
+            float targetY = startY + (upward ? -step * (idx + 1) : step * idx);
             if (isNew) p.y = targetY;   // appear in place, then slide in
 
-            // Keyed by address rather than a built string: the old
-            // version allocated two std::strings per pill per frame
-            // purely to make an ImGui id.
-            p.y    = Anim::To(ImGui::GetID((const void*)&p.y), targetY, 16.0f);
-            p.anim = Anim::To(ImGui::GetID((const void*)&p.anim), 1.0f, 15.0f);
+            p.y    = Anim::To(ImGui::GetID(("hudY_" + *it.name).c_str()),
+                              targetY, 16.0f);
+            p.anim = Anim::To(ImGui::GetID(("hudA_" + *it.name).c_str()),
+                              1.0f, 15.0f);
+            idx++;
         }
 
         // Anything switched off animates out before it is dropped
@@ -412,381 +325,234 @@ private:
             if (it->second.seen) { ++it; continue; }
 
             it->second.anim = Anim::To(
-                ImGui::GetID((const void*)&it->second.anim), 0.0f, 15.0f);
+                ImGui::GetID(("hudA_" + it->first).c_str()), 0.0f, 15.0f);
 
             if (it->second.anim < 0.01f) { it = s_pills.erase(it); continue; }
 
             DrawPill(dl, anchorX, it->second.y, it->second.width, pillH,
                      it->first.c_str(), it->second.color,
-                     it->second.anim * alpha, rightAlign);
+                     it->second.anim, rightAlign);
             ++it;
         }
 
         for (auto& it : s_items) {
             Pill& p = s_pills[*it.name];
             DrawPill(dl, anchorX, p.y, it.width, pillH,
-                     it.name->c_str(), it.color, p.anim * alpha, rightAlign);
+                     it.name->c_str(), it.color, p.anim, rightAlign);
         }
     }
 
-    // =========================================================
+    // ---------------------------------------------------------
     // Editor
-    // =========================================================
-    // Drag to place. Snaps to the safe margin on each edge, to the
-    // centre lines, and to the edges of the other element so the two
-    // line up without pixel hunting. A guide is drawn only while a
-    // snap is actually holding, which is the only time it says
-    // anything.
-    //
-    // Input is read straight off ImGuiIO rather than through widgets
-    // because the HUD lives on the foreground draw list with no
-    // window behind it. The menu sheet is hidden while this is open,
-    // so nothing else is competing for the click.
-    // =========================================================
-    struct EditTarget {
-        const char* label;
-        ImVec2 pos;
-        ImVec2 size;
-        float* ax;
-        float* ay;
-        bool   live;
-    };
+    // ---------------------------------------------------------
+    // A dashed outline round each element, a label saying what it
+    // is, and drag to move. Snapping to the screen edges and the
+    // centre lines, with a guide drawn while a snap is active, so
+    // lining two elements up does not become an exercise in nudging
+    // one pixel at a time.
+    // ---------------------------------------------------------
+    static void DashedRect(ImDrawList* dl, ImVec2 a, ImVec2 b, ImU32 col) {
+        const float dash = 6.0f, gap = 4.0f;
 
-    static bool Hit(ImVec2 m, ImVec2 a, ImVec2 size) {
-        return m.x >= a.x && m.x <= a.x + size.x
-            && m.y >= a.y && m.y <= a.y + size.y;
-    }
-
-    // Nearest candidate within the threshold, or the value untouched
-    static float SnapTo(float v, const float* candidates, int count, float* guide) {
-        float best = v, bestD = kSnapPx;
-        int hit = -1;
-        for (int i = 0; i < count; i++) {
-            float d = std::fabs(v - candidates[i]);
-            if (d < bestD) { bestD = d; best = candidates[i]; hit = i; }
+        for (float x = a.x; x < b.x; x += dash + gap) {
+            float x2 = x + dash; if (x2 > b.x) x2 = b.x;
+            dl->AddLine(ImVec2(x, a.y), ImVec2(x2, a.y), col, 1.4f);
+            dl->AddLine(ImVec2(x, b.y), ImVec2(x2, b.y), col, 1.4f);
         }
-        if (hit >= 0 && guide) *guide = best;
-        return best;
+        for (float y = a.y; y < b.y; y += dash + gap) {
+            float y2 = y + dash; if (y2 > b.y) y2 = b.y;
+            dl->AddLine(ImVec2(a.x, y), ImVec2(a.x, y2), col, 1.4f);
+            dl->AddLine(ImVec2(b.x, y), ImVec2(b.x, y2), col, 1.4f);
+        }
     }
 
-    static void DragTargets(EditTarget* t, int count, float sw, float sh,
-                            bool consumed)
+    static bool Inside(const Rect& r, ImVec2 p) {
+        return r.valid && p.x >= r.a.x && p.x <= r.b.x
+                       && p.y >= r.a.y && p.y <= r.b.y;
+    }
+
+    static void EditorChrome(ImDrawList* dl, const Rect& r, const char* label,
+                             bool hot)
     {
+        if (!r.valid) return;
+
+        ImVec2 a(r.a.x - 5.0f, r.a.y - 5.0f);
+        ImVec2 b(r.b.x + 5.0f, r.b.y + 5.0f);
+
+        ImU32 col = hot ? Col::Blue : Col::Alpha(Col::Blue, 0.55f);
+        if (hot) dl->AddRectFilled(a, b, Col::Alpha(Col::Blue, 0.10f), 8.0f);
+        DashedRect(dl, a, b, col);
+
+        Fonts::Push(Fonts::Caption);
+        ImVec2 ts = ImGui::CalcTextSize(label);
+        float ly = a.y - ts.y - 5.0f;
+        if (ly < 2.0f) ly = b.y + 5.0f;   // no room above: put it below
+        dl->AddRectFilled(ImVec2(a.x, ly - 2.0f),
+                          ImVec2(a.x + ts.x + 10.0f, ly + ts.y + 2.0f),
+                          Col::Alpha(Col::Blue, hot ? 0.95f : 0.7f), 4.0f);
+        dl->AddText(ImVec2(a.x + 5.0f, ly), Col::OnAccent, label);
+        Fonts::Pop(Fonts::Caption);
+    }
+
+    // Snap a normalised anchor to the edges and the centre lines.
+    // Reports which guides fired so they can be drawn.
+    static void SnapAnchor(float* nx, float* ny, float sw, float sh,
+                           bool rightAlign, bool bottom,
+                           bool* guideX, bool* guideY)
+    {
+        float px = *nx * sw;
+        float py = *ny * sh;
+
+        float leftEdge  = kEdgeMargin;
+        float rightEdge = sw - kEdgeMargin;
+        float topEdge   = kEdgeMargin;
+        float botEdge   = sh - kEdgeMargin;
+
+        *guideX = *guideY = false;
+
+        if (!rightAlign && std::fabs(px - leftEdge)  < kSnapPixels) px = leftEdge;
+        if ( rightAlign && std::fabs(px - rightEdge) < kSnapPixels) px = rightEdge;
+        if (!bottom     && std::fabs(py - topEdge)   < kSnapPixels) py = topEdge;
+        if ( bottom     && std::fabs(py - botEdge)   < kSnapPixels) py = botEdge;
+
+        if (std::fabs(px - sw * 0.5f) < kSnapPixels) { px = sw * 0.5f; *guideX = true; }
+        if (std::fabs(py - sh * 0.5f) < kSnapPixels) { py = sh * 0.5f; *guideY = true; }
+
+        *nx = Clamp01(px / sw);
+        *ny = Clamp01(py / sh);
+    }
+
+    static void RunEditor(ImDrawList* dl, float sw, float sh) {
         ImGuiIO& io = ImGui::GetIO();
-        const ImVec2 m = io.MousePos;
+        ImVec2 m = io.MousePos;
 
-        s_guideX = s_guideY = -1.0f;
+        // A wash over the world so it is obvious the HUD is in a
+        // different mode.
+        dl->AddRectFilled(ImVec2(0, 0), ImVec2(sw, sh), IM_COL32(0, 0, 0, 40));
 
-        if (!io.MouseDown[0]) s_drag = -1;
+        bool hotWm = watermark  && Inside(s_wmRect, m);
+        bool hotMl = moduleList && Inside(s_mlRect, m);
 
-        // Topmost first, so the element drawn last is grabbed first
-        if (s_drag < 0 && io.MouseClicked[0] && !consumed) {
-            for (int i = count - 1; i >= 0; i--) {
-                if (!t[i].live) continue;
-                if (!Hit(m, t[i].pos, t[i].size)) continue;
-                s_drag = i;
-                s_grab = ImVec2(m.x - t[i].pos.x, m.y - t[i].pos.y);
-                break;
+        // ---- Begin a drag ----
+        // Only when the pointer is not over the panel, or moving the
+        // menu would also drag whatever is behind it.
+        if (s_drag == Drag::None && ImGui::IsMouseClicked(ImGuiMouseButton_Left)
+            && !io.WantCaptureMouse)
+        {
+            if (hotMl) {
+                s_drag = Drag::ModuleList;
+                s_grab = ImVec2(m.x - mlX * sw, m.y - mlY * sh);
+            } else if (hotWm) {
+                s_drag = Drag::Watermark;
+                s_grab = ImVec2(m.x - wmX * sw, m.y - wmY * sh);
             }
         }
 
-        if (s_drag < 0 || s_drag >= count || !t[s_drag].live) return;
+        if (s_drag != Drag::None && !ImGui::IsMouseDown(ImGuiMouseButton_Left))
+            s_drag = Drag::None;
 
-        EditTarget& d = t[s_drag];
-        ImVec2 p(m.x - s_grab.x, m.y - s_grab.y);
+        bool guideX = false, guideY = false;
 
-        // ---- Candidates ----
-        float xs[6], ys[6];
-        int nx = 0, ny = 0;
-        xs[nx++] = kMargin;                         // left margin
-        xs[nx++] = sw - kMargin - d.size.x;         // right margin
-        xs[nx++] = (sw - d.size.x) * 0.5f;          // centred
-        ys[ny++] = kMargin;
-        ys[ny++] = sh - kMargin - d.size.y;
-        ys[ny++] = (sh - d.size.y) * 0.5f;
+        if (s_drag != Drag::None) {
+            float* nx = (s_drag == Drag::Watermark) ? &wmX : &mlX;
+            float* ny = (s_drag == Drag::Watermark) ? &wmY : &mlY;
 
-        for (int i = 0; i < count; i++) {
-            if (i == s_drag || !t[i].live) continue;
-            xs[nx++] = t[i].pos.x;                                  // left edges
-            xs[nx++] = t[i].pos.x + t[i].size.x - d.size.x;         // right edges
-            ys[ny++] = t[i].pos.y + t[i].size.y + kBlockGap;        // stacked under
-            ys[ny++] = t[i].pos.y - kBlockGap - d.size.y;           // stacked over
+            *nx = Clamp01((m.x - s_grab.x) / sw);
+            *ny = Clamp01((m.y - s_grab.y) / sh);
+
+            SnapAnchor(nx, ny, sw, sh, *nx > 0.5f, *ny > 0.5f, &guideX, &guideY);
         }
 
-        float gx = -1.0f, gy = -1.0f;
-        p.x = SnapTo(p.x, xs, nx, &gx);
-        p.y = SnapTo(p.y, ys, ny, &gy);
+        // ---- Chrome ----
+        if (watermark)
+            EditorChrome(dl, s_wmRect, "Watermark",
+                         hotWm || s_drag == Drag::Watermark);
+        if (moduleList)
+            EditorChrome(dl, s_mlRect, "Module list",
+                         hotMl || s_drag == Drag::ModuleList);
 
-        float maxX = sw - kMargin - d.size.x;
-        float maxY = sh - kMargin - d.size.y;
-        if (maxX < kMargin) maxX = kMargin;
-        if (maxY < kMargin) maxY = kMargin;
-        p.x = Clamp(p.x, kMargin, maxX);
-        p.y = Clamp(p.y, kMargin, maxY);
+        // ---- Guides ----
+        ImU32 guide = Col::Alpha(Col::Orange, 0.9f);
+        if (guideX) dl->AddLine(ImVec2(sw * 0.5f, 0), ImVec2(sw * 0.5f, sh), guide, 1.0f);
+        if (guideY) dl->AddLine(ImVec2(0, sh * 0.5f), ImVec2(sw, sh * 0.5f), guide, 1.0f);
 
-        if (gx >= 0.0f && std::fabs(p.x - gx) < 0.5f) s_guideX = p.x;
-        if (gy >= 0.0f && std::fabs(p.y - gy) < 0.5f) s_guideY = p.y;
-
-        d.pos = p;
-        // Written live rather than on release: Store is the exact
-        // inverse of Resolve, so the element cannot drift, and the
-        // autosave picks it up even if the game dies mid-drag.
-        Store(p, d.size, sw, sh, d.ax, d.ay);
-    }
-
-    // A button with no ImGui window behind it
-    static bool RawButton(ImDrawList* dl, ImVec2 a, ImVec2 size,
-                          const char* label, ImU32 col, bool filled,
-                          float alpha, const char* key)
-    {
-        ImGuiIO& io = ImGui::GetIO();
-        ImVec2 b(a.x + size.x, a.y + size.y);
-
-        const bool hov = Hit(io.MousePos, a, size);
-        const float h = Anim::ToStr(key, hov ? 1.0f : 0.0f, 18.0f);
-        const float r = size.y * 0.5f;
-
-        if (filled) {
-            if (h > 0.02f) Glow(dl, a, b, col, r, h * 0.7f * alpha, 4);
-            dl->AddRectFilled(a, b, Col::Alpha(col, (0.9f + 0.1f * h) * alpha), r);
-        } else {
-            dl->AddRectFilled(a, b,
-                Col::Alpha(IM_COL32(255, 255, 255, 255), (0.10f + 0.10f * h) * alpha), r);
-            dl->AddRect(a, b,
-                Col::Alpha(IM_COL32(255, 255, 255, 255), (0.30f + 0.25f * h) * alpha),
-                r, 0, 1.0f);
-        }
-
-        Fonts::Push(Fonts::BodyBold);
-        ImVec2 ts = ImGui::CalcTextSize(label);
-        dl->AddText(ImVec2(a.x + (size.x - ts.x) * 0.5f,
-                           a.y + (size.y - ts.y) * 0.5f),
-                    Col::Alpha(filled ? Col::OnAccent
-                                      : IM_COL32(255, 255, 255, 255), alpha),
-                    label);
-        Fonts::Pop(Fonts::BodyBold);
-
-        return hov && io.MouseClicked[0];
-    }
-
-    static void DrawOutline(ImDrawList* dl, ImVec2 a, ImVec2 size,
-                            const char* label, bool active, float alpha)
-    {
-        ImVec2 b(a.x + size.x, a.y + size.y);
-        const float r = 10.0f;
-        const ImU32 c = Col::Alpha(Col::Blue, (active ? 1.0f : 0.55f) * alpha);
-
-        dl->AddRect(ImVec2(a.x - 4.0f, a.y - 4.0f),
-                    ImVec2(b.x + 4.0f, b.y + 4.0f), c, r, 0,
-                    active ? 2.0f : 1.4f);
-
-        // Corner ticks: reads as a handle without pretending to be a
-        // resize grip, which this is not.
-        const float t = 7.0f;
-        const ImU32 cc = Col::Alpha(Col::Blue, alpha);
-        dl->AddLine(ImVec2(a.x - 4.0f, a.y - 4.0f), ImVec2(a.x - 4.0f + t, a.y - 4.0f), cc, 2.0f);
-        dl->AddLine(ImVec2(a.x - 4.0f, a.y - 4.0f), ImVec2(a.x - 4.0f, a.y - 4.0f + t), cc, 2.0f);
-        dl->AddLine(ImVec2(b.x + 4.0f, b.y + 4.0f), ImVec2(b.x + 4.0f - t, b.y + 4.0f), cc, 2.0f);
-        dl->AddLine(ImVec2(b.x + 4.0f, b.y + 4.0f), ImVec2(b.x + 4.0f, b.y + 4.0f - t), cc, 2.0f);
-
+        // ---- Instruction ----
         Fonts::Push(Fonts::Caption);
-        ImVec2 ts = ImGui::CalcTextSize(label);
-        float ly = a.y - 4.0f - ts.y - 6.0f;
-        if (ly < 2.0f) ly = b.y + 8.0f;   // no room above, put it under
-        dl->AddRectFilled(ImVec2(a.x - 4.0f, ly - 2.0f),
-                          ImVec2(a.x + ts.x + 10.0f, ly + ts.y + 2.0f),
-                          Col::Alpha(Col::Blue, 0.9f * alpha), 5.0f);
-        dl->AddText(ImVec2(a.x + 1.0f, ly),
-                    Col::Alpha(Col::OnAccent, alpha), label);
+        const char* tip = s_drag != Drag::None
+            ? "Release to place"
+            : "Drag an element to move it. It snaps to the edges and the centre.";
+        ImVec2 ts = ImGui::CalcTextSize(tip);
+        float bx = (sw - ts.x) * 0.5f;
+        float by = sh - 46.0f;
+        dl->AddRectFilled(ImVec2(bx - 14.0f, by - 8.0f),
+                          ImVec2(bx + ts.x + 14.0f, by + ts.y + 8.0f),
+                          IM_COL32(20, 22, 28, 225), 9.0f);
+        dl->AddText(ImVec2(bx, by), IM_COL32(255, 255, 255, 235), tip);
         Fonts::Pop(Fonts::Caption);
-    }
-
-    static void DrawEditorChrome(ImDrawList* dl, float sw, float sh, float alpha) {
-        // ---- Snap guides ----
-        if (s_guideX >= 0.0f)
-            dl->AddLine(ImVec2(s_guideX, 0), ImVec2(s_guideX, sh),
-                        Col::Alpha(Col::Pink, 0.75f * alpha), 1.0f);
-        if (s_guideY >= 0.0f)
-            dl->AddLine(ImVec2(0, s_guideY), ImVec2(sw, s_guideY),
-                        Col::Alpha(Col::Pink, 0.75f * alpha), 1.0f);
-
-        // ---- Safe area ----
-        dl->AddRect(ImVec2(kMargin, kMargin), ImVec2(sw - kMargin, sh - kMargin),
-                    Col::Alpha(IM_COL32(255, 255, 255, 255), 0.10f * alpha),
-                    0.0f, 0, 1.0f);
-
-        // ---- Banner ----
-        const char* title = "HUD Layout";
-        const char* hint  = "Drag an element to place it. It snaps to the edges "
-                            "and to the other card.";
-
-        Fonts::Push(Fonts::Title);
-        ImVec2 tS = ImGui::CalcTextSize(title);
-        Fonts::Pop(Fonts::Title);
-        Fonts::Push(Fonts::Caption);
-        ImVec2 hS = ImGui::CalcTextSize(hint);
-        Fonts::Pop(Fonts::Caption);
-
-        const float btnH = 30.0f;
-        const float padX = 22.0f, padY = 16.0f, gap = 16.0f;
-        const float doneW = 78.0f, resetW = 108.0f;
-
-        float bodyW = tS.x;
-        if (hS.x > bodyW) bodyW = hS.x;
-        float cw = padX * 2.0f + bodyW;
-        float minW = padX * 2.0f + doneW + resetW + 10.0f;
-        if (cw < minW) cw = minW;
-        float ch = padY * 2.0f + tS.y + 6.0f + hS.y + 14.0f + btnH;
-
-        ImVec2 a((sw - cw) * 0.5f, sh * 0.06f - (1.0f - alpha) * 12.0f);
-        ImVec2 b(a.x + cw, a.y + ch);
-
-        dl->AddRectFilled(ImVec2(a.x + 2, a.y + 6), ImVec2(b.x + 2, b.y + 10),
-                          IM_COL32(0, 0, 0, (int)(70 * alpha)), 18.0f);
-        dl->AddRectFilled(a, b, IM_COL32(22, 24, 30, (int)(238 * alpha)), 18.0f);
-        dl->AddRect(a, b, Col::Alpha(Col::Blue, 0.35f * alpha), 18.0f, 0, 1.0f);
-
-        float y = a.y + padY;
-
-        Fonts::Push(Fonts::Title);
-        dl->AddText(ImVec2(a.x + (cw - tS.x) * 0.5f, y),
-                    Col::Alpha(IM_COL32(255, 255, 255, 255), alpha), title);
-        Fonts::Pop(Fonts::Title);
-        y += tS.y + 6.0f;
-
-        Fonts::Push(Fonts::Caption);
-        dl->AddText(ImVec2(a.x + (cw - hS.x) * 0.5f, y),
-                    Col::Alpha(IM_COL32(255, 255, 255, 170), alpha), hint);
-        Fonts::Pop(Fonts::Caption);
-        y += hS.y + 14.0f;
-
-        float bx = a.x + (cw - (doneW + resetW + 10.0f)) * 0.5f;
-
-        if (RawButton(dl, ImVec2(bx, y), ImVec2(resetW, btnH),
-                      "Reset", Col::Blue, false, alpha, "hudReset")) {
-            ResetLayout();
-        }
-        if (RawButton(dl, ImVec2(bx + resetW + 10.0f, y), ImVec2(doneW, btnH),
-                      "Done", Col::Blue, true, alpha, "hudDone")) {
-            EndEdit();
-        }
-    }
-
-    // True if the pointer is over the banner, so a click there does
-    // not also grab whatever HUD element happens to be underneath.
-    static bool OverChrome(float sw, float sh) {
-        ImGuiIO& io = ImGui::GetIO();
-        return io.MousePos.y < sh * 0.06f + 150.0f
-            && std::fabs(io.MousePos.x - sw * 0.5f) < 260.0f;
     }
 
 public:
-    // ---------------------------------------------------------
-    // Render
-    // ---------------------------------------------------------
     static void Render() {
         ImGuiIO& io = ImGui::GetIO();
-        const float sw = io.DisplaySize.x;
-        const float sh = io.DisplaySize.y;
+        float sw = io.DisplaySize.x;
+        float sh = io.DisplaySize.y;
         if (sw < 2.0f || sh < 2.0f) return;
 
-        const bool edit = s_editing;
-        const float editFade = Anim::ToStr("hudEditFade", edit ? 1.0f : 0.0f, 15.0f);
-
-        if (!edit && !watermark && !moduleList) {
-            if (!s_pills.empty()) s_pills.clear();
-            return;
-        }
+        if (!watermark && !moduleList && !s_editing) return;
 
         ImDrawList* dl = ImGui::GetForegroundDrawList();
         if (!dl) return;
 
-        // ---- Measure ----
-        const bool showWm = watermark || edit;
-        const bool showMl = moduleList || edit;
+        // Alignment falls out of where the element is, so there is
+        // no second setting that can disagree with the first.
+        bool wmRight = wmX > 0.5f, wmBottom = wmY > 0.5f;
+        bool mlRight = mlX > 0.5f, mlBottom = mlY > 0.5f;
 
-        ImVec2 wmSize(0, 0);
-        if (showWm) wmSize = MeasureWatermark();
+        s_wmRect.valid = s_mlRect.valid = false;
 
-        float pillH = 0.0f, step = 0.0f;
-        ImVec2 mlSize(0, 0);
-        if (showMl) mlSize = MeasureList(edit, &pillH, &step);
+        if (watermark)
+            DrawWatermark(dl, wmX * sw, wmY * sh, wmRight, wmBottom);
 
-        // ---- Place ----
-        EditTarget targets[2];
-        targets[0] = { "Watermark", Resolve(wmX, wmY, wmSize, sw, sh), wmSize,
-                       &wmX, &wmY, showWm && wmSize.x > 1.0f };
-        targets[1] = { "Modules", Resolve(mlX, mlY, mlSize, sw, sh), mlSize,
-                       &mlX, &mlY, showMl && mlSize.x > 1.0f };
+        if (moduleList)
+            DrawModuleList(dl, mlX * sw, mlY * sh, mlRight, mlBottom);
 
-        if (edit) {
-            // Scrim first: same draw list, so order is depth. The
-            // world goes quiet and the HUD is the only thing lit.
-            dl->AddRectFilled(ImVec2(0, 0), ImVec2(sw, sh),
-                              IM_COL32(8, 10, 14, (int)(150 * editFade)));
-            DragTargets(targets, 2, sw, sh, OverChrome(sw, sh));
-        }
-
-        // ---- Draw ----
-        // Disabled elements are still shown, at half strength, while
-        // the editor is open: placing something you cannot see is
-        // impossible, and hiding it would make the switch feel like
-        // it deleted the element.
-        if (showWm && wmSize.x > 1.0f) {
-            float a = watermark ? 1.0f : 0.45f * editFade;
-            DrawWatermark(dl, targets[0].pos, wmSize, a);
-        }
-        if (showMl && mlSize.x > 1.0f) {
-            const bool right = (targets[1].pos.x + mlSize.x * 0.5f) > sw * 0.5f;
-            const bool up    = (targets[1].pos.y + mlSize.y * 0.5f) > sh * 0.5f;
-            float a = moduleList ? 1.0f : 0.45f * editFade;
-            DrawList(dl, targets[1].pos, mlSize, pillH, step, right, up, a);
-        }
-
-        if (editFade > 0.01f) {
-            for (int i = 0; i < 2; i++) {
-                if (!targets[i].live) continue;
-                DrawOutline(dl, targets[i].pos, targets[i].size,
-                            targets[i].label, s_drag == i, editFade);
-            }
-            DrawEditorChrome(dl, sw, sh, editFade);
-        }
+        if (s_editing) RunEditor(dl, sw, sh);
     }
 
-    // ---------------------------------------------------------
-    // Settings
-    // ---------------------------------------------------------
     static void RenderSettings() {
-        SectionHeader("HUD");
+        SectionHeader("On screen");
         BeginCard();
         SwitchRow("Watermark", &watermark,
-                  "The client name in the corner", Col::Blue);
+                  "The client name and your frame rate", Col::Blue);
         if (watermark) {
             RowSeparator();
-            SwitchRow("Frame rate", &showFps,
-                      "Shown beside the name", Col::Blue);
+            SwitchRow("Frame rate", &showFps, nullptr, Col::Blue);
         }
         RowSeparator();
         SwitchRow("Module list", &moduleList,
                   "What is currently running", Col::Purple);
         EndCard();
 
+        SectionHeader("Layout");
         BeginCard();
-        ImGui::Dummy(ImVec2(0, 10));
-        ImGui::Indent(M::RowPadX);
-        if (Button("Edit Layout",
-                   ImGui::GetContentRegionAvail().x - M::RowPadX,
-                   Col::Blue, true)) {
-            BeginEdit();
-        }
-        ImGui::Unindent(M::RowPadX);
-        ImGui::Dummy(ImVec2(0, 10));
+        bool editing = s_editing;
+        if (SwitchRow("Move HUD", &editing,
+                      "Drag the elements anywhere on screen", Col::Orange))
+            SetEditing(editing);
         EndCard();
 
-        Footnote("Editing hides this menu and lets you drag the cards "
-                 "straight onto the screen. They snap to the edges and to "
-                 "each other. Escape or Done when you are finished, and the "
-                 "positions are saved with everything else.");
+        ImGui::Dummy(ImVec2(0, 6));
+        if (Button("Reset HUD Positions",
+                   ImGui::GetContentRegionAvail().x - M::RowPadX,
+                   Col::Label2, false)) {
+            ResetLayout();
+            SetEditing(false);
+        }
+
+        Footnote("Positions are stored as a fraction of the screen, so the "
+                 "HUD stays where you put it when you resize the window or "
+                 "go fullscreen. An element in the right half grows leftward "
+                 "and one in the bottom half grows upward.");
     }
 };
 
