@@ -1,11 +1,11 @@
 #pragma once
 #include <jni.h>
-#include <cstdio>
 #include <string>
 #include <cmath>
 
 #include "../jni/class_resolver.h"
 #include "../jni/jvmti_util.h"
+#include "../util/log.h"
 
 // =================================================================
 // Minecraft — the game singleton and entity accessors
@@ -59,7 +59,15 @@ private:
 
     inline static bool s_ready = false;
 
+    static constexpr double kPi = 3.14159265358979323846;
+
 public:
+    // Vanilla eye height. Sneaking lowers it, and aiming from the
+    // wrong height is a visible pitch error at close range, which is
+    // exactly where every fight happens.
+    static constexpr double kEyeHeight       = 1.62;
+    static constexpr double kEyeHeightSneak  = 1.54;
+
     static bool IsReady() { return s_ready; }
 
     static bool Init(JNIEnv* env) {
@@ -129,12 +137,12 @@ public:
 
         s_ready = (gMinecraft != nullptr && fThePlayer != nullptr);
 
-        printf("[MC] ready=%d player=%p world=%p screen=%p posX=%p yaw=%p hurt=%p sprint=%p\n",
+        PH_LOG("[MC] ready=%d player=%p world=%p screen=%p posX=%p yaw=%p hurt=%p sprint=%p",
             (int)s_ready, (void*)fThePlayer, (void*)fTheWorld, (void*)fCurrentScreen,
             (void*)fPosX, (void*)fYaw, (void*)fHurtTime, (void*)mIsSprinting);
 
         if (!fCurrentScreen)
-            printf("[MC] WARN: currentScreen unresolved, GUI checks disabled\n");
+            PH_LOG("[MC] WARN: currentScreen unresolved, GUI checks disabled");
 
         return s_ready;
     }
@@ -210,6 +218,13 @@ public:
         return v != 0;
     }
 
+    // Where this entity's eyes actually are, sneak included.
+    static double GetEyeY(JNIEnv* env, jobject e) {
+        if (!e) return 0.0;
+        double h = IsSneaking(env, e) ? kEyeHeightSneak : kEyeHeight;
+        return GetPosY(env, e) + h;
+    }
+
     static float GetRenderPartialTicks(JNIEnv* env) {
         if (!gMinecraft || !fTimer || !fRenderPartialTicks) return 0.f;
         jobject t = env->GetObjectField(gMinecraft, fTimer);
@@ -243,11 +258,11 @@ public:
                                       double tx, double ty, double tz) {
         double dx = tx - GetPosX(env, from);
         double dz = tz - GetPosZ(env, from);
-        double dy = ty - (GetPosY(env, from) + 1.62);
+        double dy = ty - GetEyeY(env, from);
         double flat = std::sqrt(dx*dx + dz*dz);
 
-        float yaw   = (float)(std::atan2(dz, dx) * 180.0 / 3.14159265358979) - 90.0f;
-        float pitch = (float)(-(std::atan2(dy, flat) * 180.0 / 3.14159265358979));
+        float yaw   = (float)(std::atan2(dz, dx) * 180.0 / kPi) - 90.0f;
+        float pitch = (float)(-(std::atan2(dy, flat) * 180.0 / kPi));
         return { yaw, pitch };
     }
 
