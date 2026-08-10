@@ -33,6 +33,10 @@
 // So: the grid is enforced, the aim point wanders around the body,
 // targets are sticky rather than re-picked every tick, and the
 // whole thing only runs while you are actually swinging.
+//
+// PITCH RATIO lives inside Rotation::Step now, not here. Scaling the
+// pitch that Step returned used to knock it straight back off the
+// mouse grid, which is the one thing this module must never do.
 // =================================================================
 
 class AimAssist : public Module {
@@ -356,15 +360,15 @@ public:
         auto want = Rotation::ToPoint(env, player, tx, ty, tz);
         m_lastAngle = AngleTo(env, player, tx, ty, tz, yaw, pitch);
 
+        // Pitch ratio goes INTO Step so the grid snap and the
+        // velocity carry both act on the value that is written.
+        // Scaling next.pitch here afterwards was the grid violation.
         auto next = Rotation::Step(yaw, pitch, want.yaw, want.pitch,
                                    m_speed, m_smoothing,
-                                   m_jitter, m_overshoot);
-
-        // Pitch trails yaw.
-        float pitchStep = (next.pitch - pitch) * m_pitchRatio;
+                                   m_jitter, m_overshoot, m_pitchRatio);
 
         Minecraft::SetYaw(env, player, next.yaw);
-        Minecraft::SetPitch(env, player, pitch + pitchStep);
+        Minecraft::SetPitch(env, player, next.pitch);
 
         m_active = true;
     }
