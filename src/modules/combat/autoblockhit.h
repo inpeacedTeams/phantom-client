@@ -7,79 +7,119 @@
 #include "../../jni/jvmti_util.h"
 #include <imgui.h>
 #include <Windows.h>
-#include <jvmti.h>
+#include <unordered_map>
+#include <deque>
+#include <chrono>
 #include <random>
+#include <cstring>
+#include <cctype>
 
 // =================================================================
 // Auto Blockhit
 // =================================================================
 // Blocking with a sword in 1.8 halves incoming damage and resets
-// sprint. Blocking a lot is not suspicious on its own: real
-// blockhitters keep right click down for most of a fight. What
-// gets flagged is HOW the block is produced.
+// sprint. The old version simply held the block whenever the module
+// was on, which is both useless and obvious: it blocked in an empty
+// lobby, it blocked with a pickaxe, and it never let go in time to
+// actually swing.
 //
-//   BAD  block/unblock pairs with identical tick gaps
-//   BAD  blocking without a sword in hand
-//   BAD  toggling faster than the item-use cooldown allows
-//   GOOD right click held, with human micro-releases
+// This one watches the enemy and blocks around THEIR swing.
 //
-// We drive keyBindUseItem, so Minecraft emits the same packets a
-// real right-click hold produces.
+// HOW THE PREDICTION WORKS
+// EntityLivingBase raises isSwingInProgress the moment a player
+// swings, and the client sees that through the animation packet.
+// Timing those rising edges gives their swing rhythm, usually a
+// fairly steady 100-250ms for someone clicking normally.
 //
-// PERFECT mode aims for near-total coverage, releasing only for the
-// tick a swing needs plus randomized micro-gaps.
+// From that we know roughly when the next swing lands, so the block
+// goes down a configurable lead time before it and comes back up
+// once the hit has passed. If they stop swinging, the rhythm goes
+// stale and we stop blocking entirely, which is what keeps the
+// module quiet when nobody is fighting you.
+//
+// WHY THE SWORD CHECK CHANGED
+// Hunting for the ItemSword class by field name was fragile and
+// matched the wrong class often enough to block with a pickaxe.
+// Unlocalised names are plain strings in the source and survive
+// every obfuscation pass, so "item.swordDiamond" is a far more
+// reliable signal than any field lookup.
 // =================================================================
 
 class AutoBlockhit : public Module {
 private:
-    int   m_mode = 4;   // 0 Normal 1 Timed 2 Fake 3 Smart 4 Perfect
+    using Clock = std::chrono::steady_clock;
+    using Ms    = std::chrono::milliseconds;
 
-    float m_chance          = 100.0f;
-    int   m_blockTicksMin   = 1;
-    int   m_blockTicksMax   = 2;
-    bool  m_onlySword       = true;
-    bool  m_onlyWhileMoving = false;
+    static long long MsSince(Clock::time_point t) {
+        return std::chrono::duration_cast<Ms>(Clock::now() - t).count();
+    }
 
-    int   m_hitIntervalMin  = 1;
-    int   m_hitIntervalMax  = 3;
+    struct Enemy {
+        bool  wasSwinging = false;
+        bool  hasSwung    = false;
+        Clock::time_point lastSwing;
+        std::deque<long long> intervals;
+        long long avgInterval = 0;
+        unsigned long long lastSeen = 0;
+    };
 
-    float m_coverage        = 94.0f;
-    int   m_swingGapTicks   = 1;
-    bool  m_microRelease    = true;
-    float m_microChance     = 7.0f;
-    int   m_microLenMin     = 1;
-    int   m_microLenMax     = 2;
-    bool  m_predictive      = true;
-    float m_predictRange    = 3.8f;
-    bool  m_holdBetweenHits = true;
-    int   m_reblockDelayMin = 0;
-    int   m_reblockDelayMax = 1;
+    // ---- Mode ----
+    // 0 Predict, 1 Reactive, 2 In Range, 3 Swing Only
+    int m_mode = 0;
 
-    bool  m_varyReleaseTiming = true;
-    float m_timingNoise     = 30.0f;
-    bool  m_pauseOnFlag     = true;
-    int   m_flagPauseTicks  = 20;
+    // ---- Detection ----
+    float m_blockRange  = 3.7f;   // they can reach us from here
+    float m_detectRange = 6.0f;   // start watching their rhythm
 
-    // State
-    bool m_blocking         = false;
-    int  m_blockCountdown   = 0;
-    int  m_unblockCountdown = 0;
-    int  m_hitCounter       = 0;
-    int  m_nextBlockAt      = 1;
-    bool m_lastLMB          = false;
-    int  m_flagPause        = 0;
-    int  m_ticksBlocked     = 0;
-    int  m_ticksTotal       = 0;
+    // ---- Prediction ----
+    int m_leadMs        = 130;    // go down this long before the swing
+    int m_defaultCycle  = 220;    // assumed rhythm until one is learned
+    int m_staleMs       = 1400;   // silence for this long means disengaged
+    int m_reactionMin   = 35;     // nobody reacts instantly
+    int m_reactionMax   = 95;
 
-    // Sword check is walked once per second, not per tick
-    bool m_swordCached      = true;
-    int  m_swordCheckTimer  = 0;
+    // ---- Release ----
+    int m_swingGap      = 1;      // ticks unblocked so our swing lands
+    int m_afterHit      = 2;      // ticks unblocked once their hit passed
+    int m_maxBlockTicks = 40;     // never hold longer than this
 
-    jfieldID  m_fInventory = nullptr;
-    jmethodID m_mCurItem   = nullptr;
-    jmethodID m_mGetItem   = nullptr;
-    jclass    m_itemSword  = nullptr;
-    bool      m_resolved   = false;
+    // ---- Humanisation ----
+    float m_chance      = 95.0f;
+    bool  m_varyTiming  = true;
+    float m_timingNoise = 25.0f;
+
+    // ---- Safety ----
+    bool m_onlySword     = true;
+    bool m_pauseOnFlag   = true;
+    int  m_flagPauseTicks = 20;
+
+    // ---- State ----
+    std::unordered_map<int, Enemy> m_enemies;
+    bool m_blocking       = false;
+    int  m_releaseLeft    = 0;    // ticks we must stay unblocked
+    int  m_blockHeldTicks = 0;
+    int  m_flagPause      = 0;
+    bool m_lastLMB        = false;
+    int  m_lastHurtTime   = 0;
+    unsigned long long m_tick = 0;
+
+    bool m_swordCached     = false;
+    int  m_swordCheckTimer = 0;
+
+    // Live readout
+    long long m_lastPredictMs = -1;
+    long long m_shownCycle    = 0;
+    int  m_ticksBlocked = 0;
+    int  m_ticksTotal   = 0;
+
+    // ---- JNI ----
+    jfieldID  m_fInventory   = nullptr;
+    jmethodID m_mCurItem     = nullptr;
+    jmethodID m_mStackName   = nullptr;   // ItemStack.getUnlocalizedName
+    jfieldID  m_fSwinging    = nullptr;   // EntityLivingBase.isSwingInProgress
+    jfieldID  m_fSwingProg   = nullptr;   // EntityLivingBase.swingProgress
+    jmethodID m_getEntityId  = nullptr;
+    bool m_resolved = false;
 
     std::mt19937 m_rng{ std::random_device{}() };
 
@@ -92,41 +132,22 @@ private:
         std::uniform_int_distribution<int> d(lo, hi);
         return d(m_rng);
     }
-    int Noisy(int base) {
-        if (!m_varyReleaseTiming || m_timingNoise <= 0.f) return base;
-        float r = base * (m_timingNoise / 100.f);
+    long long Noisy(long long base) {
+        if (!m_varyTiming || m_timingNoise <= 0.f) return base;
+        float r = (float)base * (m_timingNoise / 100.f);
         std::uniform_real_distribution<float> d(-r, r);
-        int v = base + (int)d(m_rng);
+        long long v = base + (long long)d(m_rng);
         return v < 0 ? 0 : v;
     }
 
-    // ItemSword is obfuscated, so find it by the field it declares
-    jclass FindItemSword(JNIEnv* env) {
-        jvmtiEnv* jvmti = JvmtiUtil::Get(env);
-        if (!jvmti) return nullptr;
-
-        jint count = 0;
-        jclass* classes = nullptr;
-        if (jvmti->GetLoadedClasses(&count, &classes) != JVMTI_ERROR_NONE) return nullptr;
-
-        jclass found = nullptr;
-        for (jint i = 0; i < count && !found; i++) {
-            if (JvmtiUtil::HasField(env, classes[i], "field_150934_a")
-             || JvmtiUtil::HasField(env, classes[i], "attackDamage")) {
-                found = (jclass)env->NewGlobalRef(classes[i]);
-            }
-        }
-        jvmti->Deallocate((unsigned char*)classes);
-        return found;
-    }
-
-    void ResolveJNI(JNIEnv* env) {
+    void Resolve(JNIEnv* env) {
         if (m_resolved) return;
 
         if (ClassResolver::entityPlayer) {
             m_fInventory = JvmtiUtil::FindField(env, ClassResolver::entityPlayer,
                 { "field_71071_by", "inventory" });
         }
+
         if (m_fInventory) {
             jobject player = Minecraft::GetPlayer(env);
             if (player) {
@@ -139,85 +160,112 @@ private:
                 }
             }
         }
-        if (!m_itemSword) m_itemSword = FindItemSword(env);
+
+        if (ClassResolver::entityLivingBase) {
+            auto lb = ClassResolver::entityLivingBase;
+            m_fSwinging  = JvmtiUtil::FindField(env, lb,
+                { "field_82175_bq", "isSwingInProgress" });
+            m_fSwingProg = JvmtiUtil::FindField(env, lb,
+                { "field_70733_aJ", "swingProgress" });
+        }
+
+        if (ClassResolver::entity) {
+            m_getEntityId = JvmtiUtil::FindMethod(env, ClassResolver::entity,
+                { "func_145782_y", "getEntityId" }, 0);
+        }
 
         m_resolved = true;
-        printf("[AutoBlock] inv=%p curItem=%p sword=%p\n",
-            (void*)m_fInventory, (void*)m_mCurItem, (void*)m_itemSword);
+        printf("[AutoBlock] inv=%p item=%p swing=%p prog=%p id=%p\n",
+            (void*)m_fInventory, (void*)m_mCurItem,
+            (void*)m_fSwinging, (void*)m_fSwingProg, (void*)m_getEntityId);
     }
 
+    // Unlocalised names are literal strings in the source, so they
+    // read the same no matter how the classes were renamed.
     bool CheckSword(JNIEnv* env, jobject player) {
         if (!m_onlySword) return true;
-        if (!m_fInventory || !m_mCurItem || !m_itemSword) return true;
+        if (!m_fInventory || !m_mCurItem) return true;   // cannot tell, allow
 
         jobject inv = env->GetObjectField(player, m_fInventory);
         if (!inv) return false;
 
         jobject stack = env->CallObjectMethod(inv, m_mCurItem);
         if (env->ExceptionCheck()) { env->ExceptionClear(); return false; }
-        if (!stack) return false;
+        if (!stack) return false;                        // empty hand
 
-        if (!m_mGetItem) {
+        if (!m_mStackName) {
             jclass sc = env->GetObjectClass(stack);
-            m_mGetItem = JvmtiUtil::FindMethod(env, sc, { "func_77973_b", "getItem" }, 0);
+            m_mStackName = JvmtiUtil::FindMethod(env, sc,
+                { "func_77977_a", "getUnlocalizedName" }, 0);
             env->DeleteLocalRef(sc);
         }
-        if (!m_mGetItem) return false;
+        if (!m_mStackName) return true;                  // cannot tell, allow
 
-        jobject item = env->CallObjectMethod(stack, m_mGetItem);
+        jstring js = (jstring)env->CallObjectMethod(stack, m_mStackName);
         if (env->ExceptionCheck()) { env->ExceptionClear(); return false; }
-        if (!item) return false;
+        if (!js) return false;
 
-        return env->IsInstanceOf(item, m_itemSword) != 0;
+        const char* raw = env->GetStringUTFChars(js, nullptr);
+        bool isSword = false;
+        if (raw) {
+            char low[128];
+            size_t n = std::strlen(raw);
+            if (n > sizeof(low) - 1) n = sizeof(low) - 1;
+            for (size_t i = 0; i < n; i++)
+                low[i] = (char)std::tolower((unsigned char)raw[i]);
+            low[n] = '\0';
+            isSword = (std::strstr(low, "sword") != nullptr);
+            env->ReleaseStringUTFChars(js, raw);
+        }
+        env->DeleteLocalRef(js);
+        return isSword;
+    }
+
+    bool IsSwinging(JNIEnv* env, jobject ent) {
+        if (m_fSwinging) return env->GetBooleanField(ent, m_fSwinging) != 0;
+        if (m_fSwingProg) return env->GetFloatField(ent, m_fSwingProg) > 0.001f;
+        return false;
     }
 
     void SetBlock(JNIEnv* env, bool on) {
         if (m_blocking == on) return;
         KeyBinds::SetUseItem(env, on);
         m_blocking = on;
-    }
-
-    bool EnemyInRange(JNIEnv* env) {
-        if (!EntityList::Init(env)) return false;
-        return !EntityList::GetPlayers(env, m_predictRange).empty();
+        if (!on) m_blockHeldTicks = 0;
     }
 
 public:
     AutoBlockhit()
-        : Module("Auto Blockhit", "Sword block with near-total coverage",
+        : Module("Auto Blockhit", "Block around the enemy's swing, not always",
                  ModuleCategory::COMBAT, 0)
     {
         Bind("Mode", &m_mode);
+        Bind("Block Range", &m_blockRange);
+        Bind("Detect Range", &m_detectRange);
+        Bind("Lead", &m_leadMs);
+        Bind("Default Cycle", &m_defaultCycle);
+        Bind("Stale", &m_staleMs);
+        Bind("Reaction Min", &m_reactionMin);
+        Bind("Reaction Max", &m_reactionMax);
+        Bind("Swing Gap", &m_swingGap);
+        Bind("After Hit", &m_afterHit);
+        Bind("Max Block Ticks", &m_maxBlockTicks);
         Bind("Chance", &m_chance);
-        Bind("Block Ticks Min", &m_blockTicksMin);
-        Bind("Block Ticks Max", &m_blockTicksMax);
-        Bind("Only Sword", &m_onlySword);
-        Bind("Only While Moving", &m_onlyWhileMoving);
-        Bind("Hit Interval Min", &m_hitIntervalMin);
-        Bind("Hit Interval Max", &m_hitIntervalMax);
-        Bind("Coverage", &m_coverage);
-        Bind("Swing Gap", &m_swingGapTicks);
-        Bind("Micro Release", &m_microRelease);
-        Bind("Micro Chance", &m_microChance);
-        Bind("Micro Len Min", &m_microLenMin);
-        Bind("Micro Len Max", &m_microLenMax);
-        Bind("Predictive", &m_predictive);
-        Bind("Predict Range", &m_predictRange);
-        Bind("Hold Between Hits", &m_holdBetweenHits);
-        Bind("Reblock Delay Min", &m_reblockDelayMin);
-        Bind("Reblock Delay Max", &m_reblockDelayMax);
-        Bind("Vary Release Timing", &m_varyReleaseTiming);
+        Bind("Vary Timing", &m_varyTiming);
         Bind("Timing Noise", &m_timingNoise);
+        Bind("Only Sword", &m_onlySword);
         Bind("Pause On Flag", &m_pauseOnFlag);
         Bind("Flag Pause Ticks", &m_flagPauseTicks);
     }
 
     void OnTick(JNIEnv* env) override {
         if (!KeyBinds::Init(env)) return;
-        ResolveJNI(env);
+        Resolve(env);
 
         jobject player = Minecraft::GetPlayer(env);
         if (!player) return;
+
+        m_tick++;
 
         if (Minecraft::IsInGui(env)) { SetBlock(env, false); return; }
 
@@ -227,16 +275,11 @@ public:
             return;
         }
 
-        if (m_onlyWhileMoving && !KeyBinds::GetForward(env)) {
-            SetBlock(env, false);
-            return;
-        }
-
-        // Walking the inventory every tick is wasteful, and the held
+        // Walking the inventory every tick is wasteful and the held
         // item rarely changes mid-swing.
         if (--m_swordCheckTimer <= 0) {
             m_swordCached = CheckSword(env, player);
-            m_swordCheckTimer = 10;
+            m_swordCheckTimer = 6;
         }
         if (!m_swordCached) { SetBlock(env, false); return; }
 
@@ -244,78 +287,157 @@ public:
         if (m_blocking) m_ticksBlocked++;
         if (m_ticksTotal > 400) { m_ticksTotal /= 2; m_ticksBlocked /= 2; }
 
+        // ---- Our own swing frees the block ----
         bool lmb = (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0;
-        bool justClicked = lmb && !m_lastLMB;
+        bool weSwung = lmb && !m_lastLMB;
         m_lastLMB = lmb;
+        if (weSwung) {
+            SetBlock(env, false);
+            m_releaseLeft = m_swingGap;
+        }
 
-        // ---------------- PERFECT ----------------
-        if (m_mode == 4) {
-            if (justClicked) {
-                SetBlock(env, false);
-                m_unblockCountdown = Noisy(m_swingGapTicks);
-                if (m_unblockCountdown < 1) m_unblockCountdown = 1;
-                return;
-            }
-            if (m_unblockCountdown > 0) {
-                if (--m_unblockCountdown == 0)
-                    m_blockCountdown = Rand(m_reblockDelayMin, m_reblockDelayMax);
-                return;
-            }
-            if (m_blockCountdown > 0) { m_blockCountdown--; return; }
+        // ---- Their hit landed, so the block did its job ----
+        int hurt = Minecraft::GetHurtTime(env, player);
+        if (hurt > 0 && m_lastHurtTime == 0) {
+            SetBlock(env, false);
+            m_releaseLeft = m_afterHit;
+        }
+        m_lastHurtTime = hurt;
 
-            if (m_microRelease && m_blocking && Roll(m_microChance)) {
-                float actual = m_ticksTotal > 0
-                    ? (100.f * m_ticksBlocked / m_ticksTotal) : 0.f;
-                if (actual > m_coverage) {
-                    SetBlock(env, false);
-                    m_unblockCountdown = Rand(m_microLenMin, m_microLenMax);
-                    return;
-                }
-            }
+        // ---- Watch every nearby enemy ----
+        if (!EntityList::Init(env)) return;
+        auto ents = EntityList::GetPlayers(env, m_detectRange);
 
-            if (m_predictive && !m_blocking && EnemyInRange(env)) {
-                SetBlock(env, true);
-                return;
-            }
-            if (m_holdBetweenHits && !m_blocking && Roll(m_chance)) {
-                SetBlock(env, true);
-            }
+        if (ents.empty()) {
+            // Nobody near: this is the case the old build got wrong
+            SetBlock(env, false);
+            m_lastPredictMs = -1;
+            m_shownCycle = 0;
             return;
         }
 
-        // ---------------- LEGACY 0-3 ----------------
-        if (m_blocking) {
-            if (m_blockCountdown <= 0) SetBlock(env, false);
-            else { m_blockCountdown--; return; }
+        bool  anySwingingNow = false;
+        bool  anyInBlockRange = false;
+        long long soonest = -1;
+
+        for (auto& e : ents) {
+            if (!m_getEntityId) break;
+            jint id = env->CallIntMethod(e.ref, m_getEntityId);
+            if (env->ExceptionCheck()) { env->ExceptionClear(); continue; }
+
+            Enemy& en = m_enemies[(int)id];
+            en.lastSeen = m_tick;
+
+            bool swinging = IsSwinging(env, e.ref);
+
+            // Rising edge is the swing itself; holding the button
+            // keeps the flag up for several ticks after.
+            if (swinging && !en.wasSwinging) {
+                if (en.hasSwung) {
+                    long long gap = MsSince(en.lastSwing);
+                    // Ignore nonsense: double events, or a pause so
+                    // long it says nothing about their rhythm.
+                    if (gap >= 60 && gap <= 1200) {
+                        en.intervals.push_back(gap);
+                        if (en.intervals.size() > 8) en.intervals.pop_front();
+
+                        long long sum = 0;
+                        for (auto v : en.intervals) sum += v;
+                        en.avgInterval = sum / (long long)en.intervals.size();
+                    }
+                }
+                en.lastSwing = Clock::now();
+                en.hasSwung = true;
+            }
+            en.wasSwinging = swinging;
+
+            bool inRange = (e.distanceToPlayer <= m_blockRange);
+            if (inRange && swinging) anySwingingNow = true;
+            if (inRange) anyInBlockRange = true;
+
+            if (!inRange || !en.hasSwung) continue;
+
+            long long since = MsSince(en.lastSwing);
+
+            // Gone quiet: they have stopped attacking, so stop
+            // guessing at a rhythm that no longer exists.
+            if (since > m_staleMs) continue;
+
+            long long cycle = en.avgInterval > 0 ? en.avgInterval : m_defaultCycle;
+            long long until = cycle - (since % cycle);
+
+            if (soonest < 0 || until < soonest) {
+                soonest = until;
+                m_shownCycle = cycle;
+            }
         }
 
-        if (!justClicked) return;
-        m_hitCounter++;
+        // Forget anyone who walked away
+        for (auto it = m_enemies.begin(); it != m_enemies.end(); ) {
+            if (m_tick - it->second.lastSeen > 60) it = m_enemies.erase(it);
+            else ++it;
+        }
 
-        bool shouldBlock = false;
+        m_lastPredictMs = soonest;
+
+        // ---- Still inside a forced release ----
+        if (m_releaseLeft > 0) {
+            m_releaseLeft--;
+            SetBlock(env, false);
+            return;
+        }
+
+        // ---- Decide ----
+        bool want = false;
+
         switch (m_mode) {
-            case 0: shouldBlock = true; break;
-            case 1:
-                if (m_hitCounter >= m_nextBlockAt) {
-                    shouldBlock = true;
-                    m_hitCounter = 0;
-                    m_nextBlockAt = Rand(m_hitIntervalMin, m_hitIntervalMax);
+            case 1:   // Reactive: only while they are actually swinging
+                want = anySwingingNow;
+                break;
+
+            case 2:   // In Range: block whenever someone can reach us
+                want = anyInBlockRange;
+                break;
+
+            case 3:   // Swing Only: purely a sprint-reset aid
+                want = false;
+                break;
+
+            default: { // Predict
+                if (anySwingingNow) {
+                    want = true;         // already mid-swing, block now
+                } else if (soonest >= 0) {
+                    long long lead = Noisy(m_leadMs)
+                                   + Rand(m_reactionMin, m_reactionMax);
+                    want = (soonest <= lead);
                 }
                 break;
-            case 2: shouldBlock = true; break;
-            case 3: shouldBlock = EnemyInRange(env); break;
+            }
         }
 
-        if (!shouldBlock || !Roll(m_chance)) return;
+        // Holding forever is both a tell and pointless
+        if (want && m_blocking && m_blockHeldTicks >= m_maxBlockTicks) {
+            SetBlock(env, false);
+            m_releaseLeft = 2;
+            return;
+        }
 
-        m_blockCountdown = Noisy(Rand(m_blockTicksMin, m_blockTicksMax));
-        if (m_mode != 2) SetBlock(env, true);   // Fake never sends the block
+        if (want && !m_blocking) {
+            if (!Roll(m_chance)) return;   // occasionally miss one
+            SetBlock(env, true);
+        } else if (!want && m_blocking) {
+            SetBlock(env, false);
+        }
+
+        if (m_blocking) m_blockHeldTicks++;
     }
 
     void OnDisable(JNIEnv* env) override {
         SetBlock(env, false);
-        m_blockCountdown = 0;
-        m_unblockCountdown = 0;
+        m_releaseLeft = 0;
+        m_blockHeldTicks = 0;
+        m_enemies.clear();
+        m_lastPredictMs = -1;
     }
 
     void OnServerCorrection() {
@@ -323,63 +445,68 @@ public:
     }
 
     void RenderSettings() override {
-        const char* modes[] = { "Normal", "Timed", "Fake", "Smart", "Perfect" };
-        ImGui::Combo("Mode", &m_mode, modes, 5);
+        const char* modes[] = { "Predict", "Reactive", "In Range", "Swing Only" };
+        ImGui::Combo("Mode", &m_mode, modes, 4);
 
-        if (m_mode == 4) {
-            float actual = m_ticksTotal > 0
-                ? (100.f * m_ticksBlocked / m_ticksTotal) : 0.f;
-            ImGui::TextColored(ImVec4(0.4f, 1.f, 0.6f, 1.f), "Live coverage: %.1f%%", actual);
+        switch (m_mode) {
+            case 0: ImGui::TextDisabled("Learns their swing rhythm and blocks just before it."); break;
+            case 1: ImGui::TextDisabled("Blocks only while they are mid-swing."); break;
+            case 2: ImGui::TextDisabled("Blocks whenever anyone is in reach. Blunt."); break;
+            case 3: ImGui::TextDisabled("Never blocks on its own, only frees the key for your swings."); break;
+        }
 
-            ImGui::Separator();
-            ImGui::TextColored(ImVec4(1.f, 0.6f, 0.3f, 1.f), "Coverage");
-            ImGui::SliderFloat("Target Coverage", &m_coverage, 60.f, 99.f, "%.0f%%");
-            ImGui::SliderInt("Swing Gap (ticks)", &m_swingGapTicks, 1, 3);
-            ImGui::Checkbox("Hold Between Hits", &m_holdBetweenHits);
-            ImGui::SliderInt("Reblock Delay Min", &m_reblockDelayMin, 0, 4);
-            ImGui::SliderInt("Reblock Delay Max", &m_reblockDelayMax, 0, 5);
-            if (m_reblockDelayMin > m_reblockDelayMax) m_reblockDelayMin = m_reblockDelayMax;
-
-            ImGui::Separator();
-            ImGui::TextColored(ImVec4(0.5f, 0.8f, 1.f, 1.f), "Humanization");
-            ImGui::Checkbox("Micro Release", &m_microRelease);
-            if (m_microRelease) {
-                ImGui::SliderFloat("Micro Chance", &m_microChance, 1.f, 25.f, "%.0f%%");
-                ImGui::SliderInt("Micro Len Min", &m_microLenMin, 1, 4);
-                ImGui::SliderInt("Micro Len Max", &m_microLenMax, 1, 5);
-                if (m_microLenMin > m_microLenMax) m_microLenMin = m_microLenMax;
-            }
-            ImGui::Checkbox("Vary Release Timing", &m_varyReleaseTiming);
-            if (m_varyReleaseTiming)
-                ImGui::SliderFloat("Timing Noise", &m_timingNoise, 0.f, 60.f, "%.0f%%");
-
-            ImGui::Separator();
-            ImGui::Checkbox("Pre-Block On Approach", &m_predictive);
-            if (m_predictive)
-                ImGui::SliderFloat("Predict Range", &m_predictRange, 2.f, 6.f, "%.1f");
+        // Live state, which is the fastest way to see it working
+        ImGui::Separator();
+        if (m_lastPredictMs >= 0) {
+            ImGui::TextColored(ImVec4(0.3f, 0.8f, 1.f, 1.f),
+                "Next swing in ~%lld ms   (cycle %lld ms, %.1f CPS)",
+                m_lastPredictMs, m_shownCycle,
+                m_shownCycle > 0 ? 1000.0 / (double)m_shownCycle : 0.0);
         } else {
-            ImGui::SliderFloat("Chance", &m_chance, 10.f, 100.f, "%.0f%%");
-            ImGui::SliderInt("Block Ticks Min", &m_blockTicksMin, 1, 5);
-            ImGui::SliderInt("Block Ticks Max", &m_blockTicksMax, 1, 6);
-            if (m_blockTicksMin > m_blockTicksMax) m_blockTicksMin = m_blockTicksMax;
-            if (m_mode == 1) {
-                ImGui::SliderInt("Hit Interval Min", &m_hitIntervalMin, 1, 5);
-                ImGui::SliderInt("Hit Interval Max", &m_hitIntervalMax, 1, 6);
-                if (m_hitIntervalMin > m_hitIntervalMax) m_hitIntervalMin = m_hitIntervalMax;
-            }
-            if (m_mode == 3)
-                ImGui::SliderFloat("Predict Range", &m_predictRange, 2.f, 6.f, "%.1f");
+            ImGui::TextDisabled("No attacker tracked");
+        }
+        float cov = m_ticksTotal > 0 ? (100.f * m_ticksBlocked / m_ticksTotal) : 0.f;
+        ImGui::TextDisabled("Blocking %.0f%% of the time | %s",
+            cov, m_blocking ? "BLOCK" : "open");
+
+        ImGui::Separator();
+        ImGui::TextColored(ImVec4(1.f, 0.6f, 0.3f, 1.f), "Range");
+        ImGui::SliderFloat("Block Range", &m_blockRange, 2.f, 6.f, "%.1f");
+        ImGui::SliderFloat("Detect Range", &m_detectRange, 3.f, 10.f, "%.1f");
+
+        if (m_mode == 0) {
+            ImGui::Separator();
+            ImGui::TextColored(ImVec4(0.5f, 0.8f, 1.f, 1.f), "Prediction");
+            ImGui::SliderInt("Lead (ms)", &m_leadMs, 40, 300);
+            ImGui::SliderInt("Assumed Cycle (ms)", &m_defaultCycle, 100, 400);
+            ImGui::SliderInt("Stale After (ms)", &m_staleMs, 500, 3000);
+            ImGui::SliderInt("Reaction Min (ms)", &m_reactionMin, 0, 150);
+            ImGui::SliderInt("Reaction Max (ms)", &m_reactionMax, 0, 250);
+            if (m_reactionMin > m_reactionMax) m_reactionMin = m_reactionMax;
         }
 
         ImGui::Separator();
-        ImGui::Checkbox("Only Sword", &m_onlySword);
-        ImGui::Checkbox("Only While Moving", &m_onlyWhileMoving);
-        ImGui::Checkbox("Pause On Flag", &m_pauseOnFlag);
-        if (m_pauseOnFlag) ImGui::SliderInt("Flag Pause Ticks", &m_flagPauseTicks, 5, 60);
+        ImGui::TextColored(ImVec4(0.6f, 1.f, 0.7f, 1.f), "Release");
+        ImGui::SliderInt("Swing Gap (ticks)", &m_swingGap, 1, 4);
+        ImGui::SliderInt("After Hit (ticks)", &m_afterHit, 0, 6);
+        ImGui::SliderInt("Max Hold (ticks)", &m_maxBlockTicks, 10, 100);
 
-        if (m_onlySword && !m_itemSword) {
-            ImGui::TextColored(ImVec4(1.f, 0.8f, 0.3f, 1.f),
-                "ItemSword unresolved: sword check skipped");
+        ImGui::Separator();
+        ImGui::TextColored(ImVec4(1.f, 0.85f, 0.4f, 1.f), "Humanisation");
+        ImGui::SliderFloat("Chance", &m_chance, 50.f, 100.f, "%.0f%%");
+        ImGui::Checkbox("Vary Timing", &m_varyTiming);
+        if (m_varyTiming)
+            ImGui::SliderFloat("Timing Noise", &m_timingNoise, 0.f, 60.f, "%.0f%%");
+
+        ImGui::Separator();
+        ImGui::Checkbox("Only Sword", &m_onlySword);
+        ImGui::Checkbox("Pause On Flag", &m_pauseOnFlag);
+        if (m_pauseOnFlag)
+            ImGui::SliderInt("Flag Pause Ticks", &m_flagPauseTicks, 5, 60);
+
+        if (!m_fSwinging && !m_fSwingProg) {
+            ImGui::TextColored(ImVec4(1.f, 0.5f, 0.35f, 1.f),
+                "Swing field unresolved: prediction is blind, use In Range");
         }
         if (!KeyBinds::HasUseItem()) {
             ImGui::TextColored(ImVec4(1.f, 0.8f, 0.3f, 1.f),
