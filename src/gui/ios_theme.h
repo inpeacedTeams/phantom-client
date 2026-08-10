@@ -9,9 +9,22 @@
 // Colours, metrics and the animation store the widgets run on.
 //
 // The palette is the real iOS light system palette. Grouped grey
-// behind, white cards on top, blue for anything interactive, green
-// only for a switch that is on. Nothing else is coloured, which is
-// what makes an iOS screen feel calm.
+// behind, white cards on top, one accent for anything interactive,
+// green only for a switch that is on. Nothing else is coloured,
+// which is what makes an iOS screen feel calm.
+//
+// -----------------------------------------------------------------
+// WHY THESE ARE VARIABLES AND NOT CONSTANTS
+// -----------------------------------------------------------------
+// The Interface tab lets the user change the accent, the scale and
+// the corner radius at runtime. Every widget in the client already
+// reads Col::Blue and M::RowHeight, so the cheapest correct way to
+// make those settings real is to let UI::Apply() write into them
+// once, rather than thread a theme object through forty call sites.
+//
+// They are only ever written from the render thread, inside Apply,
+// and only ever read from the render thread while drawing. There is
+// no second writer, so no lock is needed.
 // =================================================================
 
 namespace iOS {
@@ -19,33 +32,37 @@ namespace iOS {
 // ---- Palette (iOS light) ----
 namespace Col {
     // Surfaces
-    inline const ImU32 GroupedBg   = IM_COL32(242, 242, 247, 255);  // behind cards
-    inline const ImU32 Card        = IM_COL32(255, 255, 255, 255);
-    inline const ImU32 CardPressed = IM_COL32(229, 229, 234, 255);
-    inline const ImU32 Fill        = IM_COL32(120, 120, 128, 51);   // track, chips
-    inline const ImU32 FillThick   = IM_COL32(120, 120, 128, 92);
-    inline const ImU32 Separator   = IM_COL32(198, 198, 200, 140);
+    inline ImU32 GroupedBg   = IM_COL32(242, 242, 247, 255);  // behind cards
+    inline ImU32 Card        = IM_COL32(255, 255, 255, 255);
+    inline ImU32 CardPressed = IM_COL32(229, 229, 234, 255);
+    inline ImU32 Fill        = IM_COL32(120, 120, 128, 51);   // track, chips
+    inline ImU32 FillThick   = IM_COL32(120, 120, 128, 92);
+    inline ImU32 Separator   = IM_COL32(198, 198, 200, 140);
 
     // Text
-    inline const ImU32 Label       = IM_COL32(0, 0, 0, 255);
-    inline const ImU32 Label2      = IM_COL32(60, 60, 67, 153);     // 60%
-    inline const ImU32 Label3      = IM_COL32(60, 60, 67, 76);      // 30%
-    inline const ImU32 OnAccent    = IM_COL32(255, 255, 255, 255);
+    inline ImU32 Label       = IM_COL32(0, 0, 0, 255);
+    inline ImU32 Label2      = IM_COL32(60, 60, 67, 153);     // 60%
+    inline ImU32 Label3      = IM_COL32(60, 60, 67, 76);      // 30%
+    inline ImU32 OnAccent    = IM_COL32(255, 255, 255, 255);
 
-    // Accents
-    inline const ImU32 Blue        = IM_COL32(0, 122, 255, 255);
-    inline const ImU32 BlueSoft    = IM_COL32(0, 122, 255, 38);
-    inline const ImU32 Green       = IM_COL32(52, 199, 89, 255);
-    inline const ImU32 Red         = IM_COL32(255, 59, 48, 255);
-    inline const ImU32 Orange      = IM_COL32(255, 149, 0, 255);
-    inline const ImU32 Yellow      = IM_COL32(255, 204, 0, 255);
-    inline const ImU32 Purple      = IM_COL32(175, 82, 222, 255);
-    inline const ImU32 Teal        = IM_COL32(48, 176, 199, 255);
-    inline const ImU32 Pink        = IM_COL32(255, 45, 85, 255);
+    // The accent. Written by UI::Apply, read everywhere. Named Blue
+    // because that is what it starts as and because renaming it
+    // would touch every file for no gain.
+    inline ImU32 Blue        = IM_COL32(0, 122, 255, 255);
+    inline ImU32 BlueSoft    = IM_COL32(0, 122, 255, 38);
+
+    // Fixed hues, never themed
+    inline const ImU32 Green  = IM_COL32(52, 199, 89, 255);
+    inline const ImU32 Red    = IM_COL32(255, 59, 48, 255);
+    inline const ImU32 Orange = IM_COL32(255, 149, 0, 255);
+    inline const ImU32 Yellow = IM_COL32(255, 204, 0, 255);
+    inline const ImU32 Purple = IM_COL32(175, 82, 222, 255);
+    inline const ImU32 Teal   = IM_COL32(48, 176, 199, 255);
+    inline const ImU32 Pink   = IM_COL32(255, 45, 85, 255);
 
     // Shadow, layered rather than blurred
-    inline const ImU32 Shadow1     = IM_COL32(0, 0, 0, 10);
-    inline const ImU32 Shadow2     = IM_COL32(0, 0, 0, 6);
+    inline const ImU32 Shadow1 = IM_COL32(0, 0, 0, 10);
+    inline const ImU32 Shadow2 = IM_COL32(0, 0, 0, 6);
 
     inline ImU32 Alpha(ImU32 c, float a) {
         ImVec4 v = ImGui::ColorConvertU32ToFloat4(c);
@@ -64,18 +81,154 @@ namespace Col {
     }
 }
 
-// ---- Metrics ----
+// =================================================================
+// Metrics
+// =================================================================
+// Base values are the real iOS numbers. The live values are those
+// multiplied by the user's scale, so a 1.2x menu is genuinely
+// bigger rather than just having bigger text in the same boxes.
+// =================================================================
 namespace M {
-    inline constexpr float CardRadius   = 12.0f;
-    inline constexpr float RowHeight    = 44.0f;   // the iOS row height
-    inline constexpr float RowPadX      = 16.0f;
-    inline constexpr float CardGap      = 22.0f;
-    inline constexpr float SwitchW      = 51.0f;   // exact iOS switch
-    inline constexpr float SwitchH      = 31.0f;
-    inline constexpr float SwitchKnob   = 27.0f;
-    inline constexpr float SegHeight    = 32.0f;
-    inline constexpr float SegRadius    = 8.0f;
+    inline constexpr float BaseCardRadius = 12.0f;
+    inline constexpr float BaseRowHeight  = 44.0f;   // the iOS row height
+    inline constexpr float BaseRowPadX    = 16.0f;
+    inline constexpr float BaseSwitchW    = 51.0f;   // exact iOS switch
+    inline constexpr float BaseSwitchH    = 31.0f;
+    inline constexpr float BaseSwitchKnob = 27.0f;
+    inline constexpr float BaseSegHeight  = 32.0f;
+    inline constexpr float BaseSegRadius  = 8.0f;
+    inline constexpr float BaseSheetRound = 20.0f;
+
+    inline float CardRadius = BaseCardRadius;
+    inline float RowHeight  = BaseRowHeight;
+    inline float RowPadX    = BaseRowPadX;
+    inline float SwitchW    = BaseSwitchW;
+    inline float SwitchH    = BaseSwitchH;
+    inline float SwitchKnob = BaseSwitchKnob;
+    inline float SegHeight  = BaseSegHeight;
+    inline float SegRadius  = BaseSegRadius;
+    inline float SheetRound = BaseSheetRound;
+    inline float CardGap    = 22.0f;
 }
+
+// =================================================================
+// Interface settings
+// =================================================================
+// Everything the user can change about the look of the client.
+//
+// WHAT IS DELIBERATELY NOT HERE
+//
+//   Real background blur. A gaussian blur needs the framebuffer
+//   read back into a texture and a shader pass. This overlay runs
+//   on imgui_impl_opengl2, the fixed-function backend, chosen
+//   because it cannot disturb the game's GL state. Faking blur by
+//   stacking translucent quads costs fill rate and looks like a
+//   smear. A clean dim plus a vignette reads better and is free, so
+//   the setting is honestly called Dim.
+//
+//   Interface sounds. There is no asset pipeline in a single
+//   injected DLL, and the alternative is PlaySound with a Windows
+//   system beep, which sounds like an error dialog and plays
+//   through the wrong device. A UI that clicks at you in a game
+//   with its own audio is worse than a silent one.
+// =================================================================
+struct UI {
+    // Layout
+    inline static float scale     = 1.00f;   // 0.85 - 1.35
+    inline static float animSpeed = 1.00f;   // 0.4 lazy, 2.0 snappy
+    inline static float roundness = 1.00f;   // multiplier on every radius
+
+    // Effects
+    inline static bool  glow        = true;
+    inline static float glowAmount  = 1.00f;
+    inline static bool  dim         = true;
+    inline static float dimAmount   = 0.42f;
+    inline static bool  vignette    = true;
+
+    // Behaviour
+    inline static bool  openAnimation = true;
+    inline static bool  hoverInfo     = true;   // description card on hover
+    inline static bool  rowNudge      = true;   // hovered row slides right
+
+    // Accent
+    inline static int   accent = 0;
+    inline static float accentCustom[4] = { 0.00f, 0.48f, 1.00f, 1.00f };
+
+    static constexpr int kAccentCount = 8;
+
+    static const char* const* AccentNames() {
+        static const char* names[kAccentCount] = {
+            "Blue", "Purple", "Pink", "Teal",
+            "Green", "Orange", "Red", "Custom"
+        };
+        return names;
+    }
+
+    static ImU32 AccentColor() {
+        switch (accent) {
+            case 1: return Col::Purple;
+            case 2: return Col::Pink;
+            case 3: return Col::Teal;
+            case 4: return Col::Green;
+            case 5: return Col::Orange;
+            case 6: return Col::Red;
+            case 7: return ImGui::ColorConvertFloat4ToU32(ImVec4(
+                        accentCustom[0], accentCustom[1],
+                        accentCustom[2], accentCustom[3]));
+            default: return IM_COL32(0, 122, 255, 255);
+        }
+    }
+
+    static float Clamp(float v, float lo, float hi) {
+        return v < lo ? lo : (v > hi ? hi : v);
+    }
+
+    // Push the settings into the palette and the metrics. Called
+    // once per frame before anything draws; it is a handful of
+    // multiplies, so there is no point tracking whether it changed.
+    static void Apply() {
+        scale     = Clamp(scale, 0.85f, 1.35f);
+        animSpeed = Clamp(animSpeed, 0.40f, 2.00f);
+        roundness = Clamp(roundness, 0.00f, 1.60f);
+
+        Col::Blue     = AccentColor();
+        Col::BlueSoft = Col::Alpha(Col::Blue, 0.15f);
+
+        const float s = scale;
+        const float r = scale * roundness;
+
+        M::RowHeight  = M::BaseRowHeight  * s;
+        M::RowPadX    = M::BaseRowPadX    * s;
+        M::SwitchW    = M::BaseSwitchW    * s;
+        M::SwitchH    = M::BaseSwitchH    * s;
+        M::SwitchKnob = M::BaseSwitchKnob * s;
+        M::SegHeight  = M::BaseSegHeight  * s;
+
+        M::CardRadius = M::BaseCardRadius * r;
+        M::SegRadius  = M::BaseSegRadius  * r;
+        M::SheetRound = M::BaseSheetRound * r;
+
+        // Text scales with everything else, or a 1.3x menu is just
+        // the same small type in roomier boxes.
+        ImGui::GetIO().FontGlobalScale = s;
+
+        ImGuiStyle& st = ImGui::GetStyle();
+        st.FrameRounding  = 9.0f * r;
+        st.ChildRounding  = M::CardRadius;
+        st.GrabRounding   = 10.0f * r;
+        st.PopupRounding  = 12.0f * r;
+        st.WindowRounding = M::SheetRound;
+    }
+
+    static void Reset() {
+        scale = animSpeed = roundness = 1.0f;
+        glow = dim = vignette = true;
+        glowAmount = 1.0f;
+        dimAmount = 0.42f;
+        openAnimation = hoverInfo = rowNudge = true;
+        accent = 0;
+    }
+};
 
 // =================================================================
 // Animation store
@@ -102,6 +255,8 @@ private:
 
 public:
     // Ease toward target. speed 10 is brisk, 18 snappy, 6 lazy.
+    // Scaled by the user's animation speed, which is the only place
+    // that setting needs to exist.
     static float To(ImGuiID id, float target, float speed = 14.0f) {
         ImGuiIO& io = ImGui::GetIO();
         Entry& e = s_store[id];
@@ -112,7 +267,10 @@ public:
         float dt = io.DeltaTime;
         if (dt > 0.1f) dt = 0.1f;             // survive a stall without a jump
 
-        e.value += (target - e.value) * (1.0f - std::exp(-speed * dt));
+        float sp = speed * UI::animSpeed;
+        if (sp < 0.5f) sp = 0.5f;
+
+        e.value += (target - e.value) * (1.0f - std::exp(-sp * dt));
 
         if (std::fabs(target - e.value) < 0.0005f) e.value = target;
         return e.value;
@@ -160,7 +318,7 @@ public:
 struct Fonts {
     inline static ImFont* Body     = nullptr;   // 17px, iOS body
     inline static ImFont* BodyBold = nullptr;
-    inline static ImFont* Title    = nullptr;   // 22px
+    inline static ImFont* Title    = nullptr;   // 24px
     inline static ImFont* Caption  = nullptr;   // 13px
     inline static ImFont* Mono     = nullptr;
 
@@ -209,13 +367,13 @@ struct Fonts {
 // =================================================================
 // Module settings panels still use stock ImGui widgets. Rather than
 // rewrite fifteen modules, the base style is pulled toward the same
-// language: rounded, roomy, blue accent, no borders.
+// language: rounded, roomy, accented, no borders.
 // =================================================================
 
 inline void ApplyStyle() {
     ImGuiStyle& s = ImGui::GetStyle();
 
-    s.WindowRounding    = 20.0f;
+    s.WindowRounding    = M::SheetRound;
     s.ChildRounding     = M::CardRadius;
     s.FrameRounding     = 9.0f;
     s.GrabRounding      = 10.0f;
