@@ -9,6 +9,7 @@
 #include "ios_theme.h"
 #include "ios_widgets.h"
 #include "ios_hud.h"
+#include "../mc/mouse_control.h"
 #include "../modules/module_manager.h"
 #include "../render/backtrack_vis.h"
 #include "../config/profiles.h"
@@ -23,6 +24,25 @@
 // Toggles and profile loads are queued to ModuleManager and applied
 // on the client thread where a valid JNIEnv exists.
 //
+// MOTION
+// Three things move, and all of them are frame-rate independent:
+//
+//   the sheet    fades and lifts into place on open
+//   the rows     arrive staggered when a tab changes, which is what
+//                makes switching feel like a screen transition
+//                rather than a redraw
+//   the switches ease, and their row's accent dot brightens with
+//                the module
+//
+// Nothing bounces or spins. The point is to make state changes
+// legible, not decorative.
+//
+// TWO LEVELS OF SETTINGS
+// A module's panel shows its mode and the two or three values worth
+// touching. Everything else is behind Advanced. The full set is
+// still bound, so profiles reach all of it; it just is not in your
+// face when you open a module to flip one switch.
+//
 // OPTIMISTIC SWITCHES
 // Because a toggle is queued, IsEnabled() still reads the old value
 // for up to one tick. Animating from that would make every switch
@@ -35,8 +55,13 @@ private:
     inline static int   s_tab  = 0;
     inline static float s_fade = 0.0f;
 
+    // Tab transition
+    inline static int   s_lastTab = -1;
+    inline static float s_tabAge  = 0.0f;
+
     inline static std::unordered_map<std::string, bool> s_pending;
     inline static std::unordered_map<std::string, bool> s_expanded;
+    inline static std::unordered_map<std::string, bool> s_advanced;
 
     static constexpr int kTabCount = 6;
     inline static const char* s_tabNames[kTabCount] = {
@@ -70,6 +95,24 @@ private:
         else                           out[0] = '\0';
     }
 
+    static float Clamp01(float v) {
+        return v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v);
+    }
+
+    // Decelerating ease. Fast at the start, settles softly, which is
+    // the curve iOS uses for anything entering the screen.
+    static float EaseOut(float t) {
+        float u = 1.0f - Clamp01(t);
+        return 1.0f - u * u * u;
+    }
+
+    // How far along is row `index` in the tab transition?
+    static float RowEntry(int index) {
+        const float step = 0.035f;   // gap between neighbouring rows
+        const float dur  = 0.24f;
+        return EaseOut((s_tabAge - step * (float)index) / dur);
+    }
+
     // The pending value if a toggle is in flight, else the real one
     static bool VisualState(Module* mod) {
         auto it = s_pending.find(mod->GetName());
@@ -83,18 +126,77 @@ private:
     }
 
     // ---------------------------------------------------------
+    // Advanced disclosure inside an open module
+    // ---------------------------------------------------------
+    static void AdvancedBlock(const std::shared_ptr<Module>& mod) {
+        if (!mod->HasAdvanced()) return;
+
+        bool& open = s_advanced[mod->GetName()];
+
+        ImGui::Dummy(ImVec2(0, 2));
+
+        float w = ImGui::GetContentRegionAvail().x;
+        float h = 30.0f;
+        ImVec2 p = ImGui::GetCursorScreenPos();
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+
+        ImGui::InvisibleButton("##adv", ImVec2(w, h));
+        if (ImGui::IsItemClicked()) open = !open;
+
+        float hov = iOS::Anim::To(ImGui::GetID("##advh"),
+                                  ImGui::IsItemHovered() ? 1.0f : 0.0f, 20.0f);
+        float rot = iOS::Anim::To(ImGui::GetID("##advr"), open ? 1.0f : 0.0f, 16.0f);
+
+        float cy = p.y + h * 0.5f;
+
+        // Chevron, pointing right when closed and down when open
+        {
+            float cx = p.x + 5.0f;
+            float ang = rot * 1.5707963f;
+            float ca = std::cos(ang), sa = std::sin(ang);
+            auto R = [&](float x, float y) {
+                return ImVec2(cx + (x * ca - y * sa), cy + (x * sa + y * ca));
+            };
+            ImU32 c = iOS::Col::Mix(iOS::Col::Label3, iOS::Col::Blue, hov);
+            dl->AddLine(R(-2.0f, -4.0f), R(2.0f, 0.0f), c, 1.7f);
+            dl->AddLine(R(2.0f, 0.0f), R(-2.0f, 4.0f), c, 1.7f);
+        }
+
+        iOS::Fonts::Push(iOS::Fonts::Caption);
+        ImVec2 ts = ImGui::CalcTextSize("Advanced");
+        dl->AddText(ImVec2(p.x + 16.0f, cy - ts.y * 0.5f),
+                    iOS::Col::Mix(iOS::Col::Label2, iOS::Col::Blue, hov),
+                    "Advanced");
+        iOS::Fonts::Pop(iOS::Fonts::Caption);
+
+        ImGui::SetCursorScreenPos(ImVec2(p.x, p.y + h));
+
+        if (iOS::BeginCollapsible("advbody", open)) {
+            mod->RenderAdvanced();
+            ImGui::Dummy(ImVec2(0, 4));
+            iOS::EndCollapsible();
+        }
+    }
+
+    // ---------------------------------------------------------
     // One module: switch, keybind chip, expandable settings
     // ---------------------------------------------------------
-    static void ModuleRow(const std::shared_ptr<Module>& mod, bool last) {
+    static void ModuleRow(const std::shared_ptr<Module>& mod, bool last,
+                          float entry)
+    {
         ImGui::PushID(mod.get());
 
         const std::string& name = mod->GetName();
         bool on = VisualState(mod.get());
         bool& expanded = s_expanded[name];
 
+        // Rows slide in from the right as a tab opens
+        float slide = (1.0f - entry) * 16.0f;
+
         float w = ImGui::GetContentRegionAvail().x;
         float h = iOS::M::RowHeight;
         ImVec2 p = ImGui::GetCursorScreenPos();
+        p.x += slide;
         ImDrawList* dl = ImGui::GetWindowDrawList();
 
         ImU32 accent = CategoryColor(mod->GetCategory());
@@ -104,25 +206,54 @@ private:
         ImGui::InvisibleButton("##expand", ImVec2(w - switchZone, h));
         bool expandClicked = ImGui::IsItemClicked();
         bool expandHeld    = ImGui::IsItemActive();
+        bool expandHover   = ImGui::IsItemHovered();
         if (expandClicked) expanded = !expanded;
 
+        // Hover is a whisper, press is a proper flash
+        float hovT = iOS::Anim::To(ImGui::GetID("##rh"),
+                                   expandHover ? 1.0f : 0.0f, 18.0f);
         float pressT = iOS::Anim::To(ImGui::GetID("##rp"),
                                      expandHeld ? 1.0f : 0.0f, 22.0f);
-        if (pressT > 0.01f) {
+        float wash = pressT > hovT * 0.35f ? pressT : hovT * 0.35f;
+        if (wash > 0.01f) {
             dl->AddRectFilled(p, ImVec2(p.x + w, p.y + h),
-                              iOS::Col::Alpha(iOS::Col::CardPressed, pressT));
+                              iOS::Col::Alpha(iOS::Col::CardPressed, wash * entry));
         }
 
         // Category dot brightens with the module
         float onT = iOS::Anim::To(ImGui::GetID("##dot"), on ? 1.0f : 0.0f, 14.0f);
         float dotX = p.x + iOS::M::RowPadX + 4.0f;
         float cy = p.y + h * 0.5f;
+
+        // A soft halo while it is on, so an active module reads from
+        // across the panel without shouting
+        if (onT > 0.02f) {
+            dl->AddCircleFilled(ImVec2(dotX, cy), 4.0f + 4.0f * onT,
+                                iOS::Col::Alpha(accent, 0.18f * onT * entry), 16);
+        }
         dl->AddCircleFilled(ImVec2(dotX, cy), 4.0f,
-                            iOS::Col::Alpha(accent, 0.28f + 0.72f * onT), 14);
+            iOS::Col::Alpha(accent, (0.28f + 0.72f * onT) * entry), 14);
 
         float textX = dotX + 14.0f;
-        ImVec2 ts = ImGui::CalcTextSize(name.c_str());
-        dl->AddText(ImVec2(textX, cy - ts.y * 0.5f), iOS::Col::Label, name.c_str());
+
+        // A live status line, if the module has one, sits under the
+        // name so you can read what it is doing without opening it.
+        const char* status = on ? mod->StatusLine() : nullptr;
+
+        if (status && status[0]) {
+            ImVec2 ns = ImGui::CalcTextSize(name.c_str());
+            dl->AddText(ImVec2(textX, cy - ns.y + 1.0f),
+                        iOS::Col::Alpha(iOS::Col::Label, entry), name.c_str());
+
+            iOS::Fonts::Push(iOS::Fonts::Caption);
+            dl->AddText(ImVec2(textX, cy + 2.0f),
+                        iOS::Col::Alpha(accent, 0.85f * entry), status);
+            iOS::Fonts::Pop(iOS::Fonts::Caption);
+        } else {
+            ImVec2 ts = ImGui::CalcTextSize(name.c_str());
+            dl->AddText(ImVec2(textX, cy - ts.y * 0.5f),
+                        iOS::Col::Alpha(iOS::Col::Label, entry), name.c_str());
+        }
 
         // Chevron rotates as the row opens
         float openT = iOS::Anim::To(ImGui::GetID("##ch"), expanded ? 1.0f : 0.0f, 16.0f);
@@ -133,8 +264,10 @@ private:
             auto rot = [&](float x, float y) {
                 return ImVec2(cx + (x * ca - y * sa), cy + (x * sa + y * ca));
             };
-            dl->AddLine(rot(-2.5f, -4.5f), rot(2.0f, 0.0f), iOS::Col::Label3, 1.8f);
-            dl->AddLine(rot(2.0f, 0.0f), rot(-2.5f, 4.5f), iOS::Col::Label3, 1.8f);
+            ImU32 c = iOS::Col::Alpha(
+                iOS::Col::Mix(iOS::Col::Label3, iOS::Col::Label2, hovT), entry);
+            dl->AddLine(rot(-2.5f, -4.5f), rot(2.0f, 0.0f), c, 1.8f);
+            dl->AddLine(rot(2.0f, 0.0f), rot(-2.5f, 4.5f), c, 1.8f);
         }
 
         // Keybind chip
@@ -149,9 +282,9 @@ private:
                 float bx = p.x + w - switchZone - 24.0f - bw;
                 float by = cy - 10.0f;
                 dl->AddRectFilled(ImVec2(bx, by), ImVec2(bx + bw, by + 20.0f),
-                                  iOS::Col::Fill, 6.0f);
+                                  iOS::Col::Alpha(iOS::Col::Fill, entry), 6.0f);
                 dl->AddText(ImVec2(bx + 6.0f, by + (20.0f - bs.y) * 0.5f),
-                            iOS::Col::Label2, kb);
+                            iOS::Col::Alpha(iOS::Col::Label2, entry), kb);
                 iOS::Fonts::Pop(iOS::Fonts::Caption);
             }
         }
@@ -165,7 +298,7 @@ private:
             ModuleManager::QueueToggle(mod.get());
         }
 
-        ImGui::SetCursorScreenPos(ImVec2(p.x, p.y + h));
+        ImGui::SetCursorScreenPos(ImVec2(p.x - slide, p.y + h));
 
         // ---- Settings, animated open ----
         // EndCollapsible only balances a Begin that returned true.
@@ -187,10 +320,13 @@ private:
                 ImGui::Dummy(ImVec2(0, 4));
             }
 
-            // Modules still draw stock ImGui controls. The base style
-            // was pulled toward the same language so they do not look
-            // pasted in from another program.
+            // The everyday controls. Modules still draw stock ImGui
+            // widgets; the base style was pulled toward the same
+            // language so they do not look pasted in.
             mod->RenderSettings();
+
+            // Everything else, folded away
+            AdvancedBlock(mod);
 
             ImGui::PopItemWidth();
             ImGui::Unindent(iOS::M::RowPadX);
@@ -228,7 +364,7 @@ private:
 
         iOS::BeginCard();
         for (size_t i = 0; i < mods.size(); i++)
-            ModuleRow(mods[i], i + 1 == mods.size());
+            ModuleRow(mods[i], i + 1 == mods.size(), RowEntry((int)i));
         iOS::EndCard();
 
         ImGui::Dummy(ImVec2(0, 6));
@@ -286,7 +422,7 @@ private:
 
         iOS::SectionHeader("About");
         iOS::BeginCard();
-        iOS::ValueRow("Version", "2.4.1");
+        iOS::ValueRow("Version", "2.5.0");
         iOS::RowSeparator();
         iOS::ValueRow("Target", "Lunar 1.8.9");
         iOS::RowSeparator();
@@ -295,9 +431,12 @@ private:
             snprintf(buf, sizeof(buf), "%d", ModuleManager::GetModuleCount());
             iOS::ValueRow("Modules", buf);
         }
+        iOS::RowSeparator();
+        iOS::ValueRow("Cursor",
+            MouseControl::IsUsable() ? "Released by the game" : "Software fallback");
         iOS::EndCard();
 
-        iOS::Footnote("INSERT opens this menu. DELETE ejects the client.");
+        iOS::Footnote("INSERT opens this menu, ESC closes it. DELETE ejects.");
         ImGui::Dummy(ImVec2(0, 10));
     }
 
@@ -329,16 +468,21 @@ private:
         int active = 0;
         for (auto& m : ModuleManager::GetModules()) if (m->IsEnabled()) active++;
 
+        // The count pill eases between values rather than jumping,
+        // so toggling something reads as one continuous change.
+        float shownActive = iOS::Anim::ToStr("activeCount", (float)active, 12.0f);
+
         char cnt[32];
-        snprintf(cnt, sizeof(cnt), "%d active", active);
+        snprintf(cnt, sizeof(cnt), "%d active", (int)(shownActive + 0.5f));
         iOS::Fonts::Push(iOS::Fonts::Caption);
         ImVec2 cs = ImGui::CalcTextSize(cnt);
         float bw = cs.x + 18.0f;
         float bx = p.x + width - 20.0f - bw;
+        float lit = Clamp01(shownActive);
         dl->AddRectFilled(ImVec2(bx, iy + 5.0f), ImVec2(bx + bw, iy + 25.0f),
-                          active ? iOS::Col::BlueSoft : iOS::Col::Fill, 10.0f);
+                          iOS::Col::Mix(iOS::Col::Fill, iOS::Col::BlueSoft, lit), 10.0f);
         dl->AddText(ImVec2(bx + 9.0f, iy + 5.0f + (20.0f - cs.y) * 0.5f),
-                    active ? iOS::Col::Blue : iOS::Col::Label2, cnt);
+                    iOS::Col::Mix(iOS::Col::Label2, iOS::Col::Blue, lit), cnt);
         iOS::Fonts::Pop(iOS::Fonts::Caption);
 
         ImGui::SetCursorScreenPos(ImVec2(p.x + 16.0f, p.y + 56.0f));
@@ -360,7 +504,21 @@ public:
     // rather than a cut.
     static void Render(bool open) {
         s_fade = iOS::Anim::ToStr("menuFade", open ? 1.0f : 0.0f, 16.0f);
-        if (s_fade < 0.004f) return;
+        if (s_fade < 0.004f) {
+            s_tabAge = 0.0f;      // next open replays the entry
+            s_lastTab = -1;
+            return;
+        }
+
+        // Tab transition clock. Reset on a change, then run forward.
+        float dt = ImGui::GetIO().DeltaTime;
+        if (dt > 0.1f) dt = 0.1f;
+        if (s_tab != s_lastTab) {
+            s_lastTab = s_tab;
+            s_tabAge = 0.0f;
+        } else if (s_tabAge < 3.0f) {
+            s_tabAge += dt;
+        }
 
         ImGui::SetNextWindowSize(ImVec2(470, 560), ImGuiCond_FirstUseEver);
         ImGui::SetNextWindowPos(ImVec2(120, 90), ImGuiCond_FirstUseEver);
@@ -387,10 +545,13 @@ public:
             ImVec2 ws = ImGui::GetWindowSize();
             ImDrawList* dl = ImGui::GetWindowDrawList();
 
-            // Sheet: shadow, then the grouped grey ground
-            dl->AddRectFilled(ImVec2(wp.x + 2.0f, wp.y + 6.0f),
-                              ImVec2(wp.x + ws.x + 2.0f, wp.y + ws.y + 8.0f),
-                              IM_COL32(0, 0, 0, (int)(46 * s_fade)), 22.0f);
+            // Sheet: shadow, then the grouped grey ground. The shadow
+            // grows with the fade, so the panel reads as lifting off
+            // the game rather than being switched on.
+            float lift = s_fade;
+            dl->AddRectFilled(ImVec2(wp.x + 2.0f, wp.y + 4.0f + 4.0f * lift),
+                              ImVec2(wp.x + ws.x + 2.0f, wp.y + ws.y + 4.0f + 6.0f * lift),
+                              IM_COL32(0, 0, 0, (int)(52 * s_fade)), 22.0f);
             dl->AddRectFilled(wp, ImVec2(wp.x + ws.x, wp.y + ws.y),
                               iOS::Col::GroupedBg, 20.0f);
 
@@ -399,6 +560,10 @@ public:
             ImGui::BeginChild("##scroll", ImVec2(0, 0),
                               ImGuiChildFlags_None,
                               ImGuiWindowFlags_NoBackground);
+
+            // Content lifts into place behind the header
+            ImGui::Dummy(ImVec2(0, (1.0f - EaseOut(s_fade)) * 14.0f));
+
             ImGui::Indent(16.0f);
             ImGui::PushItemWidth(ImGui::GetContentRegionAvail().x - 32.0f);
 
