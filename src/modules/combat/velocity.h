@@ -38,6 +38,11 @@
 // Both drive KeyBinds rather than motion fields, because writing
 // moveStrafing directly does nothing: the movement code recomputes
 // it from the keys every tick.
+//
+// NOTE: do not name anything in here 'near' or 'far'. windef.h
+// still defines both as empty macros for 16-bit compatibility, so
+// a local called 'near' silently expands to nothing and the parse
+// falls apart several lines later.
 // =================================================================
 
 class Velocity : public Module {
@@ -94,6 +99,7 @@ private:
         std::uniform_int_distribution<int> d(lo, hi);
         return d(m_rng);
     }
+    bool CoinFlip() { return (m_rng() % 2) == 0; }
 
     bool IsLegit() const    { return m_mode >= 3; }
     bool UsesJump() const   { return m_mode == 3 || m_mode == 5; }
@@ -112,22 +118,27 @@ private:
         m_jumpHeld = false;
     }
 
-    // Which side is the attacker on? Positive cross product means
-    // they are to our right, so we strafe right to close on them.
+    // Which side is the attacker on? A positive 2D cross product of
+    // our facing against the direction to them means they are to
+    // our left, so we strafe left to close in.
+    //
     // Guessing at random, as the old build did, was a coin flip
     // between closing the gap and doubling the knockback.
     bool AttackerOnLeft(JNIEnv* env, jobject player) {
-        if (!EntityList::Init(env)) return (m_rng() % 2) == 0;
+        if (!EntityList::Init(env)) return CoinFlip();
 
         auto ents = EntityList::GetPlayers(env, 6.0f);
-        if (ents.empty()) return (m_rng() % 2) == 0;
+        if (ents.empty()) return CoinFlip();
 
-        const EntityInfo* near = nullptr;
+        const EntityInfo* closest = nullptr;
         double best = 1e9;
         for (auto& e : ents) {
-            if (e.distanceToPlayer < best) { best = e.distanceToPlayer; near = &e; }
+            if (e.distanceToPlayer < best) {
+                best = e.distanceToPlayer;
+                closest = &e;
+            }
         }
-        if (!near) return (m_rng() % 2) == 0;
+        if (!closest) return CoinFlip();
 
         double px = Minecraft::GetPosX(env, player);
         double pz = Minecraft::GetPosZ(env, player);
@@ -137,10 +148,9 @@ private:
         double fx = -std::sin(yaw * DEG);
         double fz =  std::cos(yaw * DEG);
 
-        double dx = near->posX - px;
-        double dz = near->posZ - pz;
+        double dx = closest->posX - px;
+        double dz = closest->posZ - pz;
 
-        // 2D cross product of facing against the direction to them
         double cross = fx * dz - fz * dx;
         return cross > 0.0;   // they are to our left
     }
@@ -236,7 +246,7 @@ public:
                 m_pendingStrafe = true;
                 m_strafeLeft = m_strafeToward
                              ? AttackerOnLeft(env, player)
-                             : ((m_rng() % 2) == 0);
+                             : CoinFlip();
                 m_lastSide = m_strafeLeft ? "left" : "right";
             }
         }
@@ -254,8 +264,7 @@ public:
                            || KeyBinds::GetLeft(env)
                            || KeyBinds::GetRight(env);
 
-                bool ok = (!m_jumpOnlyGround || onGround)
-                       && (!m_jumpOnlyMoving || moving)
+                bool ok = (!m_jumpOnlyMoving || moving)
                        && onGround;   // a mid-air jump does nothing
 
                 if (ok) {
@@ -333,8 +342,9 @@ public:
             ImGui::SliderInt("Delay Max", &m_jumpDelayMax, 0, 5);
             if (m_jumpDelayMin > m_jumpDelayMax) m_jumpDelayMin = m_jumpDelayMax;
             ImGui::SliderInt("Hits Until Jump", &m_hitsUntilJump, 1, 5);
-            ImGui::Checkbox("Only On Ground", &m_jumpOnlyGround);
             ImGui::Checkbox("Only While Moving", &m_jumpOnlyMoving);
+            ImGui::TextDisabled("Always requires ground contact: a mid-air "
+                                "reset does nothing.");
             ImGui::Spacing();
         }
 
