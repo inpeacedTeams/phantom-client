@@ -45,7 +45,9 @@
 // 5. IT HAD ITS OWN COLOUR.
 //    A private RGBA picker, so the client could have a green accent
 //    and blue boxes. It draws in the client accent now: one colour
-//    setting, in one place, for the whole product.
+//    setting, in one place, for the whole product. The optional
+//    Custom Colour below is a deliberate, opt-in override of that
+//    default, not a return to every module owning a private colour.
 //
 // THREADING
 // OnTick runs on the client thread and publishes plain data under a
@@ -81,6 +83,13 @@ private:
     float m_fadeSpeed     = 12.0f;
     bool  m_shadowText    = true;
 
+    // Optional fixed colour. Off by default, which keeps ESP drawing
+    // in the client accent as designed; on, it is the Slinky-style
+    // target-colour override. RGBA, 0..1, so it binds straight to a
+    // Colour setting.
+    bool  m_customColor    = false;
+    float m_boxColor[4]    = { 0.00f, 0.48f, 1.00f, 1.00f };
+
     // ---- Published by the client thread ----
     std::vector<EntitySnapshot> m_shared;
     std::mutex m_mutex;
@@ -114,11 +123,19 @@ private:
         return cur + (target - cur) * (1.0f - std::exp(-speed * dt));
     }
 
-    // The client accent, so changing it in the UI tab changes the
-    // boxes too.
+    // The colour the boxes draw in: the client accent by default, or
+    // the module's own colour when Custom Colour is on. Alpha is the
+    // Opacity slider, multiplied by the custom colour's own alpha so
+    // the picker's alpha bar still means something.
     ImVec4 Base() const {
-        ImVec4 c = ImGui::ColorConvertU32ToFloat4(iOS::UI::AccentColor());
-        c.w = m_opacity;
+        ImVec4 c;
+        if (m_customColor) {
+            c = ImVec4(m_boxColor[0], m_boxColor[1], m_boxColor[2], m_boxColor[3]);
+            c.w *= m_opacity;
+        } else {
+            c = ImGui::ColorConvertU32ToFloat4(iOS::UI::AccentColor());
+            c.w = m_opacity;
+        }
         return c;
     }
 
@@ -194,6 +211,18 @@ public:
         Bind("Colour By Health", &m_healthColor,
              "Tint the box green through red instead of using the accent")
             .Advanced();
+
+        // Opt-in fixed colour. Bound after Colour By Health so the
+        // swatch sits with the other colour controls, and gated on
+        // its own toggle so the picker only appears when it is on.
+        Bind("Custom Colour", &m_customColor,
+             "Use a fixed colour instead of the client accent. Off keeps "
+             "the boxes tied to the UI accent.")
+            .Advanced();
+
+        BindColor("Box Colour", m_boxColor,
+                  "Only used while Custom Colour is on")
+            .When("Custom Colour", 1).Advanced();
 
         Bind("Fade With Distance", &m_distanceFade,
              "Distant players draw fainter, so a crowded map stays readable")
@@ -284,9 +313,15 @@ public:
                     "client on a recording.";
             return NoticeLevel::Warning;
         }
-        snprintf(m_notice, sizeof(m_notice),
-                 "Drawing in the client accent, so the UI tab changes these "
-                 "boxes too.");
+        if (m_customColor) {
+            snprintf(m_notice, sizeof(m_notice),
+                     "Using a fixed custom colour. Turn off Custom Colour to "
+                     "tie the boxes back to the UI accent.");
+        } else {
+            snprintf(m_notice, sizeof(m_notice),
+                     "Drawing in the client accent, so the UI tab changes "
+                     "these boxes too.");
+        }
         *text = m_notice;
         return NoticeLevel::Info;
     }
