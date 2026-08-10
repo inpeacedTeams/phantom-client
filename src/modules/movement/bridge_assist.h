@@ -42,16 +42,15 @@
 
 class BridgeAssist : public Module {
 private:
+    // ---- Core ----
     int   m_mode         = 0;
     bool  m_onlyBackward = true;
-    bool  m_onlyOnGround = true;
 
-    // How far ahead to look, in blocks. Roughly one tick of
-    // movement at sprint speed.
-    float m_lookAhead    = 0.34f;
+    // ---- Advanced ----
+    bool  m_onlyOnGround = true;
+    float m_lookAhead    = 0.34f;  // roughly one tick at sprint speed
     bool  m_useWorld     = true;   // real block test when available
     float m_edgeFallback = 0.28f;  // fractional test if it is not
-
     int   m_sneakTicks   = 2;
     int   m_unsneakTicks = 1;
     int   m_holdTicks    = 2;      // stay down briefly after clearing
@@ -241,12 +240,13 @@ public:
         m_why = "off";
     }
 
-    void RenderSettings() override {
-        ImGui::TextColored(m_sneaking ? ImVec4(0.2f, 0.8f, 0.4f, 1.f)
-                                      : ImVec4(0.55f, 0.55f, 0.6f, 1.f),
-            "%s  (%s)", m_sneaking ? "SNEAKING" : "upright", m_why);
+    const char* StatusLine() const override {
+        return m_sneaking ? "sneaking" : nullptr;
+    }
 
-        ImGui::Separator();
+    bool HasAdvanced() const override { return true; }
+
+    void RenderSettings() override {
         const char* modes[] = { "Eagle", "Godbridge", "Breezily", "Safewalk" };
         ImGui::Combo("Mode", &m_mode, modes, 4);
         switch (m_mode) {
@@ -256,22 +256,35 @@ public:
             case 3: ImGui::TextDisabled("Never step off an edge, in any direction."); break;
         }
 
-        ImGui::Separator();
-        ImGui::TextColored(ImVec4(1.f, 0.6f, 0.3f, 1.f), "Detection");
+        if (m_mode != 3)
+            ImGui::Checkbox("Only While Walking Backwards", &m_onlyBackward);
+
+        if (m_useWorld && !m_worldOk) {
+            ImGui::TextColored(ImVec4(1.f, 0.7f, 0.3f, 1.f),
+                "World unresolved: falling back to a coarse edge guess");
+        }
+        if (!KeyBinds::HasSneak()) {
+            ImGui::TextColored(ImVec4(1.f, 0.8f, 0.3f, 1.f),
+                "Sneak keybind unresolved: module inactive");
+        }
+    }
+
+    void RenderAdvanced() override {
+        ImGui::TextDisabled("%s  ·  %s", m_sneaking ? "SNEAKING" : "upright", m_why);
+
+        ImGui::SeparatorText("Detection");
         ImGui::Checkbox("Use Block Lookup", &m_useWorld);
         if (m_useWorld) {
-            ImGui::TextColored(m_worldOk ? ImVec4(0.3f, 0.8f, 0.4f, 1.f)
-                                         : ImVec4(1.f, 0.7f, 0.3f, 1.f),
-                m_worldOk ? "World readable: real edge detection"
-                          : "World unresolved: using the fractional guess");
+            ImGui::TextDisabled(m_worldOk
+                ? "World readable: real edge detection"
+                : "World unresolved: using the fractional guess");
         }
         ImGui::SliderFloat("Look Ahead", &m_lookAhead, 0.1f, 0.7f, "%.2f blocks");
         ImGui::TextDisabled("Roughly one tick of movement at sprint speed.");
         if (!m_useWorld || !m_worldOk)
             ImGui::SliderFloat("Edge Fallback", &m_edgeFallback, 0.05f, 0.49f, "%.2f");
 
-        ImGui::Separator();
-        ImGui::TextColored(ImVec4(0.5f, 0.8f, 1.f, 1.f), "Timing");
+        ImGui::SeparatorText("Timing");
         ImGui::SliderInt("Hold Ticks", &m_holdTicks, 0, 6);
         ImGui::TextDisabled("Stays down briefly after the ground returns.");
         if (m_mode == 1) {
@@ -279,13 +292,6 @@ public:
             ImGui::SliderInt("Unsneak Ticks", &m_unsneakTicks, 1, 3);
         }
 
-        ImGui::Separator();
-        ImGui::Checkbox("Only Backward", &m_onlyBackward);
         ImGui::Checkbox("Only On Ground", &m_onlyOnGround);
-
-        if (!KeyBinds::HasSneak()) {
-            ImGui::TextColored(ImVec4(1.f, 0.8f, 0.3f, 1.f),
-                "Sneak keybind unresolved: module inactive");
-        }
     }
 };
