@@ -2,7 +2,7 @@
 #include <imgui.h>
 #include <string>
 #include <vector>
-#include <utility>
+#include <algorithm>
 #include <unordered_map>
 #include <cmath>
 #include <cstdio>
@@ -12,7 +12,7 @@
 #include "../modules/module_manager.h"
 
 // =================================================================
-// iOS HUD
+// HUD
 // =================================================================
 // Drawn straight onto the foreground draw list rather than through
 // ImGui windows, because a window brings padding, a background and
@@ -20,17 +20,40 @@
 //
 // The look is iOS notification cards: translucent white over the
 // game, generous rounding, one hairline of light along the top edge
-// to suggest thickness. No real blur, since that would mean a
-// framebuffer grab every frame for a decorative effect.
+// to suggest thickness.
 //
-// Everything animates in and out. A module switched off slides its
-// pill toward the edge and fades, and only leaves the list once it
-// has finished going.
+// WHAT IS ON IT
+//   Watermark   the client name and your frame rate
+//   Module list what is currently running
+//
+// There used to be a third card that said "ESP: Tracking players"
+// whenever the ESP was on. It carried no information the module
+// list did not already give you, and a panel that exists to state
+// the obvious is worse than empty space, so it is gone.
+//
+// ANIMATION
+// Every pill owns its position and opacity. A module switched off
+// slides toward the edge and fades, and only leaves the list once
+// it has finished going, so nothing ever pops.
 // =================================================================
 
 namespace iOS {
 
 class HUD {
+public:
+    // Public so ConfigStore can persist them. A HUD you have to
+    // rearrange after every inject is not a HUD anyone leaves on.
+    inline static bool watermark = true;
+    inline static bool moduleList = true;
+    inline static bool showFps = true;
+    inline static int  corner = 1;          // 0 TL, 1 TR, 2 BL, 3 BR
+
+    static void Reset() {
+        watermark = moduleList = showFps = true;
+        corner = 1;
+        s_pills.clear();
+    }
+
 private:
     struct Pill {
         float anim = 0.0f;      // 0 hidden, 1 fully in
@@ -41,14 +64,16 @@ private:
     };
 
     inline static std::unordered_map<std::string, Pill> s_pills;
-
-    // ---- Settings ----
-    inline static bool  s_watermark  = true;
-    inline static bool  s_arraylist  = true;
-    inline static bool  s_targetCard = false;
-    inline static int   s_corner     = 1;   // 0 TL, 1 TR, 2 BL, 3 BR
-
     inline static float s_fps = 0.0f;
+
+    // Reused between frames rather than rebuilt, which is the
+    // difference between two allocations a frame and none.
+    struct Item {
+        const std::string* name;
+        ImU32 color;
+        float width;
+    };
+    inline static std::vector<Item> s_items;
 
     static ImU32 CategoryColor(ModuleCategory c) {
         switch (c) {
@@ -117,11 +142,11 @@ private:
     static float DrawWatermark(ImDrawList* dl, float x, float y, bool rightAlign) {
         ImGuiIO& io = ImGui::GetIO();
 
-        // Smoothed, or the number is a blur of digits
+        // Smoothed, or the number is an unreadable blur of digits
         s_fps += (io.Framerate - s_fps) * 0.06f;
 
-        char fps[24];
-        snprintf(fps, sizeof(fps), "%.0f FPS", s_fps);
+        char fps[24] = {};
+        if (showFps) snprintf(fps, sizeof(fps), "%.0f FPS", s_fps);
 
         const char* name = "Phantom";
 
@@ -129,11 +154,14 @@ private:
         ImVec2 ns = ImGui::CalcTextSize(name);
         Fonts::Pop(Fonts::BodyBold);
 
-        Fonts::Push(Fonts::Caption);
-        ImVec2 fs = ImGui::CalcTextSize(fps);
-        Fonts::Pop(Fonts::Caption);
+        ImVec2 fs(0, 0);
+        if (showFps) {
+            Fonts::Push(Fonts::Caption);
+            fs = ImGui::CalcTextSize(fps);
+            Fonts::Pop(Fonts::Caption);
+        }
 
-        float padX = 14.0f, padY = 9.0f, gap = 14.0f;
+        float padX = 14.0f, padY = 9.0f, gap = showFps ? 14.0f : 0.0f;
         float w = padX * 2.0f + 8.0f + ns.x + gap + fs.x;
         float h = padY * 2.0f + ns.y;
 
@@ -152,10 +180,12 @@ private:
                     Col::Label, name);
         Fonts::Pop(Fonts::BodyBold);
 
-        Fonts::Push(Fonts::Caption);
-        dl->AddText(ImVec2(b.x - padX - fs.x, cy - fs.y * 0.5f),
-                    Col::Label2, fps);
-        Fonts::Pop(Fonts::Caption);
+        if (showFps) {
+            Fonts::Push(Fonts::Caption);
+            dl->AddText(ImVec2(b.x - padX - fs.x, cy - fs.y * 0.5f),
+                        Col::Label2, fps);
+            Fonts::Pop(Fonts::Caption);
+        }
 
         return h;
     }
@@ -163,44 +193,38 @@ private:
     // ---------------------------------------------------------
     // Module pills
     // ---------------------------------------------------------
-    static void DrawArrayList(ImDrawList* dl, float anchorX, float startY,
-                              bool rightAlign, bool upward)
+    static void DrawModuleList(ImDrawList* dl, float anchorX, float startY,
+                               bool rightAlign, bool upward)
     {
         for (auto& kv : s_pills) kv.second.seen = false;
 
-        struct Item {
-            std::string name;
-            ImU32 color;
-            float width;
-        };
-        std::vector<Item> items;
+        s_items.clear();
 
         Fonts::Push(Fonts::Body);
         for (auto& mod : ModuleManager::GetModules()) {
             if (!mod->IsEnabled()) continue;
             Item it;
-            it.name  = mod->GetName();
+            it.name  = &mod->GetName();
             it.color = CategoryColor(mod->GetCategory());
-            it.width = ImGui::CalcTextSize(it.name.c_str()).x;
-            items.push_back(std::move(it));
+            it.width = ImGui::CalcTextSize(it.name->c_str()).x;
+            s_items.push_back(it);
         }
         float lineH = ImGui::GetTextLineHeight();
         Fonts::Pop(Fonts::Body);
 
         // Widest first reads as a deliberate shape rather than a
-        // ragged column.
-        for (size_t i = 0; i < items.size(); i++)
-            for (size_t j = i + 1; j < items.size(); j++)
-                if (items[j].width > items[i].width)
-                    std::swap(items[i], items[j]);
+        // ragged column. std::sort rather than the hand-written
+        // bubble sort this used to run every single frame.
+        std::sort(s_items.begin(), s_items.end(),
+                  [](const Item& a, const Item& b) { return a.width > b.width; });
 
         float padX = 12.0f, padY = 6.0f;
         float pillH = lineH + padY * 2.0f;
         float step  = pillH + 6.0f;
 
         int idx = 0;
-        for (auto& it : items) {
-            Pill& p = s_pills[it.name];
+        for (auto& it : s_items) {
+            Pill& p = s_pills[*it.name];
             bool isNew = !p.seen && p.anim <= 0.001f;
 
             p.seen  = true;
@@ -210,8 +234,10 @@ private:
             float targetY = startY + (upward ? -step * (idx + 1) : step * idx);
             if (isNew) p.y = targetY;   // appear in place, then slide in
 
-            p.y    = Anim::To(ImGui::GetID(("hudY_" + it.name).c_str()), targetY, 16.0f);
-            p.anim = Anim::To(ImGui::GetID(("hudA_" + it.name).c_str()), 1.0f, 15.0f);
+            p.y    = Anim::To(ImGui::GetID(("hudY_" + *it.name).c_str()),
+                              targetY, 16.0f);
+            p.anim = Anim::To(ImGui::GetID(("hudA_" + *it.name).c_str()),
+                              1.0f, 15.0f);
             idx++;
         }
 
@@ -230,39 +256,11 @@ private:
             ++it;
         }
 
-        for (auto& it : items) {
-            Pill& p = s_pills[it.name];
+        for (auto& it : s_items) {
+            Pill& p = s_pills[*it.name];
             DrawPill(dl, anchorX, p.y, it.width, pillH, padX,
-                     it.name.c_str(), it.color, p.anim, rightAlign);
+                     it.name->c_str(), it.color, p.anim, rightAlign);
         }
-    }
-
-    // ---------------------------------------------------------
-    // Target card, bottom centre
-    // ---------------------------------------------------------
-    static void DrawTargetCard(ImDrawList* dl, float cx, float bottomY) {
-        auto esp = ModuleManager::GetESP();
-        bool have = esp && esp->IsEnabled();
-
-        float shown = Anim::ToStr("hudTarget", have ? 1.0f : 0.0f, 13.0f);
-        if (shown < 0.01f) return;
-
-        float w = 200.0f, h = 58.0f;
-        float lift = (1.0f - shown) * 18.0f;
-        ImVec2 a(cx - w * 0.5f, bottomY - h + lift);
-        ImVec2 b(a.x + w, a.y + h);
-
-        GlassPanel(dl, a, b, 16.0f, shown);
-
-        Fonts::Push(Fonts::Caption);
-        dl->AddText(ImVec2(a.x + 14.0f, a.y + 10.0f),
-                    Col::Alpha(Col::Label2, shown), "ESP");
-        Fonts::Pop(Fonts::Caption);
-
-        Fonts::Push(Fonts::BodyBold);
-        dl->AddText(ImVec2(a.x + 14.0f, a.y + 27.0f),
-                    Col::Alpha(Col::Label, shown), "Tracking players");
-        Fonts::Pop(Fonts::BodyBold);
     }
 
 public:
@@ -272,17 +270,19 @@ public:
         float sh = io.DisplaySize.y;
         if (sw < 2.0f || sh < 2.0f) return;
 
+        if (!watermark && !moduleList) return;
+
         ImDrawList* dl = ImGui::GetForegroundDrawList();
         if (!dl) return;
 
         const float margin = 14.0f;
-        bool rightAlign = (s_corner == 1 || s_corner == 3);
-        bool bottom     = (s_corner == 2 || s_corner == 3);
+        bool rightAlign = (corner == 1 || corner == 3);
+        bool bottom     = (corner == 2 || corner == 3);
 
         float x = rightAlign ? (sw - margin) : margin;
         float y = bottom ? (sh - margin) : margin;
 
-        if (s_watermark) {
+        if (watermark) {
             if (bottom) {
                 float h = DrawWatermark(dl, x, y - 40.0f, rightAlign);
                 y -= h + 10.0f;
@@ -292,40 +292,40 @@ public:
             }
         }
 
-        if (s_arraylist)  DrawArrayList(dl, x, y, rightAlign, bottom);
-        if (s_targetCard) DrawTargetCard(dl, sw * 0.5f, sh - 18.0f);
-
-        Anim::GarbageCollect();
+        if (moduleList) DrawModuleList(dl, x, y, rightAlign, bottom);
     }
 
     static void RenderSettings() {
         SectionHeader("On screen");
         BeginCard();
-        SwitchRow("Watermark", &s_watermark, nullptr, Col::Blue);
+        SwitchRow("Watermark", &watermark,
+                  "The client name in the corner", Col::Blue);
+        if (watermark) {
+            RowSeparator();
+            SwitchRow("Frame rate", &showFps, nullptr, Col::Blue);
+        }
         RowSeparator();
-        SwitchRow("Module list", &s_arraylist, nullptr, Col::Purple);
-        RowSeparator();
-        SwitchRow("ESP card", &s_targetCard, nullptr, Col::Green);
+        SwitchRow("Module list", &moduleList,
+                  "What is currently running", Col::Purple);
         EndCard();
 
-        SectionHeader("Position");
+        SectionHeader("Corner");
         BeginCard();
         ImGui::Dummy(ImVec2(0, 9));
         ImGui::Indent(M::RowPadX);
         {
             const char* corners[] = { "Top L", "Top R", "Bot L", "Bot R" };
-            Segmented("hudcorner", corners, 4, &s_corner,
+            Segmented("hudcorner", corners, 4, &corner,
                       ImGui::GetContentRegionAvail().x - M::RowPadX);
         }
         ImGui::Unindent(M::RowPadX);
         ImGui::Dummy(ImVec2(0, 11));
         EndCard();
 
-        Footnote("The HUD draws over the game rather than in a window, "
-                 "so it never steals your mouse.");
+        Footnote("The HUD draws over the game rather than in a window, so it "
+                 "never steals your mouse and costs nothing when both of "
+                 "these are off.");
     }
-
-    static void Reset() { s_pills.clear(); }
 };
 
 } // namespace iOS
