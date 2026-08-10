@@ -34,13 +34,6 @@ enum class ModuleCategory {
 // config key AND the label, so they cannot disagree. The hint is
 // mandatory in spirit: a control nobody can explain should not be
 // exposed at all.
-//
-// It also carries the value it started with. Bind runs in the
-// constructor, after the member initialisers, so the field already
-// holds the module's default at the moment it is registered.
-// Recording it there is free, and it is what lets the config loader
-// start from a known state instead of layering one config on top of
-// the last one.
 // =================================================================
 struct Setting {
     enum class Type { Bool, Int, Float, Mode };
@@ -57,9 +50,6 @@ struct Setting {
     const char* const* options = nullptr;   // Mode only
     int optionCount = 0;
 
-    // Captured at Bind time. Never written again.
-    float def = 0.0f;
-
     // Everyday settings are on the panel. Everything else is behind
     // Advanced, which most people will never open and should never
     // need to.
@@ -67,23 +57,22 @@ struct Setting {
 
     // A control that does nothing in the current mode is worse than
     // a missing one, because it invites you to change it and then
-    // ignores you. Rows can declare which mode they belong to and
-    // simply are not drawn otherwise.
-    int  dependOn    = -1;      // index of the governing setting
-    int  dependValue = 0;
-    bool dependEqual = true;
+    // ignores you. Rows declare which modes they belong to and are
+    // simply not drawn otherwise.
+    //
+    // A MASK rather than a single value, because most settings apply
+    // to more than one mode: a jump delay belongs to both Jump Reset
+    // and Combined, and pretending otherwise was how the first
+    // version of this ended up hiding half of Velocity.
+    int      dependOn = -1;         // index of the governing setting
+    unsigned dependMask = 0;        // bit per allowed value
+    bool     dependNegate = false;
 
     bool  AsBool()  const { return *(bool*)ptr; }
     int   AsInt()   const { return *(int*)ptr; }
     float AsFloat() const { return *(float*)ptr; }
 
     // The value a config file stores, whatever the type underneath.
-    //
-    // EVERY reader must go through this rather than reaching for
-    // AsFloat. A Mode is an int, and reading one as a float
-    // reinterprets the bits: mode 5 comes back as 7e-45, which then
-    // clamps to 0 on the way in. That is how a saved config used to
-    // quietly reset every mode in the client to its first option.
     float Read() const {
         switch (type) {
             case Type::Bool:  return *(bool*)ptr ? 1.0f : 0.0f;
@@ -118,16 +107,7 @@ struct Setting {
                 break;
         }
     }
-
-    void Restore() { Write(def); }
-
-    bool IsDefault() const {
-        float d = Read() - def;
-        return d < 0.0001f && d > -0.0001f;
-    }
 };
-
-class Module;
 
 // Small fluent handle returned by Bind. It holds an index rather
 // than a reference because push_back moves the vector out from
@@ -138,25 +118,36 @@ struct SettingRef {
 
     Setting& S() const { return (*vec)[index]; }
 
-    SettingRef& Hint(const char* h)      { S().hint = h; return *this; }
-    SettingRef& Advanced()               { S().advanced = true; return *this; }
-    SettingRef& Format(const char* f)    { S().fmt = f; return *this; }
+    SettingRef& Hint(const char* h)   { S().hint = h; return *this; }
+    SettingRef& Advanced()            { S().advanced = true; return *this; }
+    SettingRef& Format(const char* f) { S().fmt = f; return *this; }
 
-    // Draw this row only while another setting holds a given value.
+    // Draw this row only while another setting holds one of the
+    // given values. Bits, so several modes can share a control.
     SettingRef& When(const char* other, int value) {
-        return Depend(other, value, true);
+        return Depend(other, Bit(value), false);
+    }
+    SettingRef& WhenAny(const char* other, int a, int b, int c = -1) {
+        return Depend(other, Bit(a) | Bit(b) | Bit(c), false);
     }
     SettingRef& Unless(const char* other, int value) {
-        return Depend(other, value, false);
+        return Depend(other, Bit(value), true);
+    }
+    SettingRef& UnlessAny(const char* other, int a, int b, int c = -1) {
+        return Depend(other, Bit(a) | Bit(b) | Bit(c), true);
     }
 
 private:
-    SettingRef& Depend(const char* other, int value, bool equal) {
+    static unsigned Bit(int v) {
+        return (v >= 0 && v < 32) ? (1u << v) : 0u;
+    }
+
+    SettingRef& Depend(const char* other, unsigned mask, bool negate) {
         for (size_t i = 0; i < vec->size(); i++) {
             if ((*vec)[i].name != other) continue;
-            S().dependOn    = (int)i;
-            S().dependValue = value;
-            S().dependEqual = equal;
+            S().dependOn     = (int)i;
+            S().dependMask   = mask;
+            S().dependNegate = negate;
             break;
         }
         return *this;
@@ -180,17 +171,9 @@ protected:
     std::atomic<bool> m_enabled{ false };
     std::atomic<int>  m_keybind{ 0 };
 
-    // The bind this module shipped with, so "put my keys back" is
-    // answerable without hardcoding the list somewhere else.
-    int m_defaultKeybind = 0;
-
     std::vector<Setting> m_settings;
 
     SettingRef Push(Setting s) {
-        // The field holds the module's default right now. This is
-        // the only moment that is true, so it is the only moment to
-        // record it.
-        s.def = s.Read();
         m_settings.push_back(s);
         return SettingRef{ &m_settings, m_settings.size() - 1 };
     }
@@ -243,9 +226,7 @@ public:
            ModuleCategory cat, int key = 0)
         : m_name(name), m_description(desc), m_category(cat)
     {
-        int k = (key > 0 && key < 256) ? key : 0;
-        m_defaultKeybind = k;
-        m_keybind.store(k);
+        m_keybind.store(key);
     }
 
     virtual ~Module() = default;
@@ -327,34 +308,6 @@ public:
         return false;
     }
 
-    bool GetValue(const std::string& setting, float* out) const {
-        for (const auto& s : m_settings) {
-            if (s.name != setting) continue;
-            if (out) *out = s.Read();
-            return true;
-        }
-        return false;
-    }
-
-    // -------------------------------------------------------------
-    // Put every tunable back where it started.
-    //
-    // The config loader calls this before applying a file. Without
-    // it, loading config B after config A leaves A's values in every
-    // field B happens not to mention, so the result depends on what
-    // you had loaded before rather than on what is in the file.
-    // -------------------------------------------------------------
-    void ResetToDefaults() {
-        for (auto& s : m_settings) s.Restore();
-    }
-
-    // Does anything differ from the shipped values? The panel uses
-    // this to decide whether a Reset control is worth offering.
-    bool IsModified() const {
-        for (const auto& s : m_settings) if (!s.IsDefault()) return true;
-        return m_keybind.load() != m_defaultKeybind;
-    }
-
     const std::vector<Setting>& GetSettings() const { return m_settings; }
     std::vector<Setting>&       GetSettings()       { return m_settings; }
 
@@ -362,7 +315,6 @@ public:
     const std::string& GetDescription() const { return m_description; }
     ModuleCategory     GetCategory() const    { return m_category; }
     int  GetKeybind() const                   { return m_keybind.load(); }
-    int  GetDefaultKeybind() const            { return m_defaultKeybind; }
-    void SetKeybind(int key)                  { m_keybind.store((key > 0 && key < 256) ? key : 0); }
+    void SetKeybind(int key)                  { m_keybind.store(key); }
     bool IsEnabled() const                    { return m_enabled.load(); }
 };
