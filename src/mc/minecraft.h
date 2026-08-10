@@ -49,6 +49,11 @@ private:
 
     inline static jmethodID mGetMinecraft = nullptr;
 
+    // Sprinting and sneaking are DataWatcher flag bits, not plain
+    // fields, so they have to be read through the accessors.
+    inline static jmethodID mIsSprinting = nullptr;
+    inline static jmethodID mIsSneaking  = nullptr;
+
     inline static jobject gMinecraft    = nullptr;
     inline static jobject gGameSettings = nullptr;
 
@@ -86,6 +91,9 @@ public:
             fPitch    = JvmtiUtil::FindField(env, e, { "field_70125_A", "rotationPitch" });
             fOnGround = JvmtiUtil::FindField(env, e, { "field_70122_E", "onGround" });
             fIsDead   = JvmtiUtil::FindField(env, e, { "field_70128_L", "isDead" });
+
+            mIsSprinting = JvmtiUtil::FindMethod(env, e, { "func_70051_ag", "isSprinting" }, 0);
+            mIsSneaking  = JvmtiUtil::FindMethod(env, e, { "func_70093_af", "isSneaking" }, 0);
         }
 
         if (ClassResolver::entityLivingBase) {
@@ -121,9 +129,9 @@ public:
 
         s_ready = (gMinecraft != nullptr && fThePlayer != nullptr);
 
-        printf("[MC] ready=%d player=%p world=%p screen=%p posX=%p yaw=%p hurt=%p\n",
+        printf("[MC] ready=%d player=%p world=%p screen=%p posX=%p yaw=%p hurt=%p sprint=%p\n",
             (int)s_ready, (void*)fThePlayer, (void*)fTheWorld, (void*)fCurrentScreen,
-            (void*)fPosX, (void*)fYaw, (void*)fHurtTime);
+            (void*)fPosX, (void*)fYaw, (void*)fHurtTime, (void*)mIsSprinting);
 
         if (!fCurrentScreen)
             printf("[MC] WARN: currentScreen unresolved, GUI checks disabled\n");
@@ -180,6 +188,27 @@ public:
     static void SetMotionZ(JNIEnv* env, jobject e, double v) { if (fMotionZ) env->SetDoubleField(e, fMotionZ, v); }
 
     static int GetHurtTime(JNIEnv* env, jobject e) { return fHurtTime ? env->GetIntField(e, fHurtTime) : 0; }
+
+    // ---- Flags ----
+    // Read-only on purpose. Writing setSprinting is pointless: the
+    // next onLivingUpdate recomputes it from the keybind. Modules
+    // that want to change it go through KeyBinds instead.
+    static bool HasSprintCheck() { return mIsSprinting != nullptr; }
+    static bool HasSneakCheck()  { return mIsSneaking  != nullptr; }
+
+    static bool IsSprinting(JNIEnv* env, jobject e) {
+        if (!mIsSprinting || !e) return false;
+        jboolean v = env->CallBooleanMethod(e, mIsSprinting);
+        if (env->ExceptionCheck()) { env->ExceptionClear(); return false; }
+        return v != 0;
+    }
+
+    static bool IsSneaking(JNIEnv* env, jobject e) {
+        if (!mIsSneaking || !e) return false;
+        jboolean v = env->CallBooleanMethod(e, mIsSneaking);
+        if (env->ExceptionCheck()) { env->ExceptionClear(); return false; }
+        return v != 0;
+    }
 
     static float GetRenderPartialTicks(JNIEnv* env) {
         if (!gMinecraft || !fTimer || !fRenderPartialTicks) return 0.f;
