@@ -15,6 +15,7 @@
 #include <chrono>
 #include <random>
 #include <cmath>
+#include <cstdio>
 
 // =================================================================
 // Backtrack
@@ -143,6 +144,8 @@ private:
     bool m_lastLMB = false;
     unsigned long long m_tick = 0;
     double m_maxOffsetSeen = 0.0;
+
+    mutable char m_status[64] = { 0 };
 
     // Snapshot handed to the render thread
     std::vector<VisTarget> m_vis;
@@ -614,18 +617,35 @@ public:
     float VisGhostAlpha() const { return m_visGhostA; }
     const float* VisColor() const { return m_visColor; }
 
+    const char* StatusLine() const override {
+        if (m_activeCount > 0) {
+            snprintf(m_status, sizeof(m_status), "holding %d  ·  %.2f m peak",
+                     m_activeCount, m_maxOffsetSeen);
+        } else {
+            snprintf(m_status, sizeof(m_status), "%s",
+                     m_pauseCounter > 0 ? "paused after a flag"
+                                        : (m_rewinding ? "armed" : "clean"));
+        }
+        return m_status;
+    }
+
+    // =============================================================
+    // Everyday panel: how it behaves, who it picks, how far back.
+    // =============================================================
     void RenderSettings() override {
         if (!Ready()) {
             ImGui::TextColored(ImVec4(1.f, 0.8f, 0.3f, 1.f),
                 "Entity fields unresolved: join a world first");
-            ImGui::Separator();
+            return;
         }
 
         const char* modes[] = { "Constant", "Pulse", "Adaptive" };
         ImGui::Combo("Mode", &m_mode, modes, 3);
-        if (m_mode == 0) {
-            ImGui::TextColored(ImVec4(1.f, 0.5f, 0.35f, 1.f),
-                "! A constant delay is the easiest pattern to fingerprint");
+        switch (m_mode) {
+            case 0: ImGui::TextColored(ImVec4(1.f, 0.5f, 0.35f, 1.f),
+                        "A constant delay is the easiest pattern to fingerprint"); break;
+            case 1: ImGui::TextDisabled("Rewinds in bursts, clean in between."); break;
+            case 2: ImGui::TextDisabled("Scales the delay with distance."); break;
         }
 
         const char* targeting[] = { "Oldest", "Intersect", "Nearest" };
@@ -636,8 +656,22 @@ public:
             case 2: ImGui::TextDisabled("Picks the closest past spot. Easiest to land."); break;
         }
 
-        ImGui::Separator();
-        ImGui::TextColored(ImVec4(1.f, 0.6f, 0.3f, 1.f), "Strength");
+        ImGui::SliderInt("Delay Min (ms)", &m_delayMinMs, 10, 250);
+        ImGui::SliderInt("Delay Max (ms)", &m_delayMaxMs, 10, 300);
+        if (m_delayMinMs > m_delayMaxMs) m_delayMinMs = m_delayMaxMs;
+
+        if (m_pingAware) {
+            ImGui::TextDisabled("Effective cap %d ms at %d ping",
+                EffectiveCap(), m_measuredPing);
+        }
+
+        ImGui::Checkbox("Show Rewind", &m_visEnabled);
+    }
+
+    bool HasAdvanced() const override { return true; }
+
+    void RenderAdvanced() override {
+        ImGui::SeparatorText("Strength");
         ImGui::SliderFloat("Reach Assist", &m_reachAssist, 2.5f, 4.5f, "%.2f");
         ImGui::TextDisabled("Samples further than this are never chosen.");
         ImGui::Checkbox("Swing Sync", &m_swingSync);
@@ -651,20 +685,15 @@ public:
             ImGui::SliderFloat("Lock Speed", &m_aimLockSpeed, 0.5f, 10.f, "%.1f");
             ImGui::SliderFloat("Lock FOV", &m_aimLockFov, 10.f, 180.f, "%.0f");
             ImGui::TextColored(ImVec4(1.f, 0.5f, 0.35f, 1.f),
-                "! Aim lock is a rotation change and carries aim-assist risk");
+                "Aim lock is a rotation change and carries aim-assist risk");
         }
 
-        ImGui::Separator();
-        ImGui::TextColored(ImVec4(1.f, 0.6f, 0.3f, 1.f), "Delay band");
-        ImGui::SliderInt("Delay Min (ms)", &m_delayMinMs, 10, 250);
-        ImGui::SliderInt("Delay Max (ms)", &m_delayMaxMs, 10, 300);
-        if (m_delayMinMs > m_delayMaxMs) m_delayMinMs = m_delayMaxMs;
+        ImGui::SeparatorText("Delay band");
         ImGui::SliderInt("Hard Cap (ms)", &m_hardCapMs, 40, 400);
         ImGui::SliderFloat("Per-Target Jitter", &m_perTargetJitter, 0.f, 50.f, "%.0f%%");
         ImGui::SliderInt("Ramp Ticks", &m_rampTicks, 0, 12);
 
-        ImGui::Separator();
-        ImGui::TextColored(ImVec4(0.5f, 0.8f, 1.f, 1.f), "Range window");
+        ImGui::SeparatorText("Range window");
         ImGui::Checkbox("Use Range Window", &m_useRangeWindow);
         if (m_useRangeWindow) {
             ImGui::SliderFloat("Range Min", &m_rangeMin, 1.f, 4.f, "%.1f");
@@ -673,8 +702,7 @@ public:
         }
 
         if (m_mode == 1) {
-            ImGui::Separator();
-            ImGui::TextColored(ImVec4(0.6f, 1.f, 0.7f, 1.f), "Pulse timing");
+            ImGui::SeparatorText("Pulse timing");
             ImGui::SliderInt("Rewind Ticks Min", &m_pulseOnMin, 2, 40);
             ImGui::SliderInt("Rewind Ticks Max", &m_pulseOnMax, 2, 50);
             if (m_pulseOnMin > m_pulseOnMax) m_pulseOnMin = m_pulseOnMax;
@@ -683,22 +711,18 @@ public:
             if (m_pulseOffMin > m_pulseOffMax) m_pulseOffMin = m_pulseOffMax;
         }
 
-        ImGui::Separator();
-        ImGui::TextColored(ImVec4(1.f, 0.85f, 0.4f, 1.f), "Safety");
+        ImGui::SeparatorText("Safety");
         ImGui::Checkbox("Ping Aware", &m_pingAware);
         if (m_pingAware) {
             ImGui::SliderInt("Comp Window (ms)", &m_compensationMs, 100, 400);
             ImGui::SliderInt("Safety Margin (ms)", &m_safetyMarginMs, 0, 120);
-            ImGui::Text("Effective cap: %d ms (ping %d)", EffectiveCap(), m_measuredPing);
         }
         ImGui::Checkbox("Restore On Damage", &m_restoreOnDamage);
         ImGui::Checkbox("Only While Clicking", &m_onlyWhileClicking);
         ImGui::SliderInt("Pause After Flag", &m_pauseAfterFlagTicks, 0, 100);
 
-        ImGui::Separator();
-        ImGui::TextColored(ImVec4(0.7f, 0.5f, 1.f, 1.f), "Visibility");
-        ImGui::Checkbox("Show Rewind", &m_visEnabled);
         if (m_visEnabled) {
+            ImGui::SeparatorText("Visibility");
             const char* styles[] = { "Box", "Wireframe", "Trail", "Marker", "Text Only" };
             ImGui::Combo("Style", &m_visStyle, styles, 5);
             switch (m_visStyle) {
@@ -718,8 +742,8 @@ public:
             ImGui::ColorEdit4("Color", m_visColor);
         }
 
-        ImGui::Separator();
-        ImGui::TextDisabled("Rewound: %d | tracked: %d | %s",
+        ImGui::SeparatorText("Diagnostics");
+        ImGui::TextDisabled("Rewound %d | tracked %d | %s",
             m_activeCount, (int)m_targets.size(),
             m_rewinding ? "active" : "clean");
         ImGui::TextDisabled("Peak offset this session: %.2f m", m_maxOffsetSeen);
