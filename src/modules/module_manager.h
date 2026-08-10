@@ -64,11 +64,19 @@
 //   5. UI actions, keybinds, then the modules themselves.
 //   6. Queued clicks are handed to the game LAST, so a click fired
 //      by a module this tick goes out on this tick.
+//   7. Key reconciliation, after everything has had its say.
 //
 // KEY SAFETY
-// Modules hold real keybinds down. If the world goes away or we
-// eject while a key is held, the player is left walking into a wall
-// with no way to stop, so every exit path releases them.
+// Modules hold real keybinds down, and KeyBinding.pressed is edge
+// driven: the game only writes it when the keyboard fires an event.
+// A key we clear while the player is holding it therefore stays
+// cleared forever, and the player simply stops moving. That is what
+// froze everyone after a sprint reset.
+//
+// So there are two backstops. Every exit path releases held keys,
+// and every tick ends with KeyBinds::Reconcile, which puts any key
+// we are no longer driving back in line with the hardware. Worst
+// case a key is wrong for one tick.
 // =================================================================
 
 class ModuleManager {
@@ -271,6 +279,21 @@ public:
         // ---- Clicks, last, so this tick's requests go out now ----
         DispatchClicks(env);
         if (env->ExceptionCheck()) { env->ExceptionDescribe(); env->ExceptionClear(); }
+
+        // ---- Key reconciliation ----
+        // The reason a sprint reset could freeze you: pressed is
+        // edge driven, so a key we cleared while the player was
+        // holding it never came back on its own. Anything we are no
+        // longer driving gets put back in line with the hardware
+        // here, so a missed release costs one tick instead of the
+        // rest of the fight.
+        //
+        // Skipped inside a GUI, where the game clears every key on
+        // purpose and we would be fighting it.
+        if (!Minecraft::IsInGui(env)) {
+            KeyBinds::Reconcile(env);
+            if (env->ExceptionCheck()) { env->ExceptionDescribe(); env->ExceptionClear(); }
+        }
 
         // Drops every entity ref the cache was holding
         EntityList::BeginTick();
