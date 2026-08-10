@@ -21,6 +21,7 @@
 // Combat
 #include "combat/velocity.h"
 #include "combat/sprint_reset.h"
+#include "combat/autoclicker.h"
 
 // Movement
 #include "movement/no_jump_delay.h"
@@ -252,6 +253,7 @@ public:
         // Combat
         s_modules.push_back(std::make_shared<Velocity>());
         s_modules.push_back(std::make_shared<SprintReset>());
+        s_modules.push_back(std::make_shared<AutoClicker>());
 
         // Movement
         s_modules.push_back(std::make_shared<NoJumpDelay>());
