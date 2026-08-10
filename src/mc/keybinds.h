@@ -23,9 +23,29 @@
 // this is visible to a server-side anticheat.
 //
 // A held key is a two-field state in 1.8:
-//   pressed    is the key down right now
-//   pressTime  queued press events, consumed by isPressed()
-// We only touch pressed, which is what movement and item use read.
+//
+//   pressed     is the key down right now
+//   pressTime   how many press EVENTS are queued
+//
+// Those two do completely different jobs and the difference is the
+// whole reason the autoclicker never worked.
+//
+//   Minecraft.runTick():
+//       while (gameSettings.keyBindAttack.isPressed()) clickMouse();
+//
+//   KeyBinding.isPressed():
+//       if (pressTime == 0) return false;
+//       --pressTime; return true;
+//
+// So pressTime is a COUNTER OF CLICKS. Adding 1 to it makes the
+// game call clickMouse() exactly once on its next tick, running the
+// real swingItem plus attackEntity path. Holding `pressed` down
+// does not attack at all; it only mines blocks.
+//
+// This is why the client no longer synthesises OS mouse input:
+// pressTime is the same door a physical click comes through, it
+// cannot be told apart from one, and it works no matter what the
+// game is doing with raw input.
 //
 // IMPORTANT
 // A key we force down stays down until we clear it. Every module
@@ -46,7 +66,8 @@ private:
     inline static Bind s_jump, s_sneak, s_sprint;
     inline static Bind s_useItem, s_attack;
 
-    inline static jfieldID s_fPressed = nullptr;
+    inline static jfieldID s_fPressed   = nullptr;
+    inline static jfieldID s_fPressTime = nullptr;
     inline static bool s_ready = false;
 
     static Bind** AllPtrs(int& count) {
@@ -72,9 +93,13 @@ private:
 
         out.obj = env->NewGlobalRef(kb);
 
-        if (!s_fPressed) {
+        if (!s_fPressed || !s_fPressTime) {
             jclass cls = env->GetObjectClass(kb);
-            s_fPressed = JvmtiUtil::FindField(env, cls, { "field_74513_e", "pressed" });
+            if (!s_fPressed)
+                s_fPressed = JvmtiUtil::FindField(env, cls, { "field_74513_e", "pressed" });
+            if (!s_fPressTime)
+                s_fPressTime = JvmtiUtil::FindField(env, cls,
+                    { "field_151474_i", "pressTime", "field_74512_d" });
             env->DeleteLocalRef(cls);
         }
         out.pressed = s_fPressed;
@@ -104,15 +129,23 @@ public:
         s_ready = (s_forward.obj != nullptr && s_fPressed != nullptr);
 
         if (s_ready) {
-            printf("[KeyBinds] resolved fwd=%p back=%p sneak=%p jump=%p use=%p sprint=%p\n",
-                (void*)s_forward.obj, (void*)s_back.obj, (void*)s_sneak.obj,
-                (void*)s_jump.obj, (void*)s_useItem.obj, (void*)s_sprint.obj);
+            printf("[KeyBinds] resolved fwd=%p sneak=%p jump=%p use=%p attack=%p "
+                   "pressed=%p pressTime=%p\n",
+                (void*)s_forward.obj, (void*)s_sneak.obj, (void*)s_jump.obj,
+                (void*)s_useItem.obj, (void*)s_attack.obj,
+                (void*)s_fPressed, (void*)s_fPressTime);
+
+            if (!s_fPressTime)
+                printf("[KeyBinds] WARN: pressTime unresolved, native clicking is off\n");
         }
         return s_ready;
     }
 
     static void Shutdown(JNIEnv* env) {
-        if (env) ReleaseAll(env);
+        if (env) {
+            ReleaseAll(env);
+            ClearClickQueue(env);
+        }
 
         int n = 0;
         Bind** all = AllPtrs(n);
@@ -123,6 +156,7 @@ public:
             all[i]->overridden = false;
         }
         s_fPressed = nullptr;
+        s_fPressTime = nullptr;
         s_ready = false;
     }
 
@@ -153,6 +187,57 @@ public:
         int n = 0;
         Bind** all = AllPtrs(n);
         for (int i = 0; i < n; i++) Release(env, *all[i]);
+    }
+
+    // =============================================================
+    // Click queue
+    // =============================================================
+    // Adds n queued press events, which the game turns into exactly
+    // n calls to clickMouse() on its next tick.
+    //
+    // The counter is capped. If the game stalls, or we sit in a
+    // menu, an uncapped counter keeps growing and then dumps the
+    // whole backlog in a single tick: twenty attack packets with no
+    // gap between them, which is the one thing that genuinely cannot
+    // be produced by a hand.
+    static constexpr int kMaxQueued = 4;
+
+    static bool HasClickQueue() { return s_fPressTime != nullptr; }
+
+    static int GetPressTime(JNIEnv* env, Bind& b) {
+        if (!b.obj || !s_fPressTime) return 0;
+        return env->GetIntField(b.obj, s_fPressTime);
+    }
+
+    static int AddPress(JNIEnv* env, Bind& b, int n) {
+        if (!b.obj || !s_fPressTime || n <= 0) return 0;
+
+        int cur = env->GetIntField(b.obj, s_fPressTime);
+        if (cur >= kMaxQueued) return 0;
+
+        int add = n;
+        if (cur + add > kMaxQueued) add = kMaxQueued - cur;
+
+        env->SetIntField(b.obj, s_fPressTime, cur + add);
+        return add;
+    }
+
+    // Left click: swingItem plus attackEntity, the real path
+    static int QueueAttack(JNIEnv* env, int n) { return AddPress(env, s_attack, n); }
+
+    // Right click: item use, which is also how blocking starts
+    static int QueueUse(JNIEnv* env, int n) { return AddPress(env, s_useItem, n); }
+
+    static int PendingAttack(JNIEnv* env) { return GetPressTime(env, s_attack); }
+    static int PendingUse(JNIEnv* env)    { return GetPressTime(env, s_useItem); }
+
+    // Throw away anything still queued. Needed when a screen opens:
+    // runTick stops consuming pressTime while a GUI is up, so the
+    // backlog would fire all at once the moment it closes.
+    static void ClearClickQueue(JNIEnv* env) {
+        if (!env || !s_fPressTime) return;
+        if (s_attack.obj)  env->SetIntField(s_attack.obj,  s_fPressTime, 0);
+        if (s_useItem.obj) env->SetIntField(s_useItem.obj, s_fPressTime, 0);
     }
 
     // ---- Named ----
@@ -191,4 +276,5 @@ public:
     static bool HasJump()     { return s_jump.obj != nullptr; }
     static bool HasUseItem()  { return s_useItem.obj != nullptr; }
     static bool HasSprint()   { return s_sprint.obj != nullptr; }
+    static bool HasAttack()   { return s_attack.obj != nullptr; }
 };
