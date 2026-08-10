@@ -6,9 +6,10 @@
 #include "../../mc/rotation.h"
 #include "../../jni/class_resolver.h"
 #include "../../jni/jvmti_util.h"
-#include <imgui.h>
+#include "../../util/log.h"
 #include <Windows.h>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <random>
 #include <string>
@@ -37,6 +38,19 @@
 
 class KillAura : public Module {
 private:
+    static constexpr const char* kPriorities[] = {
+        "Closest", "Lowest HP", "Crosshair"
+    };
+
+    // 1.8 grants ten ticks of damage immunity after a hit. Swinging
+    // into the tail of that window deals nothing.
+    static constexpr jint kImmunityGuard = 5;
+
+    // Nothing human clicks faster than this, whatever the CPS says.
+    static constexpr long long kFloorMs = 45;
+
+    static constexpr int kWanderPeriod = 6;
+
     // ---- Targeting ----
     float m_range      = 3.2f;
     float m_fov        = 120.0f;
@@ -117,7 +131,11 @@ private:
         }
 
         m_resolved = true;
-        printf("[KillAura] attack=%p swing=%p resist=%p\n",
+
+        // PH_LOG rather than printf: in a release build there is no
+        // console attached, and a blocking write to a handle nobody
+        // is reading is not free.
+        PH_LOG("[KillAura] attack=%p swing=%p resist=%p",
             (void*)m_attackEntity, (void*)m_swingItem, (void*)m_fHurtResist);
     }
 
@@ -142,16 +160,13 @@ private:
         std::uniform_int_distribution<int> cps(lo, hi);
         std::uniform_int_distribution<int> jitter(-22, 22);
         long long d = (1000 / cps(m_rng)) + jitter(m_rng);
-        return d < 45 ? 45 : d;
+        return d < kFloorMs ? kFloorMs : d;
     }
 
-    // In 1.8 a freshly hit entity is immune for 10 ticks. Swinging
-    // into that window deals nothing and only adds packets, which
-    // is both wasteful and a distinctive pattern.
     bool OnCooldown(JNIEnv* env, jobject ent) {
         if (!m_respectCooldown || !m_fHurtResist) return false;
         jint r = env->GetIntField(ent, m_fHurtResist);
-        return r > 5;
+        return r > kImmunityGuard;
     }
 
     float AngleTo(JNIEnv* env, jobject player,
@@ -185,22 +200,70 @@ public:
     {
         m_lastAttack = std::chrono::steady_clock::now();
 
-        Bind("Range", &m_range);
-        Bind("FOV", &m_fov);
-        Bind("Target Mode", &m_targetMode);
-        Bind("Sticky", &m_sticky);
-        Bind("Min CPS", &m_minCPS);
-        Bind("Max CPS", &m_maxCPS);
-        Bind("Respect Cooldown", &m_respectCooldown);
-        Bind("Rotate", &m_rotate);
-        Bind("Rotation Speed", &m_rotSpeed);
-        Bind("Rotation Smoothing", &m_rotSmooth);
-        Bind("Max Aim Error", &m_maxAimError);
-        Bind("Aim Height", &m_aimHeight);
-        Bind("Wander", &m_wander);
-        Bind("Only While Clicking", &m_requireClick);
-        Bind("Multi Target", &m_multiTarget);
-        Bind("Max Targets", &m_maxTargets);
+        BindMode("Priority", &m_targetMode, kPriorities, 3,
+                 "Which of several people in range it goes for");
+
+        Bind("Range", &m_range, 2.0f, 6.0f, "%.2f",
+             "Vanilla reach is 3.0. Past that is the single easiest thing "
+             "for a server to catch.");
+
+        Bind("Min CPS", &m_minCPS, 1, 20,
+             "Slowest it will swing");
+
+        Bind("Max CPS", &m_maxCPS, 1, 20,
+             "Fastest it will swing");
+
+        // ---- Targeting ----
+        Bind("FOV", &m_fov, 30.0f, 360.0f, "%.0f",
+             "How far off centre a target can be. 360 means it hits people "
+             "behind you, which nothing human does.")
+            .Advanced();
+
+        Bind("Sticky", &m_sticky,
+             "Stay on one target rather than re-picking every tick")
+            .Advanced();
+
+        Bind("Respect Hurt Cooldown", &m_respectCooldown,
+             "Skip targets still immune from the last hit. Swinging into "
+             "that window deals nothing and only adds packets.")
+            .Advanced();
+
+        // ---- Rotation ----
+        Bind("Rotate To Target", &m_rotate,
+             "Turn the camera. Without this the hits land at angles you are "
+             "not looking at, which is far louder.")
+            .Advanced();
+
+        Bind("Rotation Speed", &m_rotSpeed, 1.0f, 12.0f, "%.1f")
+            .When("Rotate To Target", 1).Advanced();
+
+        Bind("Rotation Smoothing", &m_rotSmooth, 0.0f, 0.9f, "%.2f")
+            .When("Rotate To Target", 1).Advanced();
+
+        Bind("Max Aim Error", &m_maxAimError, 1.0f, 45.0f, "%.0f",
+             "Degrees. It will not swing until the crosshair is this close, "
+             "so the rotation and the hit are never the same tick.")
+            .When("Rotate To Target", 1).Advanced();
+
+        Bind("Aim Height", &m_aimHeight, 0.0f, 1.8f, "%.2f",
+             "Metres up the body")
+            .When("Rotate To Target", 1).Advanced();
+
+        Bind("Wander", &m_wander, 0.0f, 0.4f, "%.2f",
+             "Drift around the aim point, so it is never dead centre")
+            .When("Rotate To Target", 1).Advanced();
+
+        // ---- Gating ----
+        Bind("Only While Clicking", &m_requireClick,
+             "Only run while you hold the button")
+            .Advanced();
+
+        Bind("Multi Target", &m_multiTarget,
+             "Hit several people in one swing, which nothing human does")
+            .Advanced();
+
+        Bind("Max Targets", &m_maxTargets, 2, 8)
+            .When("Multi Target", 1).Advanced();
     }
 
     void OnEnable(JNIEnv*) override {
@@ -213,6 +276,16 @@ public:
         m_targetId = -1;
         m_targetName.clear();
         m_why = "off";
+        m_status[0] = '\0';
+    }
+
+    void OnReset(JNIEnv*) override {
+        Rotation::ResetVelocity();
+        m_targetId = -1;
+        m_targetName.clear();
+        m_hits = 0;
+        m_why = "idle";
+        m_lastAttack = std::chrono::steady_clock::now();
     }
 
     void OnTick(JNIEnv* env) override {
@@ -222,6 +295,8 @@ public:
         jobject player = Minecraft::GetPlayer(env);
         if (!player) return;
         if (Minecraft::IsInGui(env)) { m_why = "menu"; return; }
+
+        if (m_minCPS > m_maxCPS) m_minCPS = m_maxCPS;
 
         if (m_requireClick && !(GetAsyncKeyState(VK_LBUTTON) & 0x8000)) {
             m_why = "not holding";
@@ -286,10 +361,7 @@ public:
         m_targetName = chosen->name;
 
         // ---- Aim point ----
-        // Dead centre every swing is a pattern in itself, so the
-        // point drifts, re-rolled every few ticks rather than every
-        // tick so it reads as drift and not as noise.
-        if (++m_wanderTick >= 6) {
+        if (++m_wanderTick >= kWanderPeriod) {
             m_wanderTick = 0;
             m_wanderX = Randf(-m_wander, m_wander);
             m_wanderY = Randf(-m_wander * 0.6f, m_wander * 0.6f);
@@ -314,10 +386,6 @@ public:
         }
 
         // ---- Swing, but only once the crosshair has arrived ----
-        // Turning and attacking in the same tick gives the server a
-        // rotation and a hit with no time between them. Waiting for
-        // the aim to land is both more human and what makes the
-        // rotation worth doing at all.
         if (m_rotate && m_aimError > m_maxAimError) {
             m_why = "turning";
             return;
@@ -351,69 +419,24 @@ public:
 
     const char* StatusLine() const override {
         if (!m_targetName.empty()) {
-            snprintf(m_status, sizeof(m_status), "%s  ·  %s",
+            snprintf(m_status, sizeof(m_status), "%s  \xc2\xb7  %s",
                      m_targetName.c_str(), m_why);
         } else {
-            snprintf(m_status, sizeof(m_status), "%s  ·  %d hits",
+            snprintf(m_status, sizeof(m_status), "%s  \xc2\xb7  %d hits",
                      m_why, m_hits);
         }
         return m_status;
     }
 
-    // -------------------------------------------------------------
-    // Everyday panel: who to hit, how far, how fast.
-    // -------------------------------------------------------------
-    void RenderSettings() override {
-        ImGui::TextColored(ImVec4(1.f, 0.35f, 0.3f, 1.f),
-            "Detected by Polar, AGC and Grim");
-
-        const char* modes[] = { "Closest", "Lowest HP", "Crosshair" };
-        ImGui::Combo("Priority", &m_targetMode, modes, 3);
-
-        ImGui::SliderFloat("Range", &m_range, 2.f, 6.f, "%.2f");
-
-        ImGui::SliderInt("Min CPS", &m_minCPS, 1, 20);
-        ImGui::SliderInt("Max CPS", &m_maxCPS, 1, 20);
-        if (m_minCPS > m_maxCPS) m_minCPS = m_maxCPS;
-
+    NoticeLevel Notice(const char** text) const override {
         if (!m_attackEntity) {
-            ImGui::TextColored(ImVec4(1.f, 0.8f, 0.3f, 1.f),
-                "attackEntity unresolved: join a world first");
+            *text = "The attack method has not been found yet. Join a world "
+                    "and it will resolve itself.";
+            return NoticeLevel::Warning;
         }
-    }
-
-    bool HasAdvanced() const override { return true; }
-
-    void RenderAdvanced() override {
-        ImGui::TextColored(ImVec4(1.f, 0.6f, 0.3f, 1.f), "Targeting");
-        ImGui::SliderFloat("FOV", &m_fov, 30.f, 360.f, "%.0f");
-        ImGui::Checkbox("Sticky", &m_sticky);
-        ImGui::Checkbox("Respect Hurt Cooldown", &m_respectCooldown);
-        ImGui::TextDisabled("Skips targets still immune from the last hit.");
-
-        ImGui::Spacing();
-        ImGui::TextColored(ImVec4(0.6f, 1.f, 0.7f, 1.f), "Rotation");
-        ImGui::Checkbox("Rotate To Target", &m_rotate);
-        if (m_rotate) {
-            ImGui::SliderFloat("Speed", &m_rotSpeed, 1.f, 12.f, "%.1f");
-            ImGui::SliderFloat("Smoothing", &m_rotSmooth, 0.f, 0.9f, "%.2f");
-            ImGui::SliderFloat("Max Aim Error", &m_maxAimError, 1.f, 45.f, "%.0f deg");
-            ImGui::TextDisabled("Will not swing until the crosshair is this close.");
-            ImGui::SliderFloat("Aim Height", &m_aimHeight, 0.f, 1.8f, "%.2f");
-            ImGui::SliderFloat("Wander", &m_wander, 0.f, 0.4f, "%.2f");
-        }
-
-        ImGui::Spacing();
-        ImGui::Checkbox("Only While Clicking", &m_requireClick);
-        ImGui::Checkbox("Multi Target", &m_multiTarget);
-        if (m_multiTarget) {
-            ImGui::SliderInt("Max Targets", &m_maxTargets, 2, 8);
-            ImGui::TextColored(ImVec4(1.f, 0.5f, 0.35f, 1.f),
-                "Multi-target hits things you are not looking at");
-        }
-
-        ImGui::Spacing();
-        ImGui::TextDisabled("Hits %d | mouse grid %.4f deg",
-            m_hits, Rotation::GCD());
+        *text = "This is the loudest module in the client. Polar, AGC and "
+                "Grim all catch it, and nothing in here changes that. "
+                "Unprotected servers only.";
+        return NoticeLevel::Danger;
     }
 };
