@@ -21,25 +21,35 @@
 // as a fresh sprint hit.
 //
 // -----------------------------------------------------------------
-// THE BUG THAT FROZE YOU AFTER EVERY HIT
+// WHY YOU FROZE AFTER EVERY HIT: TWO SEPARATE BUGS
 // -----------------------------------------------------------------
+// FIRST, the key never came back.
+//
 // W-tap sets keyBindForward.pressed to false for a tick. In 1.8
 // that field is only written when the keyboard fires an EVENT, and
-// holding W produces exactly one event. So once we cleared it, the
-// game had no reason to ever set it back: no event was coming. The
-// player stood still until they let go of W and pressed it again.
+// holding W produces exactly one event, at the moment you press it.
+// Once we cleared the field the game had no reason to set it back:
+// no event was coming. You stood still until you let go of W and
+// pressed it again. That half is fixed in KeyBinds, which now
+// restores the key from the live hardware state.
 //
-// The real fix is in KeyBinds, which now restores the key from the
-// live hardware state instead of blindly writing false. What lives
-// here is the second line of defence:
+// SECOND, and this is the half that was still broken: even with
+// forward restored, THE SPRINT ITSELF DOES NOT COME BACK.
 //
-//   * every exit path ends the reset, including losing the player
-//     or the keybinds going away
-//   * a watchdog force-ends any reset that has run too long, so a
-//     dropped tick can never strand a key
-//   * the movement gate asks what the PLAYER is holding, not what
-//     the keybind currently says, because during our own reset the
-//     keybind says false and the module would deadlock itself
+// EntityPlayerSP.onLivingUpdate only starts sprinting again when:
+//
+//     moveForward >= 0.8 && !isSprinting() && ...
+//         && gameSettings.keyBindSprint.isKeyDown()
+//
+// or when the double-tap timer is running. If you sprint by
+// double-tapping W, as most people in PvP do, the sprint key is not
+// held and the double-tap timer only advances on a real key event.
+// So after the reset you kept walking, at walking speed, forever.
+//
+// The fix is to re-arm: hold the sprint key for a tick after the
+// reset. That satisfies the game's own condition, so IT decides to
+// sprint and sends the packet itself. Identical to a player tapping
+// ctrl after a W-tap, which is exactly what good players do.
 //
 // -----------------------------------------------------------------
 // METHODS
@@ -60,6 +70,10 @@ private:
     int   m_resetTicksMax = 1;
     int   m_hitDelay      = 0;
 
+    // ---- Re-arm ----
+    bool  m_rearmSprint = true;
+    int   m_rearmTicks  = 1;
+
     // ---- Gating ----
     bool  m_onlyWhileMoving = true;
     bool  m_onlyOnHit       = true;   // a real attack, not a click
@@ -69,6 +83,8 @@ private:
     bool m_resetting       = false;
     int  m_resetCountdown  = 0;
     int  m_heldTicks       = 0;
+    bool m_rearming        = false;
+    int  m_rearmLeft       = 0;
     int  m_delayCountdown  = 0;
     bool m_waitingForDelay = false;
     bool m_lastLMB         = false;
@@ -120,6 +136,36 @@ private:
         return Minecraft::IsSprinting(env, player);
     }
 
+    // Only these three actually stop the sprint by cutting movement,
+    // so only these need it started again afterwards.
+    static bool MethodBreaksSprint(int m) {
+        return m == 0 || m == 1 || m == 4;
+    }
+
+    void StopRearm(JNIEnv* env) {
+        if (!m_rearming) return;
+        KeyBinds::ReleaseSprint(env);
+        m_rearming = false;
+        m_rearmLeft = 0;
+    }
+
+    // Hold the sprint key so the game's own check fires and it
+    // decides to sprint. We never call setSprinting(true) for this:
+    // that only flips a client flag which onLivingUpdate overwrites
+    // on the same tick, and it desyncs the sprint packet.
+    void BeginRearm(JNIEnv* env) {
+        if (!m_rearmSprint) return;
+        if (!KeyBinds::HasSprint()) return;
+        if (!MethodBreaksSprint(m_activeMethod)) return;
+
+        // Pointless if they stopped walking during the reset
+        if (!KeyBinds::PhysForward(env)) return;
+
+        KeyBinds::SetSprint(env, true);
+        m_rearming  = true;
+        m_rearmLeft = m_rearmTicks < 1 ? 1 : m_rearmTicks;
+    }
+
     // Undo whatever the reset did. Keyed on m_activeMethod rather
     // than m_method, so changing the method mid-reset cannot leave a
     // key held down forever.
@@ -136,12 +182,11 @@ private:
             default: break;
         }
 
-        if (m_activeMethod == 0 || m_activeMethod == 1 || m_activeMethod == 4)
-            SetSprintFlag(env, player, true);
-
         m_resetting = false;
         m_resetCountdown = 0;
         m_heldTicks = 0;
+
+        if (env && player) BeginRearm(env);
     }
 
     void BeginReset(JNIEnv* env, jobject player) {
@@ -160,7 +205,10 @@ private:
                 return;   // instant, nothing to unwind
         }
 
-        if (m_method == 0 || m_method == 1 || m_method == 4)
+        // Cancel the sprint now rather than waiting for the game to
+        // notice movement stopped. One tick earlier is the whole
+        // point of the module.
+        if (MethodBreaksSprint(m_method))
             SetSprintFlag(env, player, false);
 
         m_resetting      = true;
@@ -178,6 +226,8 @@ public:
         Bind("Reset Ticks Min", &m_resetTicksMin);
         Bind("Reset Ticks Max", &m_resetTicksMax);
         Bind("Hit Delay", &m_hitDelay);
+        Bind("Rearm Sprint", &m_rearmSprint);
+        Bind("Rearm Ticks", &m_rearmTicks);
         Bind("Only While Moving", &m_onlyWhileMoving);
         Bind("Only On Hit", &m_onlyOnHit);
         Bind("Require Sprint", &m_requireSprint);
@@ -195,12 +245,14 @@ public:
         // a respawn or a dimension change cannot strand a key.
         if (!player) {
             if (m_resetting) EndReset(env, nullptr);
+            StopRearm(env);
             m_why = "no player";
             return;
         }
 
         if (Minecraft::IsInGui(env)) {
             if (m_resetting) EndReset(env, player);
+            StopRearm(env);
             m_why = "menu";
             return;
         }
@@ -223,6 +275,16 @@ public:
 
             m_why = "resetting";
             return;
+        }
+
+        // ---- Re-arm: hold ctrl briefly so the sprint restarts ----
+        if (m_rearming) {
+            if (m_rearmLeft > 0) {
+                m_rearmLeft--;
+                m_why = "restarting sprint";
+                return;
+            }
+            StopRearm(env);
         }
 
         // Ask what the PLAYER is holding. Reading the keybind would
@@ -280,6 +342,8 @@ public:
             jobject player = Minecraft::GetPlayer(env);
             EndReset(env, player);
         }
+        StopRearm(env);
+
         // Backstop: whatever state we thought we were in, hand every
         // key we touched back to the player.
         if (env) KeyBinds::ReleaseAll(env);
@@ -293,9 +357,13 @@ public:
 
     void RenderSettings() override {
         // ---- Live ----
-        ImGui::TextColored(m_resetting ? ImVec4(0.2f, 0.8f, 0.4f, 1.f)
-                                       : ImVec4(0.55f, 0.55f, 0.6f, 1.f),
-            "%s  (%s)", m_resetting ? "RESETTING" : "idle", m_why);
+        const char* state = m_resetting ? "RESETTING"
+                          : m_rearming  ? "RE-ARMING"
+                                        : "idle";
+        ImGui::TextColored((m_resetting || m_rearming)
+                ? ImVec4(0.2f, 0.8f, 0.4f, 1.f)
+                : ImVec4(0.55f, 0.55f, 0.6f, 1.f),
+            "%s  (%s)", state, m_why);
         ImGui::TextDisabled("Resets %d | air swings ignored %d | your CPS %.1f",
             m_resets, m_skipped, CombatState::CPS());
 
@@ -328,6 +396,23 @@ public:
         ImGui::SliderInt("Hit Delay (ticks)", &m_hitDelay, 0, 5);
         ImGui::TextDisabled("Longer holds cost more momentum than they "
                             "gain in knockback.");
+
+        ImGui::Separator();
+        ImGui::TextColored(ImVec4(0.4f, 1.f, 0.6f, 1.f), "Sprint recovery");
+        ImGui::Checkbox("Re-arm Sprint", &m_rearmSprint);
+        if (m_rearmSprint) {
+            ImGui::SliderInt("Re-arm Ticks", &m_rearmTicks, 1, 4);
+            ImGui::TextDisabled("Taps the sprint key after the reset so the "
+                                "game restarts your sprint itself.");
+        } else {
+            ImGui::TextColored(ImVec4(1.f, 0.5f, 0.35f, 1.f),
+                "Off: if you sprint by double-tapping W you will stay "
+                "at walking speed after every hit");
+        }
+        if (m_rearmSprint && !KeyBinds::HasSprint()) {
+            ImGui::TextColored(ImVec4(1.f, 0.8f, 0.3f, 1.f),
+                "Sprint keybind unresolved: cannot re-arm");
+        }
 
         ImGui::Separator();
         ImGui::TextColored(ImVec4(0.5f, 0.8f, 1.f, 1.f), "Trigger");
