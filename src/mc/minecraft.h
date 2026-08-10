@@ -1,5 +1,6 @@
 #pragma once
 #include <jni.h>
+#include <atomic>
 #include <string>
 #include <cmath>
 
@@ -58,6 +59,12 @@ private:
     inline static jobject gGameSettings = nullptr;
 
     inline static bool s_ready = false;
+
+    // Our ImGui overlay is NOT a vanilla screen, so currentScreen is
+    // null while it is open. Set from the window thread when the menu
+    // toggles; read on the client thread. A plain atomic, no JNI, so
+    // it is safe from either. See IsInGui below for why this exists.
+    inline static std::atomic<bool> s_menuOpen{ false };
 
     static constexpr double kPi = 3.14159265358979323846;
 
@@ -271,16 +278,39 @@ public:
             GetPosX(env, to), GetPosY(env, to) + 1.0, GetPosZ(env, to));
     }
 
+    // ---- Menu state ----
+    // The overlay opening is a window-thread event; releasing the
+    // mouse grab and standing modules down is client-thread work, so
+    // the window thread only flips this flag and the tick reacts.
+    // Funnelled through ModuleManager::SetMenuOpen so the cursor,
+    // this flag and the click scheduler can never disagree.
+    static void SetMenuOpen(bool v) { s_menuOpen.store(v); }
+    static bool IsMenuOpen()        { return s_menuOpen.load(); }
+
     // ---- State ----
-    // True only when a screen is actually open. If the field could
-    // not be resolved we return false so modules still run, rather
-    // than silently disabling the whole client.
-    static bool IsInGui(JNIEnv* env) {
+    // A VANILLA screen only: currentScreen != null. The narrow
+    // question "is a chest, inventory or pause menu open". This is
+    // the one key reconcile must use, because the game clears every
+    // key for a vanilla screen and we would be fighting it; it does
+    // NOT do that for our own overlay. If the field could not be
+    // resolved we return false so modules still run rather than
+    // silently disabling the whole client.
+    static bool IsVanillaGuiOpen(JNIEnv* env) {
         if (!gMinecraft || !fCurrentScreen) return false;
         jobject screen = env->GetObjectField(gMinecraft, fCurrentScreen);
         bool open = (screen != nullptr);
         if (screen) env->DeleteLocalRef(screen);
         return open;
+    }
+
+    // "Should a module keep its hands off the player right now?"
+    // True for a vanilla screen OR our own overlay. Modules gate on
+    // this, so opening the Phantom menu makes every one of them stand
+    // down through exactly the same tested path a chest triggers,
+    // without teaching fifteen files about the overlay.
+    static bool IsInGui(JNIEnv* env) {
+        if (s_menuOpen.load()) return true;
+        return IsVanillaGuiOpen(env);
     }
 
     static bool InGame(JNIEnv* env) {
