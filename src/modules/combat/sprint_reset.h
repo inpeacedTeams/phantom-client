@@ -20,25 +20,28 @@
 // Sprint resetting drops and re-applies sprint so each hit counts
 // as a fresh sprint hit.
 //
-// WHAT CHANGED AND WHY IT MATTERS
+// -----------------------------------------------------------------
+// THE BUG THAT FROZE YOU AFTER EVERY HIT
+// -----------------------------------------------------------------
+// W-tap sets keyBindForward.pressed to false for a tick. In 1.8
+// that field is only written when the keyboard fires an EVENT, and
+// holding W produces exactly one event. So once we cleared it, the
+// game had no reason to ever set it back: no event was coming. The
+// player stood still until they let go of W and pressed it again.
 //
-// This used to fire on GetAsyncKeyState(VK_LBUTTON). That is the
-// mouse button, not an attack: clicking at the sky, at a block or
-// at empty air all reset your sprint for nothing. Losing forward
-// momentum for a swing that hit no one is strictly worse than not
-// having the module at all.
+// The real fix is in KeyBinds, which now restores the key from the
+// live hardware state instead of blindly writing false. What lives
+// here is the second line of defence:
 //
-// It now triggers on CombatState::AttackedThisTick(), which means
-// the arm actually swung AND something was in reach. Same event the
-// server processes, so the reset lands where it is worth having.
+//   * every exit path ends the reset, including losing the player
+//     or the keybinds going away
+//   * a watchdog force-ends any reset that has run too long, so a
+//     dropped tick can never strand a key
+//   * the movement gate asks what the PLAYER is holding, not what
+//     the keybind currently says, because during our own reset the
+//     keybind says false and the module would deadlock itself
 //
-// EVERYTHING GOES THROUGH KEYBINDS
-//   1. setSprinting() alone does not hold: onLivingUpdate recomputes
-//      sprint from the keys every tick and overwrites it.
-//   2. KeyBinds records which keys we forced, so ReleaseAll() frees
-//      them on disconnect or eject. A key set behind its back stays
-//      stuck down with no way for the player to clear it.
-//
+// -----------------------------------------------------------------
 // METHODS
 //   0 W-Tap     release forward for a tick
 //   1 S-Tap     tap back while forward stays held
@@ -51,11 +54,11 @@
 class SprintReset : public Module {
 private:
     // ---- Behaviour ----
-    int   m_method          = 0;
-    float m_chance          = 100.0f;
-    int   m_resetTicksMin   = 1;
-    int   m_resetTicksMax   = 1;
-    int   m_hitDelay        = 0;
+    int   m_method        = 0;
+    float m_chance        = 100.0f;
+    int   m_resetTicksMin = 1;
+    int   m_resetTicksMax = 1;
+    int   m_hitDelay      = 0;
 
     // ---- Gating ----
     bool  m_onlyWhileMoving = true;
@@ -65,18 +68,23 @@ private:
     // ---- State ----
     bool m_resetting       = false;
     int  m_resetCountdown  = 0;
+    int  m_heldTicks       = 0;
     int  m_delayCountdown  = 0;
     bool m_waitingForDelay = false;
     bool m_lastLMB         = false;
     int  m_activeMethod    = 0;   // method that started the current reset
 
+    // No reset has any business lasting longer than this. If one
+    // does, something ate a tick and a key is about to get stuck.
+    static constexpr int kMaxHoldTicks = 6;
+
     // ---- Readout ----
     int m_resets  = 0;
     int m_skipped = 0;
+    int m_rescued = 0;
     const char* m_why = "idle";
 
     jmethodID m_setSprinting = nullptr;
-    jmethodID m_isSprinting  = nullptr;
     bool m_resolved = false;
 
     std::mt19937 m_rng{ std::random_device{}() };
@@ -97,8 +105,6 @@ private:
         if (ClassResolver::entity) {
             m_setSprinting = JvmtiUtil::FindMethod(env, ClassResolver::entity,
                 { "func_70031_b", "setSprinting" }, 1);
-            m_isSprinting = JvmtiUtil::FindMethod(env, ClassResolver::entity,
-                { "func_70051_ag", "isSprinting" }, 0);
         }
         m_resolved = true;
     }
@@ -110,15 +116,16 @@ private:
     }
 
     bool IsSprinting(JNIEnv* env, jobject player) {
-        if (!m_isSprinting || !player) return true;   // cannot tell, allow
-        jboolean v = env->CallBooleanMethod(player, m_isSprinting);
-        if (env->ExceptionCheck()) { env->ExceptionClear(); return true; }
-        return v != 0;
+        if (!Minecraft::HasSprintCheck()) return true;   // cannot tell, allow
+        return Minecraft::IsSprinting(env, player);
     }
 
     // Undo whatever the reset did. Keyed on m_activeMethod rather
     // than m_method, so changing the method mid-reset cannot leave a
     // key held down forever.
+    //
+    // Release() puts the key back to whatever the hardware says now,
+    // so letting go of W mid-reset does not strand you moving.
     void EndReset(JNIEnv* env, jobject player) {
         switch (m_activeMethod) {
             case 0: KeyBinds::ReleaseForward(env); break;
@@ -133,6 +140,8 @@ private:
             SetSprintFlag(env, player, true);
 
         m_resetting = false;
+        m_resetCountdown = 0;
+        m_heldTicks = 0;
     }
 
     void BeginReset(JNIEnv* env, jobject player) {
@@ -156,6 +165,7 @@ private:
 
         m_resetting      = true;
         m_resetCountdown = RandTicks();
+        m_heldTicks      = 0;
     }
 
 public:
@@ -180,7 +190,14 @@ public:
         if (!KeyBinds::Init(env) && m_method != 5) return;
 
         jobject player = Minecraft::GetPlayer(env);
-        if (!player) return;
+
+        // No player means we cannot even read state. Unwind first so
+        // a respawn or a dimension change cannot strand a key.
+        if (!player) {
+            if (m_resetting) EndReset(env, nullptr);
+            m_why = "no player";
+            return;
+        }
 
         if (Minecraft::IsInGui(env)) {
             if (m_resetting) EndReset(env, player);
@@ -188,18 +205,30 @@ public:
             return;
         }
 
-        // Always finish an in-flight reset before considering another
+        // ---- Finish an in-flight reset before considering another ----
         if (m_resetting) {
+            m_heldTicks++;
+
+            // Watchdog. Nothing here should ever take this long, so
+            // if it has, give the key back rather than debug it live.
+            if (m_heldTicks > kMaxHoldTicks) {
+                m_rescued++;
+                EndReset(env, player);
+                m_why = "watchdog released a stuck key";
+                return;
+            }
+
             if (m_resetCountdown <= 0) EndReset(env, player);
             else m_resetCountdown--;
+
             m_why = "resetting";
             return;
         }
 
-        // Read the game's forward state rather than the physical key.
-        // The player may have rebound movement, and other modules may
-        // be driving forward themselves.
-        if (m_onlyWhileMoving && !KeyBinds::GetForward(env)) {
+        // Ask what the PLAYER is holding. Reading the keybind would
+        // return our own override during a reset, and the module
+        // would refuse to ever start another one.
+        if (m_onlyWhileMoving && !KeyBinds::PhysForward(env)) {
             m_why = "not moving";
             return;
         }
@@ -221,8 +250,8 @@ public:
         // ---- The trigger ----
         bool trigger;
         if (m_onlyOnHit) {
-            // A real swing with something in reach. This is the whole
-            // point: air swings no longer cost you momentum.
+            // A real swing with something in reach. Air swings no
+            // longer cost you momentum.
             trigger = CombatState::AttackedThisTick();
             if (CombatState::SwungThisTick() && !trigger) m_skipped++;
         } else {
@@ -251,9 +280,15 @@ public:
             jobject player = Minecraft::GetPlayer(env);
             EndReset(env, player);
         }
+        // Backstop: whatever state we thought we were in, hand every
+        // key we touched back to the player.
+        if (env) KeyBinds::ReleaseAll(env);
+
         m_waitingForDelay = false;
         m_resetCountdown  = 0;
         m_delayCountdown  = 0;
+        m_heldTicks       = 0;
+        m_why = "off";
     }
 
     void RenderSettings() override {
@@ -263,6 +298,16 @@ public:
             "%s  (%s)", m_resetting ? "RESETTING" : "idle", m_why);
         ImGui::TextDisabled("Resets %d | air swings ignored %d | your CPS %.1f",
             m_resets, m_skipped, CombatState::CPS());
+
+        if (m_rescued > 0) {
+            ImGui::TextColored(ImVec4(1.f, 0.7f, 0.3f, 1.f),
+                "Watchdog fired %d time(s): the game is dropping ticks", m_rescued);
+        }
+        if (!KeyBinds::CanReadHardware()) {
+            ImGui::TextColored(ImVec4(1.f, 0.7f, 0.3f, 1.f),
+                "Cannot read the keyboard directly: keys restore from "
+                "the saved value instead");
+        }
 
         ImGui::Separator();
         const char* methods[] = {
@@ -281,6 +326,8 @@ public:
         ImGui::SliderInt("Reset Ticks Max", &m_resetTicksMax, 1, 5);
         if (m_resetTicksMin > m_resetTicksMax) m_resetTicksMin = m_resetTicksMax;
         ImGui::SliderInt("Hit Delay (ticks)", &m_hitDelay, 0, 5);
+        ImGui::TextDisabled("Longer holds cost more momentum than they "
+                            "gain in knockback.");
 
         ImGui::Separator();
         ImGui::TextColored(ImVec4(0.5f, 0.8f, 1.f, 1.f), "Trigger");
