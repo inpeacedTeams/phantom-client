@@ -455,6 +455,117 @@ inline bool SwitchRow(const char* label, bool* v,
 }
 
 // =================================================================
+// Colour row
+// =================================================================
+// Label on the left, a rounded swatch on the right. The swatch, and
+// the whole row, open a picker in a popup. The pointer is to four
+// contiguous floats (RGBA, 0..1), so this reads and writes a colour
+// setting's storage directly.
+//
+// A checkerboard is drawn behind the swatch so a translucent colour
+// reads as translucent rather than as a darker shade. The picker
+// itself is stock ImGui::ColorPicker4 inside a popup, which is the
+// same widget the UI tab already uses for the custom accent; the
+// row, the swatch and the tooltip around it are the client's own.
+// =================================================================
+inline bool ColorRow(const char* label, float rgba[4],
+                     const char* hint = nullptr)
+{
+    ImGui::PushID(label);
+    bool changed = false;
+
+    float w = ImGui::GetContentRegionAvail().x;
+    float h = hint ? 58.0f * UI::scale : M::RowHeight;
+    ImVec2 p = ImGui::GetCursorScreenPos();
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+
+    float swW = 40.0f * UI::scale;
+    float swH = 22.0f * UI::scale;
+    ImVec2 sa(p.x + w - M::RowPadX - swW, p.y + (h - swH) * 0.5f);
+    ImVec2 sb(sa.x + swW, sa.y + swH);
+
+    // The label region is one big click target, the way an iOS row
+    // is: tapping anywhere but the switch still acts on the row.
+    ImGui::InvisibleButton("##crow", ImVec2(w - swW - M::RowPadX * 2.0f, h));
+    bool rowHover   = ImGui::IsItemHovered();
+    bool rowClicked = ImGui::IsItemClicked();
+
+    float hovT = Anim::To(ImGui::GetID("##crh"), rowHover ? 1.0f : 0.0f, 18.0f);
+    if (hovT > 0.01f) {
+        dl->AddRectFilled(p, ImVec2(p.x + w, p.y + h),
+                          Col::Alpha(Col::CardPressed, hovT * 0.4f));
+    }
+
+    float textX = p.x + M::RowPadX + (UI::rowNudge ? hovT * 3.0f : 0.0f);
+    float textRoom = (sa.x - 12.0f) - textX;
+    if (textRoom < 40.0f) textRoom = 40.0f;
+
+    if (hint) {
+        dl->PushClipRect(ImVec2(textX, p.y),
+                         ImVec2(textX + textRoom, p.y + h), true);
+        dl->AddText(ImVec2(textX, p.y + 10.0f), Col::Label, label);
+        Fonts::Push(Fonts::Caption);
+        dl->AddText(Fonts::Caption, 0.0f, ImVec2(textX, p.y + 32.0f),
+                    Col::Label2, hint, nullptr, textRoom);
+        Fonts::Pop(Fonts::Caption);
+        dl->PopClipRect();
+    } else {
+        ImVec2 ts = ImGui::CalcTextSize(label);
+        dl->PushClipRect(ImVec2(textX, p.y),
+                         ImVec2(textX + textRoom, p.y + h), true);
+        dl->AddText(ImVec2(textX, p.y + (h - ts.y) * 0.5f), Col::Label, label);
+        dl->PopClipRect();
+    }
+
+    // The swatch is its own click target on top of the row.
+    ImGui::SetCursorScreenPos(sa);
+    ImGui::InvisibleButton("##sw", ImVec2(swW, swH));
+    bool swHover = ImGui::IsItemHovered();
+    if (ImGui::IsItemClicked() || rowClicked) ImGui::OpenPopup("##cpick");
+
+    float swHovT = Anim::To(ImGui::GetID("##swh"), swHover ? 1.0f : 0.0f, 18.0f);
+    float r = 6.0f * UI::roundness + 1.0f;
+
+    // Checkerboard behind the swatch, so alpha reads as alpha. Two
+    // greys, four cells, clipped to the rounded rect.
+    dl->PushClipRect(sa, sb, true);
+    ImU32 c0 = IM_COL32(150, 150, 150, 255);
+    ImU32 c1 = IM_COL32(96, 96, 96, 255);
+    dl->AddRectFilled(sa, sb, c0, 0.0f);
+    float hx = sa.x + swW * 0.5f;
+    float hy = sa.y + swH * 0.5f;
+    dl->AddRectFilled(sa, ImVec2(hx, hy), c1, 0.0f);
+    dl->AddRectFilled(ImVec2(hx, hy), sb, c1, 0.0f);
+    dl->PopClipRect();
+
+    ImU32 col = ImGui::ColorConvertFloat4ToU32(
+        ImVec4(rgba[0], rgba[1], rgba[2], rgba[3]));
+    if (swHovT > 0.02f) Glow(dl, sa, sb, col, r, swHovT * 0.5f, 3);
+    dl->AddRectFilled(sa, sb, col, r);
+    dl->AddRect(sa, sb, Col::Alpha(Col::Label, 0.15f + 0.25f * swHovT), r, 0, 1.0f);
+
+    if (swHover) Tooltip("Click to change colour");
+
+    if (ImGui::BeginPopup("##cpick")) {
+        Fonts::Push(Fonts::BodyBold);
+        ImGui::TextUnformatted(label);
+        Fonts::Pop(Fonts::BodyBold);
+        ImGui::Spacing();
+        if (ImGui::ColorPicker4("##pk", rgba,
+                ImGuiColorEditFlags_AlphaBar |
+                ImGuiColorEditFlags_NoSidePreview |
+                ImGuiColorEditFlags_DisplayRGB |
+                ImGuiColorEditFlags_DisplayHex))
+            changed = true;
+        ImGui::EndPopup();
+    }
+
+    ImGui::SetCursorScreenPos(ImVec2(p.x, p.y + h));
+    ImGui::PopID();
+    return changed;
+}
+
+// =================================================================
 // Animated expanding container
 // =================================================================
 // The content height is not known in advance, and a zero-height
