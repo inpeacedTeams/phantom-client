@@ -21,10 +21,15 @@ unit: `src/dllmain.cpp` plus the ImGui sources.
 
 ## Keybinds
 
+Every module bind below is a **default** and can be rebound live from the menu:
+open a module and click its keybind chip, then press the key (BACKSPACE clears
+it, ESC cancels). Binds are saved with the config. INSERT and DELETE are
+reserved and cannot be bound to a module.
+
 | Key | Action |
 |-----|--------|
-| INSERT | Toggle menu |
-| DELETE | Eject |
+| INSERT | Toggle menu (reserved) |
+| DELETE | Eject (reserved) |
 | B | Velocity |
 | R | Aim Assist |
 | K | Kill Aura |
@@ -109,22 +114,40 @@ list that is being freed underneath it.
 
 **Held keys.** Modules hold real keybinds down. Leaving a world, disabling a
 module and ejecting all release them, so a disconnect mid-fight cannot leave you
-sprinting into a wall in the next game.
+sprinting into a wall in the next game. `KeyBinds::Reconcile` runs at the end of
+every tick as a backstop: any key we drove but are no longer driving is put back
+in line with the hardware, so a missed release costs one tick instead of the
+rest of the fight.
 
-## Profiles
+## Configs and presets
 
-The Configs tab loads a profile: it enables the right modules, forces the
-dangerous ones off, and sets values tuned for that server's anticheat.
+The Configs tab holds two different things.
 
-| Profile | For |
-|---------|-----|
+**Presets** are built in and read-only. Each is an opinionated starting point
+tuned for a particular anticheat; applying one overwrites your current settings.
+
+| Preset | For |
+|--------|-----|
 | Minemen (AGC) | Duel server on Karhu-based prediction. Keyboard-level only |
 | Polar | MineBlaze, Pika, GommeHD. Legit combat plus bridging |
 | Legit | Minimum values. Safe under spectator and on video |
 | Blatant | No-anticheat servers only |
 
-Profiles bind by name to settings each module registers with `Bind()`. Adding a
+Presets bind by name to settings each module registers with `Bind()`. Adding a
 new tunable is one `Bind("Name", &field)` call in the constructor.
+
+**Configs** are yours, saved to disk and loaded by name. They live in
+`%APPDATA%\Phantom` as plain text (one `key=value` per line, format v2) so you
+can open and edit one by hand. `default.cfg` is written automatically at eject
+and once a minute while you play, so doing nothing at all still gets you
+persistence and a crash never costs a session. Writes go through a temp file and
+an atomic rename, so a crash mid-write cannot leave a truncated config.
+
+Loading is forward and backward compatible: unknown keys are ignored, missing
+keys keep the module's default, malformed lines are skipped and counted, and
+values are clamped to each setting's range on the way in. A config from a build
+with a module or setting this one lacks loads fine; a config from an older build
+is migrated where a key has been replaced.
 
 ## Module status
 
@@ -135,7 +158,7 @@ new tunable is one `Bind("Name", &field)` call in the constructor.
 | Auto Blockhit | Combat | Working. Drives `keyBindUseItem` |
 | Aim Assist | Combat | Working |
 | Hit Select | Combat | Working. Emits through the shared click floor |
-| Click Assist | Combat | Working. Butterfly, drag, jitter on the 1ms thread |
+| Auto Clicker | Combat | Working. Butterfly, drag, jitter on the 1ms thread |
 | Kill Aura | Combat | Working. Loud, detected everywhere |
 | Backtrack | Combat | Working. Position rewind, no packet hook |
 | Bridge Assist | Movement | Working |
@@ -145,6 +168,11 @@ new tunable is one `Bind("Name", &field)` call in the constructor.
 | Fly | Movement | Working. Detected by prediction ACs |
 | ESP | Visual | Working. Own view-projection, not GL matrices |
 | Fullbright | Visual | Working |
+
+When a module cannot resolve something it needs (a keybind, `getHealth()`, the
+click counter), it says so as an on-screen notice and its settings panel shows a
+callout, rather than silently doing nothing. A module that throws repeatedly is
+switched off on its own and the rest of the client keeps running.
 
 ## Known gaps
 
@@ -159,17 +187,17 @@ new tunable is one `Bind("Name", &field)` call in the constructor.
   the ESP health bar falls back to full.
 - **Speed and Fly** will not survive a prediction anticheat. They are there for
   unprotected servers.
-- Profiles live in code. No save/load to disk yet.
-- Keybinds are fixed at compile time. No rebinding in the menu.
 
 ## Troubleshooting
 
-The DLL opens a console. If class resolution fails it dumps every loaded class
-signature so you can find the obfuscated names by hand, then extend the
-candidate lists in that module's `JvmtiUtil::FindField` call.
+In a **debug build** (or a release built with `PHANTOM_CONSOLE` defined) the DLL
+opens a console. If class resolution fails it dumps every loaded class signature
+so you can find the obfuscated names by hand, then extend the candidate lists in
+that module's `JvmtiUtil::FindField` call. A normal release build has no
+console: everything the player needs arrives as an on-screen notification.
 
 Injecting at the main menu is fine. Startup retries for 60 seconds, and keybinds
 and the entity list keep retrying quietly until a world loads.
 
-If a module prints "unresolved" in its settings panel, that lookup failed and
-the module is inert rather than silently doing nothing.
+If a module shows an "unresolved" callout in its settings panel, that lookup
+failed and the module is inert rather than silently doing nothing.
