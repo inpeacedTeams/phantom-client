@@ -6,6 +6,7 @@
 #include "../../input/click_scheduler.h"
 #include <imgui.h>
 #include <Windows.h>
+#include <cstdio>
 
 // =================================================================
 // Click Assist
@@ -14,6 +15,12 @@
 // What flags is the SHAPE of the click stream, so all of the shape
 // logic lives in ClickScheduler and this module only decides when
 // clicking is allowed and what the stream should look like.
+//
+// THE PANEL IS THREE CONTROLS
+// Pattern, CPS range, and when to run. Everything else has a
+// sensible default derived from how real hands behave, and lives
+// behind Advanced. Thirty sliders is not more power, it is just a
+// worse chance of setting one of them wrong.
 //
 // WHY THE MODULE NO LONGER OWNS THE TIMING
 // It used to hand the scheduler a std::function that reached back
@@ -40,32 +47,30 @@
 
 class ClickAssist : public Module {
 private:
-    // ---- Shape ----
+    // ---- Core ----
     int   m_pattern = 1;
     float m_minCPS  = 15.0f;
     float m_maxCPS  = 20.0f;
 
-    // ---- When to run ----
-    // 0 while holding LMB, 1 while holding and a target is near,
-    // 2 always
+    // 0 while holding LMB, 1 holding and a target is near, 2 always
     int   m_trigger       = 0;
     bool  m_requireTarget = false;
     float m_targetRange   = 4.0f;
 
-    // Butterfly
+    // ---- Advanced: butterfly shape ----
     int   m_pairGapMin     = 22;
     int   m_pairGapMax     = 38;
     int   m_restGapMin     = 62;
     int   m_restGapMax     = 98;
     float m_pairSkipChance = 6.0f;
 
-    // Drag
+    // ---- Advanced: drag shape ----
     int   m_burstLenMin = 3;
     int   m_burstLenMax = 7;
     int   m_burstGapMin = 90;
     int   m_burstGapMax = 170;
 
-    // Humanisation
+    // ---- Advanced: humanisation ----
     bool  m_jitter         = true;
     float m_jitterAmount   = 26.0f;
     bool  m_fatigue        = true;
@@ -76,7 +81,7 @@ private:
     int   m_outlierAddMin  = 40;
     int   m_outlierAddMax  = 120;
 
-    // Safety
+    // ---- Advanced: safety ----
     int   m_hardFloorMs   = 24;
     bool  m_entropyGuard  = true;
     float m_minStdDev     = 9.0f;
@@ -85,9 +90,10 @@ private:
     int   m_breakLenMin   = 2;
     int   m_breakLenMax   = 5;
 
-    // Readout, written only on the client thread
+    // ---- Readout, written only on the client thread ----
     const char* m_why = "idle";
-    int m_delivered = 0;
+    int  m_delivered = 0;
+    char m_status[48] = { 0 };
 
     ClickProfile BuildProfile() const {
         ClickProfile p;
@@ -170,6 +176,7 @@ public:
         ClickScheduler::ClearPending();
         if (env) KeyBinds::ClearClickQueue(env);
         m_why = "off";
+        m_status[0] = '\0';
     }
 
     // Decides only whether the stream should be running. The clicks
@@ -181,6 +188,7 @@ public:
         if (!player) {
             ClickScheduler::SetActive(false);
             m_why = "no player";
+            m_status[0] = '\0';
             return;
         }
 
@@ -191,6 +199,7 @@ public:
             ClickScheduler::SetActive(false);
             KeyBinds::ClearClickQueue(env);
             m_why = "menu";
+            m_status[0] = '\0';
             return;
         }
 
@@ -222,88 +231,112 @@ public:
 
         ClickScheduler::SetActive(active);
         m_why = active ? "clicking" : why;
+
+        // Collapsed-row summary
+        if (active) snprintf(m_status, sizeof(m_status), "%.1f CPS",
+                             ClickScheduler::LiveCPS());
+        else        snprintf(m_status, sizeof(m_status), "%s", why);
     }
 
     void NoteDelivered(int n) { m_delivered += n; }
 
+    const char* StatusLine() const override {
+        return m_status[0] ? m_status : nullptr;
+    }
+
+    bool HasAdvanced() const override { return true; }
+
+    // -------------------------------------------------------------
+    // Core panel
+    // -------------------------------------------------------------
     void RenderSettings() override {
-        // ---- Live ----
         bool ok = ClickScheduler::IsRunning();
-        ImGui::TextColored(ok ? ImVec4(0.4f, 1.f, 0.6f, 1.f)
-                              : ImVec4(1.f, 0.4f, 0.4f, 1.f),
-            "%s  (%s)", ok ? "Timer running" : "TIMER DEAD", m_why);
-
-        ImGui::TextDisabled("Delivered %d | queued %lld | last gap %lld ms",
-            m_delivered, ClickScheduler::Emitted(), ClickScheduler::LastGap());
-
-        float sd = ClickScheduler::LiveStdDev();
-        if (sd < 900.f) {
-            ImVec4 col = (sd < m_minStdDev) ? ImVec4(1.f, 0.45f, 0.35f, 1.f)
-                                            : ImVec4(0.4f, 1.f, 0.6f, 1.f);
-            ImGui::TextColored(col, "Measured %.1f CPS | std-dev %.1f ms",
-                ClickScheduler::LiveCPS(), sd);
+        if (!ok) {
+            ImGui::TextColored(ImVec4(1.f, 0.4f, 0.4f, 1.f),
+                "Click timer is not running");
         }
-
         if (!KeyBinds::HasClickQueue()) {
             ImGui::TextColored(ImVec4(1.f, 0.4f, 0.4f, 1.f),
                 "pressTime unresolved: clicks cannot reach the game");
         }
 
-        ImGui::Separator();
         const char* pats[] = { "Normal", "Butterfly", "Drag", "Jitter" };
         ImGui::Combo("Pattern", &m_pattern, pats, 4);
+        switch (m_pattern) {
+            case 0: ImGui::TextDisabled("One even stream. Honest up to about 14."); break;
+            case 1: ImGui::TextDisabled("Two-finger pairs. The only real way past 16."); break;
+            case 2: ImGui::TextDisabled("Dense bursts with a longer recovery gap."); break;
+            case 3: ImGui::TextDisabled("Wide spread at a middling rate."); break;
+        }
 
         if (m_pattern == 0 && m_maxCPS > 15.f) {
             ImGui::TextColored(ImVec4(1.f, 0.45f, 0.35f, 1.f),
-                "! A flat stream above 15 CPS is not humanly reachable");
+                "A flat stream above 15 CPS is not humanly reachable");
         }
 
         ImGui::SliderFloat("Min CPS", &m_minCPS, 1.f, 24.f, "%.0f");
         ImGui::SliderFloat("Max CPS", &m_maxCPS, 1.f, 26.f, "%.0f");
         if (m_minCPS > m_maxCPS) m_minCPS = m_maxCPS;
 
-        ImGui::Separator();
-        ImGui::TextColored(ImVec4(0.5f, 0.8f, 1.f, 1.f), "When to run");
         const char* trig[] = { "Holding LMB", "Holding + target", "Always" };
-        ImGui::Combo("Trigger", &m_trigger, trig, 3);
+        ImGui::Combo("Run", &m_trigger, trig, 3);
         if (m_trigger == 2) {
             ImGui::TextColored(ImVec4(1.f, 0.45f, 0.35f, 1.f),
                 "Always-on clicking in a lobby is the easiest thing to spot");
         }
-        ImGui::Checkbox("Require Target In Range", &m_requireTarget);
-        if (m_requireTarget)
-            ImGui::SliderFloat("Target Range", &m_targetRange, 2.f, 8.f, "%.1f");
+
+        // Live measurement is worth keeping up front: it is the only
+        // way to see whether the shape you picked is actually what
+        // is leaving the client.
+        float sd = ClickScheduler::LiveStdDev();
+        if (sd < 900.f) {
+            ImVec4 col = (sd < m_minStdDev) ? ImVec4(1.f, 0.45f, 0.35f, 1.f)
+                                            : ImVec4(0.4f, 1.f, 0.6f, 1.f);
+            ImGui::TextColored(col, "Live: %.1f CPS, spread %.1f ms",
+                ClickScheduler::LiveCPS(), sd);
+        }
+    }
+
+    // -------------------------------------------------------------
+    // Advanced
+    // -------------------------------------------------------------
+    void RenderAdvanced() override {
+        ImGui::TextDisabled("Delivered %d | last gap %lld ms",
+            m_delivered, ClickScheduler::LastGap());
+
+        if (m_trigger != 2) {
+            ImGui::Checkbox("Require Target In Range", &m_requireTarget);
+            if (m_requireTarget)
+                ImGui::SliderFloat("Target Range", &m_targetRange, 2.f, 8.f, "%.1f");
+        }
 
         if (m_pattern == 1) {
-            ImGui::Separator();
-            ImGui::TextColored(ImVec4(1.f, 0.6f, 0.3f, 1.f), "Butterfly shape");
-            ImGui::SliderInt("Pair Gap Min (ms)", &m_pairGapMin, 18, 60);
-            ImGui::SliderInt("Pair Gap Max (ms)", &m_pairGapMax, 18, 80);
+            ImGui::SeparatorText("Butterfly shape");
+            ImGui::SliderInt("Pair Gap Min", &m_pairGapMin, 18, 60);
+            ImGui::SliderInt("Pair Gap Max", &m_pairGapMax, 18, 80);
             if (m_pairGapMin > m_pairGapMax) m_pairGapMin = m_pairGapMax;
-            ImGui::SliderInt("Rest Gap Min (ms)", &m_restGapMin, 30, 160);
-            ImGui::SliderInt("Rest Gap Max (ms)", &m_restGapMax, 30, 220);
+            ImGui::SliderInt("Rest Gap Min", &m_restGapMin, 30, 160);
+            ImGui::SliderInt("Rest Gap Max", &m_restGapMax, 30, 220);
             if (m_restGapMin > m_restGapMax) m_restGapMin = m_restGapMax;
-            ImGui::SliderFloat("Pair Skip Chance", &m_pairSkipChance, 0.f, 20.f, "%.0f%%");
+            ImGui::SliderFloat("Pair Skip", &m_pairSkipChance, 0.f, 20.f, "%.0f%%");
 
             float avgPair = (m_pairGapMin + m_pairGapMax) * 0.5f;
             float avgRest = (m_restGapMin + m_restGapMax) * 0.5f;
-            ImGui::TextColored(ImVec4(0.4f, 1.f, 0.6f, 1.f),
-                "Shape implies about %.1f CPS", 2000.0f / (avgPair + avgRest));
+            ImGui::TextDisabled("Shape implies about %.1f CPS",
+                2000.0f / (avgPair + avgRest));
         }
 
         if (m_pattern == 2) {
-            ImGui::Separator();
-            ImGui::TextColored(ImVec4(1.f, 0.6f, 0.3f, 1.f), "Drag shape");
+            ImGui::SeparatorText("Drag shape");
             ImGui::SliderInt("Burst Len Min", &m_burstLenMin, 2, 10);
             ImGui::SliderInt("Burst Len Max", &m_burstLenMax, 2, 14);
             if (m_burstLenMin > m_burstLenMax) m_burstLenMin = m_burstLenMax;
-            ImGui::SliderInt("Burst Gap Min (ms)", &m_burstGapMin, 50, 250);
-            ImGui::SliderInt("Burst Gap Max (ms)", &m_burstGapMax, 50, 350);
+            ImGui::SliderInt("Burst Gap Min", &m_burstGapMin, 50, 250);
+            ImGui::SliderInt("Burst Gap Max", &m_burstGapMax, 50, 350);
             if (m_burstGapMin > m_burstGapMax) m_burstGapMin = m_burstGapMax;
         }
 
-        ImGui::Separator();
-        ImGui::TextColored(ImVec4(0.5f, 0.8f, 1.f, 1.f), "Humanisation");
+        ImGui::SeparatorText("Humanisation");
         ImGui::Checkbox("Jitter", &m_jitter);
         if (m_jitter)
             ImGui::SliderFloat("Jitter Amount", &m_jitterAmount, 5.f, 50.f, "%.0f%%");
@@ -327,13 +360,13 @@ public:
             if (m_breakLenMin > m_breakLenMax) m_breakLenMin = m_breakLenMax;
         }
 
-        ImGui::Separator();
-        ImGui::TextColored(ImVec4(1.f, 0.85f, 0.4f, 1.f), "Entropy guard");
+        ImGui::SeparatorText("Safety");
         ImGui::Checkbox("Enforce Variance", &m_entropyGuard);
         if (m_entropyGuard)
-            ImGui::SliderFloat("Min Std Dev (ms)", &m_minStdDev, 3.f, 25.f, "%.0f");
+            ImGui::SliderFloat("Min Spread (ms)", &m_minStdDev, 3.f, 25.f, "%.0f");
         ImGui::SliderInt("Hard Floor (ms)", &m_hardFloorMs, 18, 50);
-        ImGui::TextDisabled("Shared with Hit Select, so the two cannot stack.");
+        ImGui::TextDisabled("Shared with Hit Select, so the two cannot stack "
+                            "into an interval no hand could produce.");
 
         long long dropped = ClickScheduler::Dropped();
         if (dropped > 20) {
