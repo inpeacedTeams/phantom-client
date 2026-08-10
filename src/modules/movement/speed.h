@@ -2,8 +2,8 @@
 #include "../module.h"
 #include "../../mc/minecraft.h"
 #include "../../mc/keybinds.h"
+#include "../../mc/movement.h"
 #include "../../mc/combat_state.h"
-#include <imgui.h>
 #include <cstdio>
 #include <cmath>
 #include <random>
@@ -38,6 +38,8 @@
 
 class Speed : public Module {
 private:
+    static constexpr const char* kModes[] = { "Sprint Jump", "Strafe", "BHop" };
+
     // ---- Core ----
     int   m_mode       = 0;
     float m_multiplier = 1.6f;
@@ -103,16 +105,12 @@ private:
         if (m_pauseInCombat && CombatState::TicksSinceHit() < m_combatPause)
             return;
 
-        bool fwd   = KeyBinds::GetForward(env);
-        bool left  = KeyBinds::GetLeft(env);
-        bool right = KeyBinds::GetRight(env);
-        bool moving = m_forwardOnly ? fwd : (fwd || left || right);
+        Movement::Input in = Movement::Read(env);
+        bool moving = m_forwardOnly ? (in.forward > 0.f) : in.moving;
         if (!moving) { m_hops = 0; return; }
 
         // Actually travelling, not walking into a wall
-        double mx = Minecraft::GetMotionX(env, player);
-        double mz = Minecraft::GetMotionZ(env, player);
-        if (std::sqrt(mx * mx + mz * mz) < 0.08) return;
+        if (Movement::Speed2D(env, player) < 0.08) return;
 
         // If the flag could not be resolved we hop anyway rather
         // than silently doing nothing forever.
@@ -137,33 +135,11 @@ private:
     // -------------------------------------------------------------
     // Motion modes
     // -------------------------------------------------------------
-    static float MoveAngle(float yaw, float forward, float strafe) {
-        if (forward > 0.f) {
-            if (strafe > 0.f)      return yaw - 45.f;
-            if (strafe < 0.f)      return yaw + 45.f;
-            return yaw;
-        }
-        if (forward < 0.f) {
-            if (strafe > 0.f)      return yaw - 135.f;
-            if (strafe < 0.f)      return yaw + 135.f;
-            return yaw + 180.f;
-        }
-        if (strafe > 0.f)          return yaw - 90.f;
-        if (strafe < 0.f)          return yaw + 90.f;
-        return yaw;
-    }
-
     void TickMotion(JNIEnv* env, jobject player) {
-        static constexpr double kBaseSpeed = 0.2873;   // vanilla sprint
-
         bool onGround = Minecraft::IsOnGround(env, player);
         if (m_groundOnly && !onGround) return;
 
-        bool fwd   = KeyBinds::GetForward(env);
-        bool back  = KeyBinds::GetBack(env);
-        bool left  = KeyBinds::GetLeft(env);
-        bool right = KeyBinds::GetRight(env);
-        if (!fwd && !back && !left && !right) return;
+        if (!Movement::Read(env).moving) return;
 
         if (m_mode == 2) {                  // BHop
             if (onGround) Minecraft::SetMotionY(env, player, 0.4);
@@ -174,35 +150,62 @@ private:
             return;
         }
 
-        float forward = (fwd ? 1.f : 0.f) - (back ? 1.f : 0.f);
-        float strafe  = (left ? 1.f : 0.f) - (right ? 1.f : 0.f);
-        float angle   = MoveAngle(Minecraft::GetYaw(env, player), forward, strafe);
-
-        double rad   = angle * 3.14159265358979 / 180.0;
-        double speed = kBaseSpeed * m_multiplier;
-
-        Minecraft::SetMotionX(env, player, -std::sin(rad) * speed);
-        Minecraft::SetMotionZ(env, player,  std::cos(rad) * speed);
+        Movement::SetHorizontal(env, player,
+                                Movement::kSprintSpeed * m_multiplier);
     }
 
 public:
     Speed() : Module("Speed", "Sprint jump automatically, or force raw motion",
                      ModuleCategory::MOVEMENT, 'F')
     {
-        Bind("Mode", &m_mode);
-        Bind("Multiplier", &m_multiplier);
-        Bind("Ground Only", &m_groundOnly);
-        Bind("Require Sprint", &m_requireSprint);
-        Bind("Forward Only", &m_forwardOnly);
-        Bind("Pause In Combat", &m_pauseInCombat);
-        Bind("Combat Pause", &m_combatPause);
-        Bind("Skip Chance", &m_skipChance);
-        Bind("Ground Ticks Min", &m_groundTicksMin);
-        Bind("Ground Ticks Max", &m_groundTicksMax);
+        BindMode("Mode", &m_mode, kModes, 3,
+                 "Sprint Jump only presses space, so the server sees a normal "
+                 "player. The other two rewrite your motion and are caught by "
+                 "any prediction anticheat.");
+
+        Bind("Multiplier", &m_multiplier, 1.0f, 3.0f, "%.2fx",
+             "How much faster than a vanilla sprint")
+            .Unless("Mode", 0);
+
+        Bind("Require Sprint", &m_requireSprint,
+             "Only hop while actually sprinting")
+            .When("Mode", 0).Advanced();
+
+        Bind("Forward Only", &m_forwardOnly,
+             "No hopping while strafing sideways")
+            .When("Mode", 0).Advanced();
+
+        Bind("Pause After A Hit", &m_pauseInCombat,
+             "Keeps the ground free for More KB and Velocity")
+            .When("Mode", 0).Advanced();
+
+        Bind("Combat Pause", &m_combatPause, 2, 20,
+             "Ticks of quiet after taking a hit")
+            .When("Mode", 0).Advanced();
+
+        Bind("Skip Chance", &m_skipChance, 0.0f, 25.0f, "%.0f%%",
+             "Miss the occasional hop, the way a person does")
+            .When("Mode", 0).Advanced();
+
+        Bind("Ground Ticks Min", &m_groundTicksMin, 1, 6,
+             "Shortest pause on the ground between hops")
+            .When("Mode", 0).Advanced();
+
+        Bind("Ground Ticks Max", &m_groundTicksMax, 1, 8,
+             "Longest pause on the ground between hops")
+            .When("Mode", 0).Advanced();
+
+        Bind("Ground Only", &m_groundOnly,
+             "Do not touch your motion while airborne")
+            .Unless("Mode", 0).Advanced();
     }
 
     void OnTick(JNIEnv* env) override {
         if (!KeyBinds::Init(env)) return;
+
+        // A slider cannot produce this, but a hand-edited config can
+        if (m_groundTicksMin > m_groundTicksMax)
+            m_groundTicksMin = m_groundTicksMax;
 
         jobject player = Minecraft::GetPlayer(env);
         if (!player) { ReleaseJump(env); return; }
@@ -222,62 +225,40 @@ public:
         ReleaseJump(env);
         m_groundTicks = 0;
         m_hops = 0;
+        m_status[0] = '\0';
+    }
+
+    // A world change leaves the jump key state and the hop counter
+    // describing a game that no longer exists.
+    void OnReset(JNIEnv* env) override {
+        ReleaseJump(env);
+        m_groundTicks = 0;
+        m_targetGround = 1;
+        m_hops = 0;
+    }
+
+    NoticeLevel Notice(const char** text) const override {
+        if (m_mode != 0) {
+            *text = "Rewrites your motion vector. Caught on the first tick by "
+                    "AGC, Grim and Polar. Unprotected servers only.";
+            return NoticeLevel::Danger;
+        }
+        if (!KeyBinds::HasJump()) {
+            *text = "The jump keybind could not be found in this build of the "
+                    "game, so the module cannot do anything.";
+            return NoticeLevel::Warning;
+        }
+        if (m_requireSprint && !Minecraft::HasSprintCheck()) {
+            *text = "The sprint flag could not be resolved, so Require Sprint "
+                    "is being ignored and it hops regardless.";
+            return NoticeLevel::Info;
+        }
+        return NoticeLevel::None;
     }
 
     const char* StatusLine() const override {
         if (m_mode == 0) snprintf(m_status, sizeof(m_status), "%d hops", m_hops);
         else             snprintf(m_status, sizeof(m_status), "%.2fx motion", m_multiplier);
         return m_status;
-    }
-
-    bool HasAdvanced() const override { return true; }
-
-    void RenderSettings() override {
-        const char* modes[] = { "Sprint Jump", "Strafe", "BHop" };
-        ImGui::Combo("Mode", &m_mode, modes, 3);
-
-        if (m_mode == 0) {
-            ImGui::TextColored(ImVec4(0.4f, 1.f, 0.6f, 1.f),
-                "Input only. Same packets as a player spamming space.");
-            if (!KeyBinds::HasJump()) {
-                ImGui::TextColored(ImVec4(1.f, 0.8f, 0.3f, 1.f),
-                    "Jump keybind unresolved: module inactive");
-            }
-            return;
-        }
-
-        ImGui::TextColored(ImVec4(1.f, 0.35f, 0.3f, 1.f),
-            "Rewrites motion. Caught instantly by AGC, Grim and Polar");
-        ImGui::SliderFloat("Multiplier", &m_multiplier, 1.0f, 3.0f, "%.2fx");
-    }
-
-    void RenderAdvanced() override {
-        if (m_mode != 0) {
-            ImGui::Checkbox("Ground Only", &m_groundOnly);
-            return;
-        }
-
-        ImGui::Checkbox("Require Sprint", &m_requireSprint);
-        if (m_requireSprint && !Minecraft::HasSprintCheck()) {
-            ImGui::TextColored(ImVec4(1.f, 0.8f, 0.3f, 1.f),
-                "Sprint flag unresolved: hopping without the check");
-        }
-        ImGui::Checkbox("Forward Only", &m_forwardOnly);
-        ImGui::Checkbox("Pause After Taking A Hit", &m_pauseInCombat);
-        if (m_pauseInCombat) {
-            ImGui::SliderInt("Combat Pause (ticks)", &m_combatPause, 2, 20);
-            ImGui::TextDisabled("Keeps the ground free for More KB and Velocity.");
-        }
-
-        ImGui::SeparatorText("Rhythm");
-        ImGui::SliderFloat("Skip Chance", &m_skipChance, 0.f, 25.f, "%.0f%%");
-        ImGui::SliderInt("Ground Ticks Min", &m_groundTicksMin, 1, 6);
-        ImGui::SliderInt("Ground Ticks Max", &m_groundTicksMax, 1, 8);
-        if (m_groundTicksMin > m_groundTicksMax)
-            m_groundTicksMin = m_groundTicksMax;
-
-        float avgGround = (m_groundTicksMin + m_groundTicksMax) * 0.5f;
-        ImGui::TextDisabled("About one hop every %.1f ticks (%d this session)",
-            avgGround + 11.0f, m_hops);
     }
 };
