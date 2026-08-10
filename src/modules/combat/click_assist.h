@@ -48,7 +48,7 @@ private:
     // ---- When to run ----
     // 0 while holding LMB, 1 while holding and a target is near,
     // 2 always
-    int   m_trigger      = 0;
+    int   m_trigger       = 0;
     bool  m_requireTarget = false;
     float m_targetRange   = 4.0f;
 
@@ -162,6 +162,7 @@ public:
     void OnEnable(JNIEnv*) override {
         ClickScheduler::SetRightButton(false);
         ClickScheduler::SetProfile(BuildProfile());
+        m_why = "armed";
     }
 
     void OnDisable(JNIEnv* env) override {
@@ -177,7 +178,11 @@ public:
         ClickScheduler::SetProfile(BuildProfile());
 
         jobject player = Minecraft::GetPlayer(env);
-        if (!player) { ClickScheduler::SetActive(false); m_why = "no player"; return; }
+        if (!player) {
+            ClickScheduler::SetActive(false);
+            m_why = "no player";
+            return;
+        }
 
         if (Minecraft::IsInGui(env)) {
             // runTick does not consume pressTime while a screen is
@@ -192,22 +197,31 @@ public:
         bool holding = (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0;
 
         bool active;
+        const char* why;
+
         switch (m_trigger) {
-            case 1:  active = holding && CombatState::HasTarget(); break;
-            case 2:  active = true; break;
-            default: active = holding; break;
+            case 1:
+                active = holding && CombatState::HasTarget();
+                why = !holding ? "not holding" : "no target";
+                break;
+            case 2:
+                active = true;
+                why = "always on";
+                break;
+            default:
+                active = holding;
+                why = "not holding";
+                break;
         }
 
         if (active && m_requireTarget
             && CombatState::TargetDist() > (double)m_targetRange) {
             active = false;
-            m_why = "nothing in range";
+            why = "nothing in range";
         }
 
         ClickScheduler::SetActive(active);
-
-        if (!active && m_why[0] != 'n') m_why = holding ? "waiting" : "not holding";
-        else if (active) m_why = "clicking";
+        m_why = active ? "clicking" : why;
     }
 
     void NoteDelivered(int n) { m_delivered += n; }
