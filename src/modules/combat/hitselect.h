@@ -4,7 +4,6 @@
 #include "../../mc/entity_list.h"
 #include "../../mc/combat_state.h"
 #include "../../input/click_scheduler.h"
-#include <imgui.h>
 #include <Windows.h>
 #include <cstdio>
 #include <random>
@@ -35,6 +34,10 @@
 
 class HitSelect : public Module {
 private:
+    // hurtTime starts here and counts down, so "start" is the
+    // earliest tick and the larger number.
+    static constexpr int kHurtTimeOnHit = 10;
+
     // ---- Core ----
     float m_chance = 85.0f;
 
@@ -58,7 +61,8 @@ private:
     int m_dropped = 0;
     int m_skipped = 0;
     const char* m_why = "idle";
-    mutable char m_status[40] = "";
+    mutable char m_status[48] = "";
+    mutable char m_notice[192] = "";
 
     std::mt19937 m_rng{ std::random_device{}() };
 
@@ -71,20 +75,51 @@ public:
     HitSelect() : Module("Hit Select", "Click on the tick you take knockback",
                          ModuleCategory::COMBAT, 0)
     {
-        Bind("Window Start", &m_windowStart);
-        Bind("Window End", &m_windowEnd);
-        Bind("Chance", &m_chance);
-        Bind("Require Target", &m_requireTarget);
-        Bind("Target Range", &m_targetRange);
-        Bind("Require Combat", &m_requireCombat);
-        Bind("Respect Rhythm", &m_respectRhythm);
-        Bind("Min Gap", &m_minGapMs);
+        Bind("Chance", &m_chance, 10.0f, 100.0f, "%.0f%%",
+             "How many incoming hits get answered");
+
+        Bind("Window Start", &m_windowStart, 1, 10,
+             "Earliest tick after the hit. 10 is the tick the damage "
+             "arrived, which is the strongest and the most obvious.")
+            .Advanced();
+
+        Bind("Window End", &m_windowEnd, 1, 10,
+             "Latest tick after the hit. Past three ticks the knockback "
+             "has already resolved.")
+            .Advanced();
+
+        Bind("Require Target", &m_requireTarget,
+             "Swinging at nothing on the exact tick you take damage is not "
+             "something a player does")
+            .Advanced();
+
+        Bind("Target Range", &m_targetRange, 2.0f, 6.0f, "%.1f",
+             "How close something has to be to count")
+            .When("Require Target", 1).Advanced();
+
+        Bind("Require Combat", &m_requireCombat,
+             "Ignore fall damage and fire ticks")
+            .Advanced();
+
+        Bind("Respect Your Rhythm", &m_respectRhythm,
+             "Never click sooner after your own swing than you already "
+             "were. An interval that only appears after damage is its own "
+             "fingerprint.")
+            .Advanced();
+
+        Bind("Min Gap", &m_minGapMs, 40, 200,
+             "Milliseconds that must have passed since your last swing")
+            .When("Respect Your Rhythm", 1).Advanced();
     }
 
     void OnTick(JNIEnv* env) override {
         jobject player = Minecraft::GetPlayer(env);
         if (!player) return;
         if (Minecraft::IsInGui(env)) { m_why = "menu"; return; }
+
+        // A hand-edited config can invert the window; the sliders
+        // cannot, and an inverted window silently never fires.
+        if (m_windowEnd > m_windowStart) m_windowEnd = m_windowStart;
 
         int hurtTime = CombatState::HurtTime();
 
@@ -108,8 +143,6 @@ public:
             return;
         }
 
-        // Swinging at nothing on the exact tick you take damage is
-        // not something a player does.
         if (m_requireTarget) {
             if (!EntityList::Init(env)) return;
             if (EntityList::GetPlayers(env, m_targetRange).empty()) {
@@ -118,9 +151,7 @@ public:
             }
         }
 
-        // Do not fire faster than you were already clicking. An
-        // interval that only ever appears right after damage is its
-        // own fingerprint.
+        // Do not fire faster than you were already clicking.
         if (m_respectRhythm) {
             long long since = CombatState::MsSinceSwing();
             if (since < m_minGapMs) {
@@ -145,6 +176,16 @@ public:
     void OnDisable(JNIEnv*) override {
         m_firedThisHit = false;
         m_lastHurtTime = 0;
+        m_status[0] = '\0';
+    }
+
+    // hurtTime is zero in a fresh world, so a stale one would look
+    // like a hit that never happened.
+    void OnReset(JNIEnv*) override {
+        m_firedThisHit = false;
+        m_lastHurtTime = 0;
+        m_fired = m_dropped = m_skipped = 0;
+        m_why = "idle";
     }
 
     const char* StatusLine() const override {
@@ -152,45 +193,23 @@ public:
         return m_status;
     }
 
-    bool HasAdvanced() const override { return true; }
-
-    void RenderSettings() override {
-        ImGui::SliderFloat("Chance", &m_chance, 10.f, 100.f, "%.0f%%");
-        ImGui::TextDisabled("Fires one click on the tick a hit lands on you, "
-                            "which cancels part of the knockback.");
-
-        if (m_dropped > m_fired && m_fired > 4) {
-            ImGui::TextColored(ImVec4(1.f, 0.7f, 0.3f, 1.f),
-                "Mostly dropped: the autoclicker is saturating the rate");
-        }
+    NoticeLevel Notice(const char** text) const override {
         if (!CombatState::IsUsable()) {
-            ImGui::TextColored(ImVec4(1.f, 0.7f, 0.3f, 1.f),
-                "Swing detection unresolved: the rhythm check is blind");
+            *text = "Swing detection could not be resolved, so the rhythm "
+                    "check is blind and the timing will be cruder.";
+            return NoticeLevel::Warning;
         }
-    }
-
-    void RenderAdvanced() override {
-        ImGui::TextDisabled("%s | fired %d, dropped %d, skipped %d",
-            m_why, m_fired, m_dropped, m_skipped);
-
-        ImGui::SeparatorText("Window");
-        ImGui::SliderInt("Start", &m_windowStart, 1, 10);
-        ImGui::SliderInt("End", &m_windowEnd, 1, 10);
-        if (m_windowEnd > m_windowStart) m_windowEnd = m_windowStart;
-        ImGui::TextDisabled("hurtTime counts down from 10, so this is ticks "
-                            "%d to %d after the hit lands.",
-                            10 - m_windowStart, 10 - m_windowEnd);
-
-        ImGui::SeparatorText("Gating");
-        ImGui::Checkbox("Require Target", &m_requireTarget);
-        if (m_requireTarget)
-            ImGui::SliderFloat("Target Range", &m_targetRange, 2.f, 6.f, "%.1f");
-        ImGui::Checkbox("Require Combat", &m_requireCombat);
-        ImGui::Checkbox("Respect Your Rhythm", &m_respectRhythm);
-        if (m_respectRhythm) {
-            ImGui::SliderInt("Min Gap (ms)", &m_minGapMs, 40, 200);
-            ImGui::TextDisabled("Never clicks sooner than this after your "
-                                "own swing.");
+        if (m_dropped > m_fired && m_fired > 4) {
+            *text = "Most of these are being dropped: the autoclicker is "
+                    "already using the whole click budget. Lower its CPS if "
+                    "you want this to land.";
+            return NoticeLevel::Warning;
         }
+        snprintf(m_notice, sizeof(m_notice),
+                 "Fires between %d and %d ticks after a hit lands on you, "
+                 "which cancels part of the knockback.",
+                 kHurtTimeOnHit - m_windowStart, kHurtTimeOnHit - m_windowEnd);
+        *text = m_notice;
+        return NoticeLevel::Info;
     }
 };
