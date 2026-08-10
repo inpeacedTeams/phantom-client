@@ -7,6 +7,7 @@
 #include "jni/jni_helper.h"
 #include "jni/class_resolver.h"
 #include "hooks/gl_hook.h"
+#include "hooks/packet_hook.h"
 #include "gui/splash.h"
 #include "gui/notifications.h"
 #include "mc/minecraft.h"
@@ -130,6 +131,12 @@ void MainThread(HMODULE hModule) {
     ModuleManager::Init();
     printf("[Phantom] %d modules registered\n", ModuleManager::GetModuleCount());
 
+    // ---- 4b. Packet hook ----
+    // Scaffold only: Init is a no-op today. Wiring the call site here
+    // means the follow-up PR that adds netty injection does not have
+    // to touch dllmain again.
+    PacketHook::Init(env);
+
     // Presets name settings as STRINGS, so a rename in a module is
     // invisible to the compiler and turns into a preset that half
     // applies. Checking here means it is found on the first inject
@@ -238,6 +245,7 @@ void MainThread(HMODULE hModule) {
     ConfigStore::Save("default");
 
     GLHook::Remove();
+    PacketHook::Shutdown(env);   // remove the handler before modules die
     ModuleManager::Shutdown(env);
     KeyBinds::Shutdown(env);
     EntityList::Shutdown(env);
