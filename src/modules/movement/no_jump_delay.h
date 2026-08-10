@@ -3,7 +3,6 @@
 #include "../../mc/minecraft.h"
 #include "../../jni/class_resolver.h"
 #include "../../jni/jvmti_util.h"
-#include <imgui.h>
 
 // =================================================================
 // No Jump Delay
@@ -15,6 +14,10 @@
 // prediction anticheat to check, because the vanilla minimum is a
 // hard constant. This is safe on unprotected servers and nowhere
 // else.
+//
+// There is nothing to configure here and no setting has been
+// invented to make the panel look busier. The panel says what it
+// does and what it costs you.
 // =================================================================
 
 class NoJumpDelay : public Module {
@@ -46,13 +49,23 @@ public:
         env->SetIntField(player, m_fJumpTicks, 0);
     }
 
-    void RenderSettings() override {
-        ImGui::TextWrapped("Removes the 10-tick delay between jumps.");
-        ImGui::TextColored(ImVec4(1.f, 0.5f, 0.35f, 1.f),
-            "Jump frequency is trivially checked. Unprotected servers only.");
+    // The field id belongs to a class, not a world, so it survives a
+    // reconnect. It does NOT survive the class never having been
+    // resolved, which is the case if the module was enabled before
+    // the game finished loading, so a reset is a free second try.
+    void OnReset(JNIEnv*) override {
+        if (!m_fJumpTicks) m_resolved = false;
+    }
+
+    NoticeLevel Notice(const char** text) const override {
         if (!m_fJumpTicks) {
-            ImGui::TextColored(ImVec4(1.f, 0.8f, 0.3f, 1.f),
-                "jumpTicks unresolved: module inactive");
+            *text = "The jump cooldown field could not be found in this build "
+                    "of the game, so the module cannot do anything.";
+            return NoticeLevel::Warning;
         }
+        *text = "Jump frequency has a hard vanilla minimum, so this is one of "
+                "the cheapest things for an anticheat to check. Unprotected "
+                "servers only.";
+        return NoticeLevel::Danger;
     }
 };
