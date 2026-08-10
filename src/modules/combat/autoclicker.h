@@ -4,7 +4,6 @@
 #include "../../mc/keybinds.h"
 #include "../../mc/combat_state.h"
 #include "../../input/click_scheduler.h"
-#include <imgui.h>
 #include <cstdio>
 
 // =================================================================
@@ -38,11 +37,11 @@
 
 class AutoClicker : public Module {
 private:
+    static constexpr const char* kButtons[] = { "Left (attack)", "Right (use)" };
+
     // ---- Core ----
     float m_cps = 12.0f;
-
-    // 0 attack, 1 use item
-    int  m_button = 0;
+    int   m_button = 0;          // 0 attack, 1 use item
 
     // ---- Gating ----
     bool  m_requireTarget = false;
@@ -62,7 +61,12 @@ private:
     // ---- Readout ----
     int  m_delivered = 0;
     const char* m_why = "idle";
-    mutable char m_status[40] = {};
+    mutable char m_status[48] = {};
+    mutable char m_notice[160] = {};
+
+    // Above this a click stream stops looking like a hand and starts
+    // looking like a loop, whatever the humanisation does.
+    static constexpr float kButterflyCPS = 16.0f;
 
     ClickerConfig BuildConfig() const {
         ClickerConfig c;
@@ -80,8 +84,8 @@ private:
     }
 
     // The fastest rate this configuration can actually reach. Asking
-    // for 30 CPS with a 22ms floor gets you 45, and the slider
-    // should say so rather than quietly lying.
+    // for 30 CPS with a 22ms floor gets you 45, and the panel should
+    // say so rather than quietly lying.
     float CeilingCPS() const {
         return m_floorMs > 0 ? 1000.0f / (float)m_floorMs : 99.0f;
     }
@@ -91,19 +95,57 @@ public:
         : Module("AutoClicker", "Clicks while you hold the button",
                  ModuleCategory::COMBAT, 0)
     {
-        Bind("CPS", &m_cps);
-        Bind("Button", &m_button);
-        Bind("Require Target", &m_requireTarget);
-        Bind("Target Range", &m_targetRange);
-        Bind("Block In GUI", &m_blockInGui);
-        Bind("Variance", &m_variance);
-        Bind("Drift", &m_drift);
-        Bind("Drift Amount", &m_driftAmount);
-        Bind("Fumbles", &m_fumbles);
-        Bind("Fumble Chance", &m_fumbleChance);
-        Bind("Bursts", &m_bursts);
-        Bind("Burst Chance", &m_burstChance);
-        Bind("Floor", &m_floorMs);
+        BindMode("Button", &m_button, kButtons, 2,
+                 "Which mouse button it clicks for you");
+
+        Bind("CPS", &m_cps, 1.0f, 22.0f, "%.0f",
+             "Clicks per second, on average");
+
+        Bind("Variance", &m_variance, 2.0f, 45.0f, "%.0f%%",
+             "Spread around your CPS. Under about 8% the stream reads as "
+             "a machine.")
+            .Advanced();
+
+        Bind("Drift", &m_drift,
+             "Slow wander, so neighbouring clicks are related the way a real "
+             "hand speeds up and eases off")
+            .Advanced();
+
+        Bind("Drift Amount", &m_driftAmount, 2.0f, 30.0f, "%.0f%%",
+             "How far the wander goes")
+            .Advanced();
+
+        Bind("Fumbles", &m_fumbles,
+             "The occasional missed click. Hands produce them, loops do not.")
+            .Advanced();
+
+        Bind("Fumble Chance", &m_fumbleChance, 0.5f, 12.0f, "%.1f%%")
+            .Advanced();
+
+        Bind("Bursts", &m_bursts,
+             "The occasional pair that lands faster than the rest")
+            .Advanced();
+
+        Bind("Burst Chance", &m_burstChance, 0.5f, 12.0f, "%.1f%%")
+            .Advanced();
+
+        Bind("Only With A Target", &m_requireTarget,
+             "Do not click at thin air")
+            .Advanced();
+
+        Bind("Target Range", &m_targetRange, 2.0f, 8.0f, "%.1f",
+             "How close something has to be to count")
+            .Advanced();
+
+        Bind("Stop In Menus", &m_blockInGui,
+             "Chests and inventories are not places to be clicking")
+            .Advanced();
+
+        Bind("Floor", &m_floorMs, 18, 60,
+             "Hard minimum milliseconds between clicks, shared with Hit "
+             "Select so the two cannot stack. Nothing under 20 is "
+             "physically reachable.")
+            .Advanced();
     }
 
     void OnEnable(JNIEnv*) override {
@@ -119,6 +161,16 @@ public:
         if (env) KeyBinds::ClearClickQueue(env);
         m_why = "off";
         m_status[0] = '\0';
+    }
+
+    // A world change while the button is held would otherwise carry
+    // a queue of clicks into the loading screen.
+    void OnReset(JNIEnv* env) override {
+        ClickScheduler::SetArmed(false);
+        ClickScheduler::ClearPending();
+        if (env) KeyBinds::ClearClickQueue(env);
+        m_delivered = 0;
+        m_why = "waiting for the button";
     }
 
     // Only decides whether clicking is permitted. The engine handles
@@ -147,11 +199,9 @@ public:
         bool allowed = true;
         const char* why = "ready";
 
-        if (m_requireTarget) {
-            if (CombatState::TargetDist() > (double)m_targetRange) {
-                allowed = false;
-                why = "nothing in range";
-            }
+        if (m_requireTarget && CombatState::TargetDist() > (double)m_targetRange) {
+            allowed = false;
+            why = "nothing in range";
         }
 
         if (!KeyBinds::HasClickQueue()) {
@@ -161,14 +211,19 @@ public:
 
         ClickScheduler::SetArmed(allowed);
 
-        if (!allowed)                        m_why = why;
+        if (!allowed)                         m_why = why;
         else if (ClickScheduler::IsHolding()) m_why = "clicking";
-        else                                  m_why = "holding the button starts it";
+        else                                  m_why = "hold the button to start";
 
-        if (ClickScheduler::IsClicking())
-            snprintf(m_status, sizeof(m_status), "%.1f CPS", ClickScheduler::LiveCPS());
-        else
-            snprintf(m_status, sizeof(m_status), "%.0f CPS ready", m_cps);
+        // The live figure is the only honest answer to "is this
+        // working", so it goes on the collapsed row rather than
+        // being buried in a panel nobody has open mid-fight.
+        if (ClickScheduler::IsClicking()) {
+            snprintf(m_status, sizeof(m_status), "%.1f CPS  \xC2\xB1%.0f ms",
+                     ClickScheduler::LiveCPS(), ClickScheduler::LiveStdDev());
+        } else {
+            snprintf(m_status, sizeof(m_status), "%s", m_why);
+        }
     }
 
     void NoteDelivered(int n) { m_delivered += n; }
@@ -177,93 +232,40 @@ public:
         return m_status[0] ? m_status : nullptr;
     }
 
-    bool HasAdvanced() const override { return true; }
-
-    // =============================================================
-    // Core panel
-    // =============================================================
-    void RenderSettings() override {
-        if (!ClickScheduler::IsRunning()) {
-            ImGui::TextColored(ImVec4(1.f, 0.4f, 0.4f, 1.f),
-                "Click timer is not running");
-        }
+    NoticeLevel Notice(const char** text) const override {
         if (!KeyBinds::HasClickQueue()) {
-            ImGui::TextColored(ImVec4(1.f, 0.4f, 0.4f, 1.f),
-                "pressTime unresolved: clicks cannot reach the game");
+            *text = "The click counter could not be found in this build of "
+                    "the game, so clicks cannot reach it.";
+            return NoticeLevel::Danger;
         }
-
-        ImGui::SliderFloat("CPS", &m_cps, 1.0f, 22.0f, "%.0f");
+        if (!ClickScheduler::IsRunning()) {
+            *text = "The click timer is not running, so nothing will be sent.";
+            return NoticeLevel::Danger;
+        }
 
         float ceiling = CeilingCPS();
         if (m_cps > ceiling) {
-            ImGui::TextColored(ImVec4(1.f, 0.7f, 0.3f, 1.f),
-                "The %d ms floor caps this at %.0f CPS", m_floorMs, ceiling);
-        } else if (m_cps > 16.0f) {
-            ImGui::TextColored(ImVec4(1.f, 0.7f, 0.3f, 1.f),
-                "Above 16 is butterfly territory. Reachable, but people notice.");
+            snprintf(m_notice, sizeof(m_notice),
+                     "The %d ms floor caps this at %.0f CPS, so the slider "
+                     "above that does nothing.", m_floorMs, ceiling);
+            *text = m_notice;
+            return NoticeLevel::Warning;
         }
-
-        const char* buttons[] = { "Left (attack)", "Right (use)" };
-        ImGui::Combo("Button", &m_button, buttons, 2);
-
-        // Live measurement, because the only honest answer to "is
-        // this working" is what actually left the client.
-        if (ClickScheduler::IsClicking()) {
-            ImGui::TextColored(ImVec4(0.4f, 1.f, 0.6f, 1.f),
-                "%.1f CPS, spread %.1f ms",
-                ClickScheduler::LiveCPS(), ClickScheduler::LiveStdDev());
-        } else {
-            ImGui::TextDisabled("%s", m_why);
-        }
-    }
-
-    // =============================================================
-    // Advanced
-    // =============================================================
-    void RenderAdvanced() override {
-        ImGui::TextDisabled("Delivered %d | last gap %lld ms",
-            m_delivered, ClickScheduler::LastGap());
-
-        ImGui::SeparatorText("Timing shape");
-        ImGui::SliderFloat("Variance", &m_variance, 2.f, 45.f, "%.0f%%");
-        ImGui::TextDisabled("Spread of the bell curve around your CPS. "
-                            "Under about 8%% the stream reads as machine.");
-
-        ImGui::Checkbox("Drift", &m_drift);
-        if (m_drift) {
-            ImGui::SliderFloat("Drift Amount", &m_driftAmount, 2.f, 30.f, "%.0f%%");
-            ImGui::TextDisabled("Slow wander so neighbouring clicks are related, "
-                                "the way a real hand speeds up and eases off. "
-                                "Plain randomness has no memory and that shows.");
-        }
-
-        ImGui::SeparatorText("Slips");
-        ImGui::Checkbox("Fumbles", &m_fumbles);
-        if (m_fumbles)
-            ImGui::SliderFloat("Fumble Chance", &m_fumbleChance, 0.5f, 12.f, "%.1f%%");
-        ImGui::Checkbox("Bursts", &m_bursts);
-        if (m_bursts)
-            ImGui::SliderFloat("Burst Chance", &m_burstChance, 0.5f, 12.f, "%.1f%%");
-        ImGui::TextDisabled("Occasional long and short gaps. Hands produce "
-                            "both; a loop produces neither.");
-
-        ImGui::SeparatorText("Gating");
-        ImGui::Checkbox("Only With A Target", &m_requireTarget);
-        if (m_requireTarget)
-            ImGui::SliderFloat("Target Range", &m_targetRange, 2.f, 8.f, "%.1f");
-        ImGui::Checkbox("Stop In Menus", &m_blockInGui);
-
-        ImGui::SeparatorText("Safety");
-        ImGui::SliderInt("Floor (ms)", &m_floorMs, 18, 60);
-        ImGui::TextDisabled("Hard minimum between clicks, shared with Hit "
-                            "Select so the two cannot stack. Nothing under "
-                            "20 ms is physically reachable.");
 
         long long dropped = ClickScheduler::Dropped();
         if (dropped > 30) {
-            ImGui::TextColored(ImVec4(1.f, 0.7f, 0.3f, 1.f),
-                "%lld clicks dropped: asking for more than the game can "
-                "consume. Lower the CPS.", dropped);
+            snprintf(m_notice, sizeof(m_notice),
+                     "%lld clicks were dropped: this is more than the game "
+                     "can consume. Lower the CPS.", dropped);
+            *text = m_notice;
+            return NoticeLevel::Warning;
         }
+
+        if (m_cps > kButterflyCPS) {
+            *text = "Above 16 is butterfly territory. Reachable by hand, but "
+                    "people notice.";
+            return NoticeLevel::Warning;
+        }
+        return NoticeLevel::None;
     }
 };
