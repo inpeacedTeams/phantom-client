@@ -7,6 +7,7 @@
 #include "../../jni/jvmti_util.h"
 #include <imgui.h>
 #include <Windows.h>
+#include <cstdio>
 #include <random>
 
 // =================================================================
@@ -70,18 +71,16 @@
 
 class SprintReset : public Module {
 private:
-    // ---- Behaviour ----
-    int   m_method        = 0;
-    float m_chance        = 100.0f;
+    // ---- Core ----
+    int   m_method = 0;
+    float m_chance = 100.0f;
+
+    // ---- Advanced ----
     int   m_resetTicksMin = 1;
     int   m_resetTicksMax = 1;
     int   m_hitDelay      = 0;
-
-    // ---- Re-arm ----
-    bool  m_rearmSprint = true;
-    int   m_rearmTicks  = 1;
-
-    // ---- Gating ----
+    bool  m_rearmSprint   = true;
+    int   m_rearmTicks    = 1;
     bool  m_onlyWhileMoving = true;
     bool  m_onlyOnHit       = true;   // a real attack, not a click
     bool  m_requireSprint   = true;   // pointless if not sprinting
@@ -106,6 +105,7 @@ private:
     int m_skipped = 0;
     int m_rescued = 0;
     const char* m_why = "idle";
+    mutable char m_status[48] = "";
 
     jmethodID m_setSprinting = nullptr;
     bool m_resolved = false;
@@ -368,22 +368,63 @@ public:
         m_why = "off";
     }
 
+    const char* StatusLine() const override {
+        static const char* names[] = { "W-Tap", "S-Tap", "Blockhit",
+                                       "Sneak", "Ctrl", "Packet" };
+        snprintf(m_status, sizeof(m_status), "%s  ·  %d resets",
+                 names[m_method], m_resets);
+        return m_status;
+    }
+
+    bool HasAdvanced() const override { return true; }
+
+    // -------------------------------------------------------------
+    // Core panel: which reset, how often. Nothing else changes the
+    // outcome enough to be worth a slider on the front page.
+    // -------------------------------------------------------------
     void RenderSettings() override {
-        // ---- Live ----
+        const char* methods[] = {
+            "W-Tap", "S-Tap", "Blockhit", "Sneak Tap", "Ctrl Spam", "Packet"
+        };
+        ImGui::Combo("Method", &m_method, methods, 6);
+
+        switch (m_method) {
+            case 0: ImGui::TextDisabled("Releases forward for a tick. Works everywhere."); break;
+            case 1: ImGui::TextDisabled("Taps back. Stops you faster and opens distance."); break;
+            case 2: ImGui::TextDisabled("Holds block. Also halves damage. Sword only."); break;
+            case 3: ImGui::TextDisabled("Taps sneak. No speed loss, common in sumo."); break;
+            case 4: ImGui::TextDisabled("Re-presses sprint. Loses the least momentum."); break;
+            case 5: ImGui::TextDisabled("Toggles sprint inside one tick. Fastest."); break;
+        }
+        if (m_method == 5) {
+            ImGui::TextColored(ImVec4(1.f, 0.4f, 0.4f, 1.f),
+                "Packet mode is detected by Polar and AGC");
+        }
+
+        ImGui::SliderFloat("Chance", &m_chance, 10.f, 100.f, "%.0f%%");
+
+        // Failure states belong up front: without these the module
+        // silently does nothing.
+        if (!CombatState::IsUsable() && m_onlyOnHit) {
+            ImGui::TextColored(ImVec4(1.f, 0.5f, 0.35f, 1.f),
+                "Swing detection unresolved: turn off Only On Landed Hits");
+        }
+        if (!KeyBinds::HasMovement()) {
+            ImGui::TextColored(ImVec4(1.f, 0.8f, 0.3f, 1.f),
+                "Keybinds unresolved: only Packet mode works");
+        }
+        if (m_rescued > 0) {
+            ImGui::TextColored(ImVec4(1.f, 0.7f, 0.3f, 1.f),
+                "Watchdog freed a stuck key %d time(s)", m_rescued);
+        }
+    }
+
+    void RenderAdvanced() override {
         const char* state = m_resetting ? "RESETTING"
                           : m_rearming  ? "RE-ARMING"
                                         : "idle";
-        ImGui::TextColored((m_resetting || m_rearming)
-                ? ImVec4(0.2f, 0.8f, 0.4f, 1.f)
-                : ImVec4(0.55f, 0.55f, 0.6f, 1.f),
-            "%s  (%s)", state, m_why);
-        ImGui::TextDisabled("Resets %d | air swings ignored %d | your CPS %.1f",
-            m_resets, m_skipped, CombatState::CPS());
-
-        if (m_rescued > 0) {
-            ImGui::TextColored(ImVec4(1.f, 0.7f, 0.3f, 1.f),
-                "Watchdog fired %d time(s): the game is dropping ticks", m_rescued);
-        }
+        ImGui::TextDisabled("%s (%s) | air swings ignored %d | your CPS %.1f",
+            state, m_why, m_skipped, CombatState::CPS());
         if (KeyBinds::Repairs() > 0) {
             ImGui::TextDisabled("Key reconcile repaired %d desync(s)",
                 KeyBinds::Repairs());
@@ -394,69 +435,36 @@ public:
                 "the saved value instead");
         }
 
-        ImGui::Separator();
-        const char* methods[] = {
-            "W-Tap", "S-Tap", "Blockhit", "Sneak Tap", "Ctrl Spam", "Packet"
-        };
-        ImGui::Combo("Method", &m_method, methods, 6);
-
-        if (m_method == 5) {
-            ImGui::TextColored(ImVec4(1.f, 0.4f, 0.4f, 1.f),
-                "! Packet mode is detected by Polar and AGC");
-        }
-
-        ImGui::Separator();
-        ImGui::SliderFloat("Chance", &m_chance, 10.f, 100.f, "%.0f%%");
-        ImGui::SliderInt("Reset Ticks Min", &m_resetTicksMin, 1, 5);
-        ImGui::SliderInt("Reset Ticks Max", &m_resetTicksMax, 1, 5);
+        ImGui::SeparatorText("Timing");
+        ImGui::SliderInt("Hold Min (ticks)", &m_resetTicksMin, 1, 5);
+        ImGui::SliderInt("Hold Max (ticks)", &m_resetTicksMax, 1, 5);
         if (m_resetTicksMin > m_resetTicksMax) m_resetTicksMin = m_resetTicksMax;
         ImGui::SliderInt("Hit Delay (ticks)", &m_hitDelay, 0, 5);
         ImGui::TextDisabled("1 tick is 50ms. Longer holds cost more momentum "
                             "than they gain in knockback.");
 
-        ImGui::Separator();
-        ImGui::TextColored(ImVec4(0.4f, 1.f, 0.6f, 1.f), "Sprint recovery");
+        ImGui::SeparatorText("Sprint recovery");
         ImGui::Checkbox("Re-arm Sprint", &m_rearmSprint);
         if (m_rearmSprint) {
             ImGui::SliderInt("Re-arm Ticks", &m_rearmTicks, 1, 4);
             ImGui::TextDisabled("Taps the sprint key after the reset so the "
                                 "game restarts your sprint itself.");
+            if (!KeyBinds::HasSprint()) {
+                ImGui::TextColored(ImVec4(1.f, 0.8f, 0.3f, 1.f),
+                    "Sprint keybind unresolved: cannot re-arm");
+            }
         } else {
             ImGui::TextColored(ImVec4(1.f, 0.5f, 0.35f, 1.f),
                 "Off: if you sprint by double-tapping W you will stay "
                 "at walking speed after every hit");
         }
-        if (m_rearmSprint && !KeyBinds::HasSprint()) {
-            ImGui::TextColored(ImVec4(1.f, 0.8f, 0.3f, 1.f),
-                "Sprint keybind unresolved: cannot re-arm");
-        }
 
-        ImGui::Separator();
-        ImGui::TextColored(ImVec4(0.5f, 0.8f, 1.f, 1.f), "Trigger");
+        ImGui::SeparatorText("Trigger");
         ImGui::Checkbox("Only On Landed Hits", &m_onlyOnHit);
         ImGui::TextDisabled(m_onlyOnHit
             ? "Fires on a real swing with a target in reach."
             : "Fires on any mouse click, including air swings.");
         ImGui::Checkbox("Only While Moving", &m_onlyWhileMoving);
         ImGui::Checkbox("Require Sprint", &m_requireSprint);
-
-        ImGui::Separator();
-        switch (m_method) {
-            case 0: ImGui::TextWrapped("Releases forward for a tick. The standard reset, works everywhere."); break;
-            case 1: ImGui::TextWrapped("Taps back for a tick. Stops you faster and opens more distance."); break;
-            case 2: ImGui::TextWrapped("Holds block. Resets sprint and halves incoming damage. Sword only."); break;
-            case 3: ImGui::TextWrapped("Taps sneak. No speed loss, common in sumo."); break;
-            case 4: ImGui::TextWrapped("Re-presses the sprint key. Loses the least momentum."); break;
-            case 5: ImGui::TextWrapped("Toggles sprint within a single tick. Fastest, but detectable."); break;
-        }
-
-        if (!CombatState::IsUsable() && m_onlyOnHit) {
-            ImGui::TextColored(ImVec4(1.f, 0.5f, 0.35f, 1.f),
-                "Swing field unresolved: turn off Only On Landed Hits");
-        }
-        if (!KeyBinds::HasMovement()) {
-            ImGui::TextColored(ImVec4(1.f, 0.8f, 0.3f, 1.f),
-                "Keybinds unresolved: only Packet mode works");
-        }
     }
 };
