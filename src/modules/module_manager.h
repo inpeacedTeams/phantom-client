@@ -13,6 +13,7 @@
 #include "../mc/rotation.h"
 #include "../mc/mouse_control.h"
 #include "../input/click_scheduler.h"
+#include "../input/key_capture.h"
 #include "../render/camera.h"
 
 // Combat
@@ -23,7 +24,7 @@
 #include "combat/autoblockhit.h"
 #include "combat/hitselect.h"
 #include "combat/backtrack.h"
-#include "combat/click_assist.h"
+#include "combat/autoclicker.h"
 
 // Movement
 #include "movement/speed.h"
@@ -52,8 +53,8 @@
 // this tick acts on it.
 //
 // The click timer runs on a third thread. It never touches JNI or
-// module state either: it only increments a counter, which this
-// tick drains and hands to the game.
+// module state either: it watches the mouse button and increments a
+// counter, which this tick drains and hands to the game.
 //
 // Every tick runs inside a JNI local frame. Without it the local
 // reference table fills up within seconds and the JVM aborts.
@@ -96,7 +97,7 @@ private:
     inline static HWND s_gameWindow = nullptr;
     inline static std::shared_ptr<ESP> s_esp;
     inline static std::shared_ptr<Backtrack> s_backtrack;
-    inline static std::shared_ptr<ClickAssist> s_clickAssist;
+    inline static std::shared_ptr<AutoClicker> s_autoClicker;
     inline static bool s_wasInGame = false;
 
     // Written by the window thread, read here. The menu itself lives
@@ -133,7 +134,7 @@ private:
         if (left  > 0) done += KeyBinds::QueueAttack(env, left);
         if (right > 0) done += KeyBinds::QueueUse(env, right);
 
-        if (done > 0 && s_clickAssist) s_clickAssist->NoteDelivered(done);
+        if (done > 0 && s_autoClicker) s_autoClicker->NoteDelivered(done);
     }
 
 public:
@@ -148,8 +149,8 @@ public:
         s_backtrack = std::make_shared<Backtrack>();
         s_modules.push_back(s_backtrack);
 
-        s_clickAssist = std::make_shared<ClickAssist>();
-        s_modules.push_back(s_clickAssist);
+        s_autoClicker = std::make_shared<AutoClicker>();
+        s_modules.push_back(s_autoClicker);
 
         s_modules.push_back(std::make_shared<KillAura>());
 
@@ -165,8 +166,9 @@ public:
         s_modules.push_back(s_esp);
         s_modules.push_back(std::make_shared<Fullbright>());
 
-        // Click timing runs on its own 1ms-resolution thread; the
-        // 20 TPS loop cannot express a 27ms gap.
+        // The click timer runs on its own 1ms thread and watches the
+        // mouse itself; the 20 TPS loop can express neither a 27ms
+        // gap nor a prompt release.
         ClickScheduler::Start();
     }
 
@@ -212,7 +214,7 @@ public:
         if (!s_wasInGame) return;
         s_wasInGame = false;
 
-        ClickScheduler::SetActive(false);
+        ClickScheduler::SetArmed(false);
         ClickScheduler::ClearPending();
         Camera::Invalidate();       // overlays stop drawing stale geometry
         CombatState::Reset();       // swing history from the last server is meaningless
@@ -279,11 +281,13 @@ public:
         }
 
         // ---- Keybinds, only while the game window is focused ----
-        // Module hotkeys are suppressed while the menu is open, or
-        // typing near a bound letter toggles things behind the UI.
+        // Suppressed while the menu is open, or typing near a bound
+        // letter toggles things behind the UI. Suppressed again
+        // while a bind is being captured: the whole point of that
+        // moment is that the next key means something else.
         bool focused = (s_gameWindow == nullptr)
                     || (GetForegroundWindow() == s_gameWindow);
-        bool hotkeys = focused && !s_menuOpen.load();
+        bool hotkeys = focused && !s_menuOpen.load() && !KeyCapture::IsActive();
 
         for (auto& mod : s_modules) {
             int key = mod->GetKeybind();
@@ -359,7 +363,7 @@ public:
         }
         s_backtrack.reset();
         s_esp.reset();
-        s_clickAssist.reset();
+        s_autoClicker.reset();
         s_modules.clear();
     }
 
