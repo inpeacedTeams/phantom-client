@@ -1,10 +1,10 @@
 #pragma once
 #include <jni.h>
-#include <cstdio>
 
 #include "minecraft.h"
 #include "../jni/class_resolver.h"
 #include "../jni/jvmti_util.h"
+#include "../util/log.h"
 
 // =================================================================
 // MouseControl
@@ -41,6 +41,17 @@
 // The state is re-asserted every tick while the menu is open. A
 // click that slips through to the game would otherwise call
 // setIngameFocus and snatch the cursor back mid-session.
+//
+// HANDS OFF WHEN A VANILLA SCREEN IS OPEN
+//
+// setIngameFocus does more than grab the mouse. It also calls
+// displayGuiScreen(null), which closes whatever screen is open.
+// So opening the menu on top of your inventory and closing it again
+// used to close the inventory too, and reset the left-click cooldown
+// while it was at it.
+//
+// When a vanilla screen is open the cursor is already free, so there
+// is nothing for us to do. We take no ownership and give none back.
 // =================================================================
 
 class MouseControl {
@@ -52,7 +63,8 @@ private:
     inline static bool s_resolved = false;
     inline static bool s_usable   = false;
 
-    // What we last asked for, so we only act on a change
+    // Whether WE are the reason the cursor is free. Never set while
+    // a vanilla screen is doing it for us.
     inline static bool s_released = false;
 
 public:
@@ -75,13 +87,13 @@ public:
         s_usable = (s_setNotInFocus != nullptr && s_setFocus != nullptr);
         s_resolved = true;
 
-        printf("[Mouse] ungrab=%p grab=%p focusFlag=%p usable=%d\n",
+        PH_LOG("[Mouse] ungrab=%p grab=%p focusFlag=%p usable=%d",
             (void*)s_setNotInFocus, (void*)s_setFocus,
             (void*)s_fHasFocus, (int)s_usable);
 
         if (!s_usable)
-            printf("[Mouse] WARN: cannot release the grab, the menu cursor "
-                   "will be stuck to the centre\n");
+            PH_LOG("[Mouse] WARN: cannot release the grab, the menu cursor "
+                   "will be stuck to the centre");
 
         return s_usable;
     }
@@ -120,6 +132,14 @@ public:
             return;
         }
 
+        // A chest, the inventory, chat, the pause screen: the game
+        // already owns this situation and handing focus back would
+        // close the screen out from under the player.
+        if (Minecraft::IsInGui(env)) {
+            s_released = false;
+            return;
+        }
+
         if (menuOpen) {
             // Re-assert. Cheap, and it survives the game deciding to
             // take the mouse back on its own.
@@ -146,7 +166,9 @@ public:
         jobject inst = Minecraft::GetInstance(env);
         if (!inst) { s_released = false; return; }
 
-        if (Minecraft::InGame(env)) {
+        // Same reasoning as Apply: if a screen is open the cursor is
+        // meant to be free, and grabbing would close the screen.
+        if (Minecraft::InGame(env) && !Minecraft::IsInGui(env)) {
             env->CallVoidMethod(inst, s_setFocus);
             if (env->ExceptionCheck()) env->ExceptionClear();
         }
