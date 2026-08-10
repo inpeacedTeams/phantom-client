@@ -30,32 +30,51 @@
 // This is the bug that killed movement after every hit.
 //
 // In 1.8 KeyBinding.pressed is only written when the keyboard fires
-// an EVENT. Holding W down produces one press event and nothing
-// else until you let go. So if we set pressed=false while the
-// player is still physically holding W, the game never puts it back
-// on its own: there is no event coming. The player is simply stuck
-// standing still until they release W and press it again.
+// an EVENT:
 //
-// Sprint reset does exactly that on every hit (W-tap sets forward
-// to false for a tick), and the old Release() only ever wrote
-// false. Worse, Set(false) marked the bind as "not overridden", so
-// Release() saw nothing to undo and returned immediately. Forward
-// stayed dead.
+//     while (Keyboard.next())
+//         KeyBinding.setKeyBindState(key, Keyboard.getEventKeyState());
 //
-// Restoring correctly means writing back what is TRUE RIGHT NOW,
-// not what we happened to save a tick ago, because the player may
-// have let go in the meantime. So we ask the hardware through
-// LWJGL, exactly like the game does:
+// Holding W produces ONE event, at the moment it goes down, and
+// nothing refreshes the field afterwards. So if we set
+// pressed = false while the player is still physically holding W,
+// the game never puts it back on its own: no event is coming. The
+// player is stuck standing still until they release W and press it
+// again.
 //
-//     keyCode >= 0  ->  Keyboard.isKeyDown(keyCode)
-//     keyCode <  0  ->  Mouse.isButtonDown(keyCode + 100)
+// Sprint reset does exactly that on every hit, and the old
+// Release() only ever wrote false. Worse, Set(false) marked the
+// bind as "not overridden", so Release() saw nothing to undo and
+// returned immediately. Forward stayed dead.
+//
+// THREE LAYERS NOW STOP THAT
+//
+//   1. Set() records an override in BOTH directions. Forcing a key
+//      up is just as much an override as forcing it down.
+//
+//   2. Release() writes back what is TRUE RIGHT NOW, asked from the
+//      hardware through LWJGL the same way the game does:
+//
+//          keyCode >= 0  ->  Keyboard.isKeyDown(keyCode)
+//          keyCode <  0  ->  Mouse.isButtonDown(keyCode + 100)
+//
+//      not what we saved a tick ago, because the player may have
+//      let go in the meantime.
+//
+//   3. Reconcile() runs at the end of every tick and repairs any
+//      key we have ever driven but are not driving now. This is the
+//      one that makes a frozen player impossible: it no longer
+//      matters which module forgot to release what, or whether a
+//      tick got dropped mid-reset. Worst case a key is wrong for
+//      50ms and then heals itself.
+//
+// Keys we have never touched are skipped entirely, so the game's
+// own handling (unPressAllKeys when a screen opens, and so on) is
+// left completely alone.
 //
 // The keycode is read fresh on every query rather than cached at
 // inject time: rebinding a key in the options menu changes it, and
 // a cached value would have us polling whatever W used to be.
-//
-// If LWJGL cannot be resolved we fall back to the value we saved
-// when the override began, which is right in the common case.
 //
 // -----------------------------------------------------------------
 // CLICK QUEUE
@@ -87,6 +106,7 @@ private:
         bool overridden = false;     // we are driving this key
         bool value = false;          // what we forced it to
         bool saved = false;          // what it was before we touched it
+        bool everTouched = false;    // we have driven it at least once
     };
 
     inline static Bind s_forward, s_back, s_left, s_right;
@@ -97,6 +117,8 @@ private:
     inline static jfieldID s_fPressTime = nullptr;
     inline static jfieldID s_fKeyCode   = nullptr;
     inline static bool s_ready = false;
+
+    inline static int s_repairs = 0;
 
     // ---- LWJGL, for asking what the hardware is actually doing ----
     inline static jclass    s_keyboardClass = nullptr;
@@ -165,11 +187,6 @@ private:
 
     // Is this key physically down right now? Returns false if we
     // have no way to find out, so the caller keeps its saved value.
-    //
-    // The keycode is read live. Caching it at inject time meant that
-    // rebinding forward in the options menu left us polling the old
-    // key forever, and every restore would then write whatever that
-    // dead key happened to be doing.
     static bool PhysicalState(JNIEnv* env, Bind& b, bool* out) {
         if (!b.obj || !s_fKeyCode) return false;
 
@@ -279,6 +296,7 @@ public:
             all[i]->obj = nullptr;
             all[i]->pressed = nullptr;
             all[i]->overridden = false;
+            all[i]->everTouched = false;
         }
 
         if (env) {
@@ -313,6 +331,7 @@ public:
         if (!b.overridden) {
             b.saved = env->GetBooleanField(b.obj, b.pressed) != 0;
             b.overridden = true;
+            b.everTouched = true;
         }
         b.value = down;
         env->SetBooleanField(b.obj, b.pressed, (jboolean)down);
@@ -339,6 +358,48 @@ public:
         Bind** all = AllPtrs(n);
         for (int i = 0; i < n; i++) Release(env, *all[i]);
     }
+
+    // -------------------------------------------------------------
+    // Reconcile — the safety net, run at the end of every tick
+    // -------------------------------------------------------------
+    // For every key we have EVER driven and are not driving right
+    // now, compare what the game believes against what the hardware
+    // says, and fix the game.
+    //
+    // Because pressed is edge driven, a single missed release would
+    // otherwise stick forever and the player would just stop moving
+    // with no way to recover short of tapping the key again. With
+    // this, the worst case is one bad tick.
+    //
+    // Deliberately skips:
+    //   - keys we never touched, so the game's own state machine is
+    //     untouched
+    //   - keys we are actively driving, or we would fight ourselves
+    //
+    // The caller must not run this while a screen is open: the game
+    // clears every key there on purpose.
+    static void Reconcile(JNIEnv* env) {
+        if (!env || !s_fPressed || !s_fKeyCode) return;
+        if (!s_isKeyDown && !s_isButtonDown) return;
+
+        int n = 0;
+        Bind** all = AllPtrs(n);
+        for (int i = 0; i < n; i++) {
+            Bind& b = *all[i];
+            if (!b.obj || !b.everTouched || b.overridden) continue;
+
+            bool live = false;
+            if (!PhysicalState(env, b, &live)) continue;
+
+            bool cur = env->GetBooleanField(b.obj, b.pressed) != 0;
+            if (cur == live) continue;
+
+            env->SetBooleanField(b.obj, b.pressed, (jboolean)live);
+            s_repairs++;
+        }
+    }
+
+    static int Repairs() { return s_repairs; }
 
     // Is anything still overridden? Useful as a stuck-key canary.
     static int HeldCount() {
@@ -431,6 +492,7 @@ public:
     static bool PhysRight(JNIEnv* e)   { return Phys(e, s_right); }
     static bool PhysSneak(JNIEnv* e)   { return Phys(e, s_sneak); }
     static bool PhysJump(JNIEnv* e)    { return Phys(e, s_jump); }
+    static bool PhysSprint(JNIEnv* e)  { return Phys(e, s_sprint); }
 
     static bool PhysMoving(JNIEnv* e) {
         return PhysForward(e) || PhysBack(e) || PhysLeft(e) || PhysRight(e);
