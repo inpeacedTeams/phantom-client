@@ -79,6 +79,27 @@ public:
     virtual void OnEnable(JNIEnv*) {}
     virtual void OnDisable(JNIEnv*) {}
 
+    // -------------------------------------------------------------
+    // OnReset
+    // -------------------------------------------------------------
+    // The world underneath the module changed: a server switch, a
+    // dimension change, a death and respawn, or a reconnect.
+    //
+    // Everything a module remembers about "the situation" is now
+    // wrong. Held targets point at entities that no longer exist,
+    // timers are counting toward a fight that already ended, and
+    // recorded positions belong to another world. Carrying any of
+    // that across is how a module comes back from a respawn aiming
+    // at nothing or refusing to fire.
+    //
+    // The module STAYS ENABLED. This is not a disable: it is the
+    // module being handed a clean slate and told to carry on.
+    // Anything held on the player's behalf must still be let go,
+    // because the reset may have happened mid-action.
+    //
+    // JNI is safe to use here, but the player and world may be null.
+    virtual void OnReset(JNIEnv*) {}
+
     // ---- Panel ----
     // RenderSettings is the everyday panel: the mode, and the two or
     // three values worth touching. Keep it short enough to read at a
