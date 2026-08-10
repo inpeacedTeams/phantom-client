@@ -1,7 +1,7 @@
 #pragma once
 #include "../module.h"
 #include "../../mc/minecraft.h"
-#include <imgui.h>
+#include <cstdio>
 
 // =================================================================
 // Fullbright
@@ -21,14 +21,20 @@
 // a permanently washed-out game and no obvious way to fix it, so
 // anything out of the vanilla range is treated as the default
 // instead.
+//
+// The setting used to be stored as "Gamma" and drawn as
+// "Brightness". Two names for one value is how a preset ends up
+// setting something that does not exist.
 // =================================================================
 
 class Fullbright : public Module {
 private:
-    float m_gamma = 100.0f;
+    float m_brightness = 100.0f;
 
     float m_savedGamma = 1.0f;
     bool  m_saved = false;
+
+    mutable char m_status[32] = {};
 
     // The real slider range in 1.8: Moody 0 to Bright 1.
     static constexpr float kVanillaMax = 1.0f;
@@ -38,7 +44,9 @@ public:
     Fullbright() : Module("Fullbright", "See in complete darkness",
                           ModuleCategory::VISUAL, 'H')
     {
-        Bind("Gamma", &m_gamma);
+        Bind("Brightness", &m_brightness, 1.0f, 1000.0f, "%.0f",
+             "Past about 100 there is no further difference: the world is "
+             "already fully lit");
     }
 
     void OnEnable(JNIEnv* env) override {
@@ -55,20 +63,24 @@ public:
     void OnTick(JNIEnv* env) override {
         // Reapplied every tick because the options screen writes the
         // slider value back over ours whenever it is open.
-        Minecraft::SetGamma(env, m_gamma);
+        Minecraft::SetGamma(env, m_brightness);
     }
 
     void OnDisable(JNIEnv* env) override {
         if (!env) return;
         Minecraft::SetGamma(env, m_saved ? m_savedGamma : kDefault);
+        m_status[0] = '\0';
     }
 
-    void RenderSettings() override {
-        ImGui::SliderFloat("Brightness", &m_gamma, 1.0f, 1000.0f, "%.0f");
-        ImGui::TextDisabled("Anything past about 100 makes no further "
-                            "difference; the world is already fully lit.");
-        if (m_saved)
-            ImGui::TextDisabled("Yours was %.2f, and goes back on disable.",
-                                m_savedGamma);
+    const char* StatusLine() const override {
+        snprintf(m_status, sizeof(m_status), "%.0f", m_brightness);
+        return m_status;
+    }
+
+    NoticeLevel Notice(const char** text) const override {
+        if (!m_saved) return NoticeLevel::None;
+        *text = "Your own brightness is remembered and put back when this "
+                "goes off.";
+        return NoticeLevel::Info;
     }
 };
