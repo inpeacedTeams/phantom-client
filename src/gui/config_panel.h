@@ -20,13 +20,13 @@
 // clear about the difference, because conflating them is confusing:
 //
 //   PRESETS are built in. They are opinionated starting points for
-//   a particular anticheat, and loading one overwrites what you
+//   a particular anticheat, and applying one overwrites what you
 //   have. They cannot be changed or deleted.
 //
 //   CONFIGS are yours. Saved to disk, loaded by name, deleted when
 //   you are done with them. "default" is written automatically on
-//   eject and loaded on inject, so doing nothing at all still gets
-//   you persistence.
+//   eject and once a minute, so doing nothing at all still gets you
+//   persistence.
 //
 // Lives in its own file because Menu was becoming the sort of class
 // that does everything, and this part has no business knowing how a
@@ -46,6 +46,16 @@ private:
     inline static std::string s_confirmDelete;
     inline static std::vector<std::string> s_cache;
     inline static float s_refreshIn = 0.0f;
+
+    // Presets are compile-time constants dressed up as function
+    // calls. Profiles::All() builds four structs, each holding
+    // three vectors and up to forty entries, and it was being
+    // called once per frame: several hundred allocations a second
+    // to draw a list that never changes.
+    static const std::vector<Profile>& Presets() {
+        static const std::vector<Profile> presets = Profiles::All();
+        return presets;
+    }
 
     // Listing a directory every frame is a syscall per frame for
     // data that changes when the user saves something. Once a second
@@ -103,8 +113,6 @@ private:
         bool delHover = ImGui::IsItemHovered();
         if (ImGui::IsItemClicked()) {
             if (confirming) {
-                // Deleting the config you are on would leave the
-                // client pointing at a file that no longer exists.
                 if (ConfigStore::Delete(name)) {
                     Notify::Info("Deleted " + name);
                     RefreshList(true);
@@ -258,16 +266,16 @@ public:
         EndCard();
 
         Footnote("Everything is saved automatically to \"default\" when you "
-                 "eject and every minute while you play, so you never lose a "
-                 "session. Named configs are for keeping several setups "
-                 "side by side.");
+                 "eject and once a minute while you play, so a crash never "
+                 "costs you a session. Named configs are for keeping several "
+                 "setups side by side.");
 
         // =====================================================
         // Presets
         // =====================================================
         SectionHeader("Presets");
 
-        auto presets = Profiles::All();
+        const std::vector<Profile>& presets = Presets();
         for (size_t i = 0; i < presets.size(); i++) {
             ImGui::PushID((int)(1000 + i));
 
@@ -292,12 +300,21 @@ public:
 
             if (Button("Apply", ImGui::GetContentRegionAvail().x - M::RowPadX,
                        Col::Blue, false)) {
+                // Copied into the lambda: the action runs on the
+                // client thread a tick later, and a reference into a
+                // static is fine but a copy is one less thing to
+                // reason about.
                 Profile p = presets[i];
                 std::string label = p.name;
                 ModuleManager::QueueAction([p, label](JNIEnv* env) {
                     Profiles::Apply(p, env);
-                    Notify::Success("Applied " + label,
-                                    Profiles::LastReport());
+                    if (Profiles::LastReport().find("could not") ==
+                        std::string::npos) {
+                        Notify::Success(label + " applied",
+                                        Profiles::LastReport());
+                    }
+                    // The failure case already raised its own
+                    // warning inside Apply, with the names in it.
                 });
             }
 
