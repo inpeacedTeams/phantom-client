@@ -10,15 +10,16 @@
 
 #include "../modules/module_manager.h"
 #include "../gui/ios_theme.h"
+#include "../gui/ios_hud.h"
 
 // =================================================================
 // ConfigStore
 // =================================================================
-// Until now nothing in this client survived an eject. Every setting
-// you touched, every keybind you set, every module you turned on:
-// gone the moment the DLL unloaded. That is the single biggest gap
-// between "a set of working features" and "a client you use", so
-// this is the first thing to fix.
+// Until recently nothing in this client survived an eject. Every
+// setting you touched, every keybind you set, every module you
+// turned on: gone the moment the DLL unloaded. That is the single
+// biggest gap between "a set of working features" and "a client you
+// use".
 //
 // WHERE
 //   %APPDATA%\Phantom\
@@ -38,6 +39,7 @@
 //     # Phantom config v1
 //     ui.scale=1.00
 //     ui.accent=2
+//     hud.corner=1
 //     module.AutoClicker.enabled=1
 //     module.AutoClicker.key=82
 //     module.AutoClicker.set.CPS=13.000000
@@ -55,9 +57,9 @@
 //   truncated by a crash mid-write still loads everything up to
 //   the break.
 //
-// Because every setting is already registered through Bind(), this
-// needs no per-module code at all: a new module is saved correctly
-// the day it is written.
+// Because every module setting is already registered through
+// Bind(), modules need no per-module code here at all: a new module
+// is saved correctly the day it is written.
 // =================================================================
 
 class ConfigStore {
@@ -233,6 +235,15 @@ public:
                 f << "ui.accentCustom" << i << "=" << UI::accentCustom[i] << "\n";
             f << "\n";
 
+            // ---- HUD ----
+            using iOS::HUD;
+            f << "# HUD\n";
+            f << "hud.watermark="  << (HUD::watermark ? 1 : 0) << "\n";
+            f << "hud.moduleList=" << (HUD::moduleList ? 1 : 0) << "\n";
+            f << "hud.fps="        << (HUD::showFps ? 1 : 0) << "\n";
+            f << "hud.corner="     << HUD::corner << "\n";
+            f << "\n";
+
             // ---- Modules ----
             for (auto& m : ModuleManager::GetModules()) {
                 const std::string& n = m->GetName();
@@ -293,10 +304,11 @@ public:
 
             if (!SplitLine(line, key, value)) { r.malformed++; continue; }
 
+            float v = 0.0f;
+
             // ---- Interface ----
             if (key.compare(0, 3, "ui.") == 0) {
                 using iOS::UI;
-                float v = 0.0f;
                 if (!ParseFloat(value, &v)) { r.malformed++; continue; }
 
                 std::string k = key.substr(3);
@@ -323,6 +335,25 @@ public:
                 continue;
             }
 
+            // ---- HUD ----
+            if (key.compare(0, 4, "hud.") == 0) {
+                using iOS::HUD;
+                if (!ParseFloat(value, &v)) { r.malformed++; continue; }
+
+                std::string k = key.substr(4);
+                if      (k == "watermark")  HUD::watermark = (v != 0.0f);
+                else if (k == "moduleList") HUD::moduleList = (v != 0.0f);
+                else if (k == "fps")        HUD::showFps = (v != 0.0f);
+                else if (k == "corner") {
+                    int c = (int)v;
+                    HUD::corner = (c >= 0 && c <= 3) ? c : 1;
+                }
+                else { r.unknown++; continue; }
+
+                r.applied++;
+                continue;
+            }
+
             if (key == "version") continue;   // informational
 
             // ---- Modules ----
@@ -332,22 +363,21 @@ public:
                 continue;
             }
 
-            Module* mod = nullptr;
-            for (auto& m : ModuleManager::GetModules()) {
-                if (m->GetName() == modName) { mod = m.get(); break; }
-            }
             // A config from a build that had a module this one does
             // not. Skipped, never fatal.
+            Module* mod = ModuleManager::Find(modName);
             if (!mod) { r.unknown++; continue; }
 
-            float v = 0.0f;
             if (!ParseFloat(value, &v)) { r.malformed++; continue; }
 
             if (field == "enabled") {
                 toggles.push_back({ mod, v != 0.0f });
                 r.applied++;
             } else if (field == "key") {
-                mod->SetKeybind((int)v);
+                int k = (int)v;
+                // A key outside the virtual-key range would never
+                // fire and would show as nonsense on the chip.
+                mod->SetKeybind((k > 0 && k < 256) ? k : 0);
                 r.applied++;
             } else if (field == "set") {
                 if (mod->SetValue(setting, v)) r.applied++;
@@ -357,18 +387,30 @@ public:
             }
         }
 
-        for (auto& t : toggles) t.first->SetEnabled(t.second, env);
+        // Clamp anything the file could have put out of range. A
+        // hand-edited config should never be able to leave the menu
+        // unusably large or invisible.
+        iOS::UI::Apply();
+
+        for (auto& t : toggles) {
+            try {
+                t.first->SetEnabled(t.second, env);
+            } catch (...) {
+                // A module that throws while being switched on must
+                // not abort the whole load.
+            }
+            if (env && env->ExceptionCheck()) env->ExceptionClear();
+        }
 
         s_current = name;
         r.ok = true;
 
         char buf[160];
         if (r.unknown || r.malformed) {
-            snprintf(buf, sizeof(buf), "Loaded %s (%d values, %d skipped)",
-                     name.c_str(), r.applied, r.unknown + r.malformed);
+            snprintf(buf, sizeof(buf), "%d values restored, %d skipped",
+                     r.applied, r.unknown + r.malformed);
         } else {
-            snprintf(buf, sizeof(buf), "Loaded %s (%d values)",
-                     name.c_str(), r.applied);
+            snprintf(buf, sizeof(buf), "%d values restored", r.applied);
         }
         r.message = buf;
 
@@ -386,6 +428,9 @@ public:
             s_lastReport = { 0, 0, 0, false, "Could not delete " + name };
             return false;
         }
+        // Deleting the config you are running would leave the panel
+        // pointing at a file that no longer exists.
+        if (s_current == name) s_current = "default";
         s_lastReport = { 0, 0, 0, true, "Deleted " + name };
         return true;
     }
