@@ -1,55 +1,56 @@
 #pragma once
 #include "../module.h"
+#include "../../mc/minecraft.h"
+#include "../../mc/keybinds.h"
+#include "../../mc/combat_state.h"
 #include "../../input/click_scheduler.h"
 #include <imgui.h>
 #include <Windows.h>
-#include <random>
-#include <chrono>
-#include <deque>
-#include <mutex>
-#include <cmath>
-#include <algorithm>
 
 // =================================================================
 // Click Assist
 // =================================================================
-// 20 CPS is not the problem. Plenty of humans butterfly at 18-22.
-// What flags is the SHAPE of the click stream.
+// 20 CPS is not the problem. Plenty of people butterfly at 18-22.
+// What flags is the SHAPE of the click stream, so all of the shape
+// logic lives in ClickScheduler and this module only decides when
+// clicking is allowed and what the stream should look like.
 //
-// Anticheats fingerprint clicking with:
-//   1. Standard deviation of intervals. Too low means machine.
-//   2. Outlier count. Humans produce stray long gaps.
-//   3. Double-click ratio. Butterfly makes tight PAIRS, not an even
-//      stream. A flat 50ms cadence at 20 CPS is not producible by
-//      a human hand.
-//   4. Drift over time. Real hands fatigue and CPS sags.
-//   5. Sub-20ms intervals, which are physically unreachable.
+// WHY THE MODULE NO LONGER OWNS THE TIMING
+// It used to hand the scheduler a std::function that reached back
+// into this object from the timer thread, under a lock, while the
+// render thread was reading the same fields to draw this panel.
+// Three threads on one object, plus a captured pointer that dies
+// on eject. Now the module pushes a POD profile and never gets
+// called back, which removes the whole class of crash.
 //
-// TIMING
-// Clicks are emitted by ClickScheduler on its own 1ms-resolution
-// thread. This module only computes the next gap. Driving it from
-// the 20 TPS loop quantised every gap to 50ms, producing a
-// dead-flat 20 CPS stream: the exact signature we are avoiding.
-// The callback runs on that thread, so shared state is guarded by
-// m_mutex.
-//
-// The hard floor is pushed into the scheduler rather than only
-// clamped here, because Hit Select emits through the same path and
-// has to honour the same limit.
+// WHY THE CLICKS THEMSELVES CHANGED
+// The scheduler used to call SendInput. That cannot work while you
+// are holding the physical button: Windows already has the button
+// down, so the injected press is not a state change and never
+// arrives, while the injected release does. The game saw releases
+// and no presses. Clicks are now queued into KeyBinding.pressTime,
+// the same counter a real click increments.
 //
 // PATTERNS
-//   0 Normal    single stream, gaussian intervals. Cap around 14
-//   1 Butterfly two-finger pairs. The only honest way past 16
-//   2 Drag      dense bursts with longer recovery gaps
-//   3 Jitter    high-variance single stream, mid CPS
+//   0 Normal    single stream, gaussian gaps. Honest cap around 14
+//   1 Butterfly two-finger pairs. The only real way past 16
+//   2 Drag      dense bursts with longer recovery
+//   3 Jitter    high variance, mid rate
 // =================================================================
 
 class ClickAssist : public Module {
 private:
-    int   m_pattern      = 1;
-    float m_minCPS       = 15.0f;
-    float m_maxCPS       = 20.0f;
-    bool  m_onlyInFight  = true;
+    // ---- Shape ----
+    int   m_pattern = 1;
+    float m_minCPS  = 15.0f;
+    float m_maxCPS  = 20.0f;
+
+    // ---- When to run ----
+    // 0 while holding LMB, 1 while holding and a target is near,
+    // 2 always
+    int   m_trigger      = 0;
+    bool  m_requireTarget = false;
+    float m_targetRange   = 4.0f;
 
     // Butterfly
     int   m_pairGapMin     = 22;
@@ -64,7 +65,7 @@ private:
     int   m_burstGapMin = 90;
     int   m_burstGapMax = 170;
 
-    // Humanization
+    // Humanisation
     bool  m_jitter         = true;
     float m_jitterAmount   = 26.0f;
     bool  m_fatigue        = true;
@@ -84,149 +85,53 @@ private:
     int   m_breakLenMin   = 2;
     int   m_breakLenMax   = 5;
 
-    // ---- Shared with the scheduler thread ----
-    mutable std::mutex m_mutex;
-    std::chrono::steady_clock::time_point m_holdStart;
-    bool m_holding    = false;
-    bool m_inPair     = false;
-    int  m_burstLeft  = 0;
-    int  m_breakLeft  = 0;
-    std::deque<long long> m_history;
-    std::mt19937 m_rng{ std::random_device{}() };
+    // Readout, written only on the client thread
+    const char* m_why = "idle";
+    int m_delivered = 0;
 
-    int Rand(int lo, int hi) {
-        if (lo >= hi) return lo;
-        std::uniform_int_distribution<int> d(lo, hi);
-        return d(m_rng);
-    }
-
-    bool Roll(float pct) {
-        std::uniform_real_distribution<float> d(0.f, 100.f);
-        return d(m_rng) < pct;
-    }
-
-    float StdDevLocked() const {
-        if (m_history.size() < 6) return 999.f;
-        double mean = 0.0;
-        for (auto v : m_history) mean += (double)v;
-        mean /= (double)m_history.size();
-        double var = 0.0;
-        for (auto v : m_history) { double d = (double)v - mean; var += d * d; }
-        var /= (double)m_history.size();
-        return (float)std::sqrt(var);
-    }
-
-    float FatigueFactor() {
-        if (!m_fatigue || !m_holding) return 1.0f;
-        auto held = std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::steady_clock::now() - m_holdStart).count();
-        if (held < m_fatigueAfterMs) return 1.0f;
-        float over = (float)(held - m_fatigueAfterMs) / 4000.0f;
-        if (over > 1.0f) over = 1.0f;
-        return 1.0f - (m_fatigueRate / 100.0f) * over;
-    }
-
-    long long ApplyNoise(long long delay) {
-        if (m_jitter && m_jitterAmount > 0.f) {
-            float range = (float)delay * (m_jitterAmount / 100.0f);
-            std::uniform_real_distribution<float> d(-range, range);
-            delay += (long long)d(m_rng);
-        }
-        if (m_outliers && Roll(m_outlierChance)) {
-            delay += Rand(m_outlierAddMin, m_outlierAddMax);
-        }
-        // If the recent stream has flattened out, widen it back up
-        if (m_entropyGuard && StdDevLocked() < m_minStdDev) {
-            std::uniform_real_distribution<float> d(-m_minStdDev * 1.6f,
-                                                     m_minStdDev * 1.6f);
-            delay += (long long)d(m_rng);
-        }
-        if (delay < (long long)m_hardFloorMs) delay = m_hardFloorMs;
-        return delay;
-    }
-
-    // Runs on the scheduler thread with m_mutex held
-    long long NextDelayLocked() {
-        float fatigue = FatigueFactor();
-        if (fatigue < 0.3f) fatigue = 0.3f;
-
-        if (m_breakPatterns) {
-            if (m_breakLeft > 0) {
-                m_breakLeft--;
-                float c = m_minCPS * 0.55f;
-                if (c < 1.f) c = 1.f;
-                return ApplyNoise((long long)(1000.0f / c));
-            }
-            if (Roll(m_breakChance * 0.08f)) {
-                m_breakLeft = Rand(m_breakLenMin, m_breakLenMax);
-            }
-        }
-
-        long long delay;
-        switch (m_pattern) {
-            case 1: {   // Butterfly: tight pair, then a rest
-                if (m_inPair) {
-                    delay = Rand(m_pairGapMin, m_pairGapMax);
-                    m_inPair = false;
-                } else {
-                    delay = Rand(m_restGapMin, m_restGapMax);
-                    m_inPair = !Roll(m_pairSkipChance);
-                }
-                delay = (long long)((float)delay / fatigue);
-                break;
-            }
-            case 2: {   // Drag: dense burst, longer recovery
-                if (m_burstLeft > 0) {
-                    m_burstLeft--;
-                    float c = m_maxCPS < 1.f ? 1.f : m_maxCPS;
-                    delay = (long long)(1000.0f / c);
-                } else {
-                    m_burstLeft = Rand(m_burstLenMin, m_burstLenMax);
-                    delay = Rand(m_burstGapMin, m_burstGapMax);
-                }
-                delay = (long long)((float)delay / fatigue);
-                break;
-            }
-            case 3: {   // Jitter
-                float mean = (m_minCPS + m_maxCPS) * 0.5f * fatigue;
-                float sd   = (m_maxCPS - m_minCPS) * 0.42f;
-                if (sd < 0.1f) sd = 0.1f;
-                std::normal_distribution<float> d(mean, sd);
-                float cps = d(m_rng);
-                if (cps < 1.f) cps = 1.f;
-                delay = (long long)(1000.0f / cps);
-                break;
-            }
-            default: {  // Normal
-                float mean = (m_minCPS + m_maxCPS) * 0.5f * fatigue;
-                float sd   = (m_maxCPS - m_minCPS) * 0.25f;
-                if (sd < 0.1f) sd = 0.1f;
-                std::normal_distribution<float> d(mean, sd);
-                float cps = d(m_rng);
-                cps = std::max(m_minCPS * 0.6f, std::min(m_maxCPS, cps));
-                if (cps < 1.f) cps = 1.f;
-                delay = (long long)(1000.0f / cps);
-                break;
-            }
-        }
-
-        delay = ApplyNoise(delay);
-
-        m_history.push_back(delay);
-        if (m_history.size() > 24) m_history.pop_front();
-        return delay;
+    ClickProfile BuildProfile() const {
+        ClickProfile p;
+        p.pattern        = m_pattern;
+        p.minCPS         = m_minCPS;
+        p.maxCPS         = m_maxCPS;
+        p.pairGapMin     = m_pairGapMin;
+        p.pairGapMax     = m_pairGapMax;
+        p.restGapMin     = m_restGapMin;
+        p.restGapMax     = m_restGapMax;
+        p.pairSkipChance = m_pairSkipChance;
+        p.burstLenMin    = m_burstLenMin;
+        p.burstLenMax    = m_burstLenMax;
+        p.burstGapMin    = m_burstGapMin;
+        p.burstGapMax    = m_burstGapMax;
+        p.jitter         = m_jitter;
+        p.jitterAmount   = m_jitterAmount;
+        p.fatigue        = m_fatigue;
+        p.fatigueRate    = m_fatigueRate;
+        p.fatigueAfterMs = m_fatigueAfterMs;
+        p.outliers       = m_outliers;
+        p.outlierChance  = m_outlierChance;
+        p.outlierAddMin  = m_outlierAddMin;
+        p.outlierAddMax  = m_outlierAddMax;
+        p.floorMs        = m_hardFloorMs;
+        p.entropyGuard   = m_entropyGuard;
+        p.minStdDev      = m_minStdDev;
+        p.breaks         = m_breakPatterns;
+        p.breakChance    = m_breakChance;
+        p.breakLenMin    = m_breakLenMin;
+        p.breakLenMax    = m_breakLenMax;
+        return p;
     }
 
 public:
     ClickAssist() : Module("Click Assist", "High CPS with human click timing",
                            ModuleCategory::COMBAT, 0)
     {
-        m_holdStart = std::chrono::steady_clock::now();
-
         Bind("Pattern", &m_pattern);
         Bind("Min CPS", &m_minCPS);
         Bind("Max CPS", &m_maxCPS);
-        Bind("Only In Fight", &m_onlyInFight);
+        Bind("Trigger", &m_trigger);
+        Bind("Require Target", &m_requireTarget);
+        Bind("Target Range", &m_targetRange);
         Bind("Pair Gap Min", &m_pairGapMin);
         Bind("Pair Gap Max", &m_pairGapMax);
         Bind("Rest Gap Min", &m_restGapMin);
@@ -256,47 +161,81 @@ public:
 
     void OnEnable(JNIEnv*) override {
         ClickScheduler::SetRightButton(false);
-        ClickScheduler::SetFloor(m_hardFloorMs);
-        ClickScheduler::SetProvider([this]() -> long long {
-            std::lock_guard<std::mutex> lock(m_mutex);
-            return NextDelayLocked();
-        });
+        ClickScheduler::SetProfile(BuildProfile());
     }
 
-    void OnDisable(JNIEnv*) override {
-        ClickScheduler::ClearProvider();
-        std::lock_guard<std::mutex> lock(m_mutex);
-        m_history.clear();
-        m_inPair = false;
-        m_burstLeft = 0;
-        m_breakLeft = 0;
-        m_holding = false;
+    void OnDisable(JNIEnv* env) override {
+        ClickScheduler::SetActive(false);
+        ClickScheduler::ClearPending();
+        if (env) KeyBinds::ClearClickQueue(env);
+        m_why = "off";
     }
 
-    // The tick only decides whether the scheduler should run.
-    // All timing lives on the scheduler thread.
-    void OnTick(JNIEnv*) override {
-        bool holding = (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0;
-        bool active  = m_onlyInFight ? holding : true;
+    // Decides only whether the stream should be running. The clicks
+    // themselves are drained and handed to the game by ModuleManager.
+    void OnTick(JNIEnv* env) override {
+        ClickScheduler::SetProfile(BuildProfile());
 
-        {
-            std::lock_guard<std::mutex> lock(m_mutex);
-            if (holding && !m_holding) {
-                m_holdStart = std::chrono::steady_clock::now();
-                m_history.clear();
-                m_inPair = false;
-                m_burstLeft = 0;
-            }
-            m_holding = holding;
+        jobject player = Minecraft::GetPlayer(env);
+        if (!player) { ClickScheduler::SetActive(false); m_why = "no player"; return; }
+
+        if (Minecraft::IsInGui(env)) {
+            // runTick does not consume pressTime while a screen is
+            // open, so anything queued would fire in one burst the
+            // moment it closes.
+            ClickScheduler::SetActive(false);
+            KeyBinds::ClearClickQueue(env);
+            m_why = "menu";
+            return;
         }
 
-        // The slider can move at any time, and Hit Select shares this
-        // limit, so keep the scheduler in step with it.
-        ClickScheduler::SetFloor(m_hardFloorMs);
+        bool holding = (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0;
+
+        bool active;
+        switch (m_trigger) {
+            case 1:  active = holding && CombatState::HasTarget(); break;
+            case 2:  active = true; break;
+            default: active = holding; break;
+        }
+
+        if (active && m_requireTarget
+            && CombatState::TargetDist() > (double)m_targetRange) {
+            active = false;
+            m_why = "nothing in range";
+        }
+
         ClickScheduler::SetActive(active);
+
+        if (!active && m_why[0] != 'n') m_why = holding ? "waiting" : "not holding";
+        else if (active) m_why = "clicking";
     }
 
+    void NoteDelivered(int n) { m_delivered += n; }
+
     void RenderSettings() override {
+        // ---- Live ----
+        bool ok = ClickScheduler::IsRunning();
+        ImGui::TextColored(ok ? ImVec4(0.4f, 1.f, 0.6f, 1.f)
+                              : ImVec4(1.f, 0.4f, 0.4f, 1.f),
+            "%s  (%s)", ok ? "Timer running" : "TIMER DEAD", m_why);
+
+        ImGui::TextDisabled("Delivered %d | queued %lld | last gap %lld ms",
+            m_delivered, ClickScheduler::Emitted(), ClickScheduler::LastGap());
+
+        float sd = ClickScheduler::LiveStdDev();
+        if (sd < 900.f) {
+            ImVec4 col = (sd < m_minStdDev) ? ImVec4(1.f, 0.45f, 0.35f, 1.f)
+                                            : ImVec4(0.4f, 1.f, 0.6f, 1.f);
+            ImGui::TextColored(col, "Measured %.1f CPS | std-dev %.1f ms",
+                ClickScheduler::LiveCPS(), sd);
+        }
+
+        if (!KeyBinds::HasClickQueue()) {
+            ImGui::TextColored(ImVec4(1.f, 0.4f, 0.4f, 1.f),
+                "pressTime unresolved: clicks cannot reach the game");
+        }
+
+        ImGui::Separator();
         const char* pats[] = { "Normal", "Butterfly", "Drag", "Jitter" };
         ImGui::Combo("Pattern", &m_pattern, pats, 4);
 
@@ -305,11 +244,21 @@ public:
                 "! A flat stream above 15 CPS is not humanly reachable");
         }
 
-        ImGui::Separator();
         ImGui::SliderFloat("Min CPS", &m_minCPS, 1.f, 24.f, "%.0f");
         ImGui::SliderFloat("Max CPS", &m_maxCPS, 1.f, 26.f, "%.0f");
         if (m_minCPS > m_maxCPS) m_minCPS = m_maxCPS;
-        ImGui::Checkbox("Only While Clicking", &m_onlyInFight);
+
+        ImGui::Separator();
+        ImGui::TextColored(ImVec4(0.5f, 0.8f, 1.f, 1.f), "When to run");
+        const char* trig[] = { "Holding LMB", "Holding + target", "Always" };
+        ImGui::Combo("Trigger", &m_trigger, trig, 3);
+        if (m_trigger == 2) {
+            ImGui::TextColored(ImVec4(1.f, 0.45f, 0.35f, 1.f),
+                "Always-on clicking in a lobby is the easiest thing to spot");
+        }
+        ImGui::Checkbox("Require Target In Range", &m_requireTarget);
+        if (m_requireTarget)
+            ImGui::SliderFloat("Target Range", &m_targetRange, 2.f, 8.f, "%.1f");
 
         if (m_pattern == 1) {
             ImGui::Separator();
@@ -324,9 +273,8 @@ public:
 
             float avgPair = (m_pairGapMin + m_pairGapMax) * 0.5f;
             float avgRest = (m_restGapMin + m_restGapMax) * 0.5f;
-            float est = 2000.0f / (avgPair + avgRest);
             ImGui::TextColored(ImVec4(0.4f, 1.f, 0.6f, 1.f),
-                "Estimated actual CPS: %.1f", est);
+                "Shape implies about %.1f CPS", 2000.0f / (avgPair + avgRest));
         }
 
         if (m_pattern == 2) {
@@ -341,7 +289,7 @@ public:
         }
 
         ImGui::Separator();
-        ImGui::TextColored(ImVec4(0.5f, 0.8f, 1.f, 1.f), "Humanization");
+        ImGui::TextColored(ImVec4(0.5f, 0.8f, 1.f, 1.f), "Humanisation");
         ImGui::Checkbox("Jitter", &m_jitter);
         if (m_jitter)
             ImGui::SliderFloat("Jitter Amount", &m_jitterAmount, 5.f, 50.f, "%.0f%%");
@@ -371,18 +319,13 @@ public:
         if (m_entropyGuard)
             ImGui::SliderFloat("Min Std Dev (ms)", &m_minStdDev, 3.f, 25.f, "%.0f");
         ImGui::SliderInt("Hard Floor (ms)", &m_hardFloorMs, 18, 50);
+        ImGui::TextDisabled("Shared with Hit Select, so the two cannot stack.");
 
-        float sd;
-        {
-            std::lock_guard<std::mutex> lock(m_mutex);
-            sd = StdDevLocked();
-        }
-        if (sd < 900.f) {
-            ImVec4 col = (sd < m_minStdDev)
-                ? ImVec4(1.f, 0.45f, 0.35f, 1.f)
-                : ImVec4(0.4f, 1.f, 0.6f, 1.f);
-            ImGui::TextColored(col, "Live std-dev: %.1f ms  (last gap %lld ms)",
-                sd, ClickScheduler::LastGap());
+        long long dropped = ClickScheduler::Dropped();
+        if (dropped > 20) {
+            ImGui::TextColored(ImVec4(1.f, 0.7f, 0.3f, 1.f),
+                "%lld clicks dropped: the game is not draining them, "
+                "lower your CPS", dropped);
         }
     }
 };
