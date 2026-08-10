@@ -4,6 +4,7 @@
 #include "../../mc/keybinds.h"
 #include "../../mc/combat_state.h"
 #include <imgui.h>
+#include <cstdio>
 #include <cmath>
 #include <random>
 
@@ -37,11 +38,12 @@
 
 class Speed : public Module {
 private:
+    // ---- Core ----
     int   m_mode       = 0;
     float m_multiplier = 1.6f;
-    bool  m_groundOnly = false;
 
-    // ---- Sprint Jump ----
+    // ---- Advanced ----
+    bool  m_groundOnly     = false;
     bool  m_requireSprint  = true;   // only hop when actually sprinting
     bool  m_forwardOnly    = true;   // no hopping while strafing sideways
     bool  m_pauseInCombat  = true;   // leave the ground to More KB / Velocity
@@ -54,6 +56,8 @@ private:
     int  m_groundTicks   = 0;
     int  m_targetGround  = 1;
     int  m_hops          = 0;
+
+    mutable char m_status[40] = "";
 
     std::mt19937 m_rng{ std::random_device{}() };
 
@@ -220,6 +224,14 @@ public:
         m_hops = 0;
     }
 
+    const char* StatusLine() const override {
+        if (m_mode == 0) snprintf(m_status, sizeof(m_status), "%d hops", m_hops);
+        else             snprintf(m_status, sizeof(m_status), "%.2fx motion", m_multiplier);
+        return m_status;
+    }
+
+    bool HasAdvanced() const override { return true; }
+
     void RenderSettings() override {
         const char* modes[] = { "Sprint Jump", "Strafe", "BHop" };
         ImGui::Combo("Mode", &m_mode, modes, 3);
@@ -227,42 +239,45 @@ public:
         if (m_mode == 0) {
             ImGui::TextColored(ImVec4(0.4f, 1.f, 0.6f, 1.f),
                 "Input only. Same packets as a player spamming space.");
-            ImGui::Separator();
-            ImGui::Checkbox("Require Sprint", &m_requireSprint);
-            ImGui::Checkbox("Forward Only", &m_forwardOnly);
-            ImGui::Checkbox("Pause After Taking A Hit", &m_pauseInCombat);
-            if (m_pauseInCombat) {
-                ImGui::SliderInt("Combat Pause (ticks)", &m_combatPause, 2, 20);
-                ImGui::TextColored(ImVec4(0.6f, 0.7f, 0.85f, 1.f),
-                    "Keeps the ground free for More KB and Velocity");
-            }
-            ImGui::Separator();
-            ImGui::SliderFloat("Skip Chance", &m_skipChance, 0.f, 25.f, "%.0f%%");
-            ImGui::SliderInt("Ground Ticks Min", &m_groundTicksMin, 1, 6);
-            ImGui::SliderInt("Ground Ticks Max", &m_groundTicksMax, 1, 8);
-            if (m_groundTicksMin > m_groundTicksMax)
-                m_groundTicksMin = m_groundTicksMax;
-
-            float avgGround = (m_groundTicksMin + m_groundTicksMax) * 0.5f;
-            ImGui::TextColored(ImVec4(0.6f, 0.7f, 0.85f, 1.f),
-                "About one hop every %.1f ticks   (%d this session)",
-                avgGround + 11.0f, m_hops);
-
             if (!KeyBinds::HasJump()) {
                 ImGui::TextColored(ImVec4(1.f, 0.8f, 0.3f, 1.f),
                     "Jump keybind unresolved: module inactive");
-            }
-            if (m_requireSprint && !Minecraft::HasSprintCheck()) {
-                ImGui::TextColored(ImVec4(1.f, 0.8f, 0.3f, 1.f),
-                    "Sprint flag unresolved: hopping without the check");
             }
             return;
         }
 
         ImGui::TextColored(ImVec4(1.f, 0.35f, 0.3f, 1.f),
-            "! Rewrites motion. Caught instantly by AGC, Grim and Polar");
-        ImGui::Separator();
+            "Rewrites motion. Caught instantly by AGC, Grim and Polar");
         ImGui::SliderFloat("Multiplier", &m_multiplier, 1.0f, 3.0f, "%.2fx");
-        ImGui::Checkbox("Ground Only", &m_groundOnly);
+    }
+
+    void RenderAdvanced() override {
+        if (m_mode != 0) {
+            ImGui::Checkbox("Ground Only", &m_groundOnly);
+            return;
+        }
+
+        ImGui::Checkbox("Require Sprint", &m_requireSprint);
+        if (m_requireSprint && !Minecraft::HasSprintCheck()) {
+            ImGui::TextColored(ImVec4(1.f, 0.8f, 0.3f, 1.f),
+                "Sprint flag unresolved: hopping without the check");
+        }
+        ImGui::Checkbox("Forward Only", &m_forwardOnly);
+        ImGui::Checkbox("Pause After Taking A Hit", &m_pauseInCombat);
+        if (m_pauseInCombat) {
+            ImGui::SliderInt("Combat Pause (ticks)", &m_combatPause, 2, 20);
+            ImGui::TextDisabled("Keeps the ground free for More KB and Velocity.");
+        }
+
+        ImGui::SeparatorText("Rhythm");
+        ImGui::SliderFloat("Skip Chance", &m_skipChance, 0.f, 25.f, "%.0f%%");
+        ImGui::SliderInt("Ground Ticks Min", &m_groundTicksMin, 1, 6);
+        ImGui::SliderInt("Ground Ticks Max", &m_groundTicksMax, 1, 8);
+        if (m_groundTicksMin > m_groundTicksMax)
+            m_groundTicksMin = m_groundTicksMax;
+
+        float avgGround = (m_groundTicksMin + m_groundTicksMax) * 0.5f;
+        ImGui::TextDisabled("About one hop every %.1f ticks (%d this session)",
+            avgGround + 11.0f, m_hops);
     }
 };
