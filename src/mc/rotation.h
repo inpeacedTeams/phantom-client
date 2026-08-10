@@ -26,7 +26,8 @@
 //    is 0.0439 is arithmetically impossible for a player. Checking
 //    this costs an anticheat nothing and catches nearly every
 //    naive aim assist. Quantising to the step removes the tell
-//    completely.
+//    completely. It applies to EVERY mode below: Snap and Linear
+//    are snapped just as Smooth is.
 //
 //    This applies to BOTH axes. A caller that wants pitch to move
 //    at a different rate than yaw (a wrist tilts less readily than
@@ -38,14 +39,24 @@
 //
 // 2. Zero jerk.
 //    A hand accelerates and decelerates. Interpolating straight to
-//    a target produces a velocity curve no arm can make, so the
-//    engine carries velocity between ticks and eases it instead of
-//    snapping.
+//    a target produces a velocity curve no arm can make, so Smooth
+//    carries velocity between ticks and eases it instead of
+//    snapping. Linear and Snap are deliberately sharper and are
+//    labelled as louder where they are exposed.
 //
 // 3. Perfect convergence.
 //    People overshoot slightly and correct. Landing exactly on
 //    target every single time, forever, is its own signature, so a
-//    small overshoot is baked in.
+//    small overshoot is baked into Smooth.
+//
+// ROTATION MODES
+//   Smooth   ease + carried velocity + overshoot. The human-looking
+//            default, and the only one meant for a real anticheat.
+//   Linear   constant angular speed toward the target; `speed` is
+//            read as degrees per tick. No ease, no inertia, so it
+//            arrives sooner and more predictably. No overshoot.
+//   Snap     the whole remaining angle in a single tick. Instant.
+//            Unprotected servers only.
 // =================================================================
 
 class Rotation {
@@ -59,6 +70,10 @@ private:
 
 public:
     struct Angles { float yaw = 0.f, pitch = 0.f; };
+
+    // How a rotation travels toward its target. Passed to Step; the
+    // grid snap and pitchRatio apply to all three.
+    enum class Mode { Smooth = 0, Linear, Snap };
 
     static float Wrap(float a) {
         while (a > 180.f)  a -= 360.f;
@@ -93,74 +108,119 @@ public:
     // -------------------------------------------------------------
     // Step the current rotation toward a target.
     //
-    // speed        degrees per tick at full commitment
-    // smoothing    0 snaps, 1 barely moves
-    // overshoot    fraction of the remaining angle to overrun by
-    // pitchRatio   how fast pitch moves relative to yaw. A wrist
-    //              tilts less readily than it turns, so callers pass
-    //              < 1 here. Applied INSIDE, before the velocity
-    //              integrate and the grid snap, so the written pitch
-    //              stays a real mouse value. Scaling the result
-    //              afterwards would break both.
+    // speed        Smooth: pull strength. Linear: degrees per tick.
+    //              Snap: ignored.
+    // smoothing    Smooth only. 0 snaps, 1 barely moves.
+    // overshoot    Smooth only. Fraction of the remaining angle to
+    //              overrun by.
+    // pitchRatio   how fast pitch moves relative to yaw, applied in
+    //              every mode BEFORE the grid snap so the written
+    //              pitch stays a real mouse value.
+    // mode         Smooth, Linear or Snap. See the header comment.
     // -------------------------------------------------------------
     static Angles Step(float curYaw, float curPitch,
                        float targetYaw, float targetPitch,
                        float speed, float smoothing,
                        float jitterPct, float overshoot,
-                       float pitchRatio = 1.0f)
+                       float pitchRatio = 1.0f,
+                       Mode mode = Mode::Smooth)
     {
         float dYaw   = Wrap(targetYaw - curYaw);
         float dPitch = targetPitch - curPitch;
 
-        // Overshoot: aim slightly past the target while it is still
-        // far away, then let it settle. People do not converge
-        // perfectly and neither should this.
-        if (overshoot > 0.0f) {
-            float mag = std::fabs(dYaw);
-            if (mag > 6.0f) {
-                std::uniform_real_distribution<float> d(0.0f, overshoot);
-                dYaw *= (1.0f + d(s_rng));
+        float stepYaw   = 0.0f;
+        float stepPitch = 0.0f;
+
+        if (mode == Mode::Snap) {
+            // The whole remaining angle at once. No velocity, no
+            // ease: this is the loud one, and pretending otherwise
+            // by leaving inertia around would only half-commit.
+            stepYaw   = dYaw;
+            stepPitch = dPitch * pitchRatio;
+            s_yawVelocity = s_pitchVelocity = 0.0f;
+        }
+        else if (mode == Mode::Linear) {
+            // Constant angular speed toward the target. `speed` is
+            // degrees per tick here, not a pull factor, so the arm
+            // travels at a steady rate rather than easing off as it
+            // arrives. No carried velocity, so it cannot overshoot
+            // and does not need the integrator.
+            float maxYaw   = speed;
+            float maxPitch = speed * pitchRatio;
+
+            stepYaw = dYaw;
+            if (stepYaw >  maxYaw) stepYaw =  maxYaw;
+            if (stepYaw < -maxYaw) stepYaw = -maxYaw;
+
+            stepPitch = dPitch;
+            if (stepPitch >  maxPitch) stepPitch =  maxPitch;
+            if (stepPitch < -maxPitch) stepPitch = -maxPitch;
+
+            // A steady rate with zero noise is its own signature,
+            // so the same per-tick jitter Smooth uses is still
+            // available here.
+            if (jitterPct > 0.0f) {
+                float r = jitterPct * 0.01f;
+                std::uniform_real_distribution<float> d(-r, r);
+                stepYaw   *= (1.0f + d(s_rng));
+                stepPitch *= (1.0f + d(s_rng));
+            }
+
+            s_yawVelocity = s_pitchVelocity = 0.0f;
+        }
+        else {
+            // ---- Smooth (default) ----
+            // Overshoot: aim slightly past the target while it is
+            // still far away, then let it settle. People do not
+            // converge perfectly and neither should this.
+            if (overshoot > 0.0f) {
+                float mag = std::fabs(dYaw);
+                if (mag > 6.0f) {
+                    std::uniform_real_distribution<float> d(0.0f, overshoot);
+                    dYaw *= (1.0f + d(s_rng));
+                }
+            }
+
+            // Ease toward the target rather than jumping. The closer
+            // the crosshair gets, the smaller the step, which
+            // removes the oscillation a plain lerp produces near
+            // zero.
+            float yawEase   = std::fmin(1.0f, std::fabs(dYaw)   / 28.0f);
+            float pitchEase = std::fmin(1.0f, std::fabs(dPitch) / 20.0f);
+
+            // pitchRatio is applied HERE so everything downstream —
+            // the velocity carry, the jitter, and above all the grid
+            // snap — acts on the value that is actually written.
+            float wantYaw   = dYaw   * speed * 0.02f * yawEase;
+            float wantPitch = dPitch * speed * 0.016f * pitchEase * pitchRatio;
+
+            // Carry velocity so the arm has inertia instead of
+            // teleporting.
+            float k = 1.0f - smoothing;
+            if (k < 0.05f) k = 0.05f;
+            s_yawVelocity   += (wantYaw   - s_yawVelocity)   * k;
+            s_pitchVelocity += (wantPitch - s_pitchVelocity) * k;
+
+            stepYaw   = s_yawVelocity;
+            stepPitch = s_pitchVelocity;
+
+            if (jitterPct > 0.0f) {
+                float r = jitterPct * 0.01f;
+                std::uniform_real_distribution<float> d(-r, r);
+                stepYaw   *= (1.0f + d(s_rng));
+                stepPitch *= (1.0f + d(s_rng));
             }
         }
 
-        // Ease toward the target rather than jumping. The closer the
-        // crosshair gets, the smaller the step, which removes the
-        // oscillation a plain lerp produces near zero.
-        float yawEase   = std::fmin(1.0f, std::fabs(dYaw)   / 28.0f);
-        float pitchEase = std::fmin(1.0f, std::fabs(dPitch) / 20.0f);
-
-        // pitchRatio is applied HERE so everything downstream — the
-        // velocity carry, the jitter, and above all the grid snap —
-        // acts on the value that is actually written. Applying it
-        // after Step returned left the integrator chasing a step it
-        // never took and put the final pitch off the mouse grid.
-        float wantYaw   = dYaw   * speed * 0.02f * yawEase;
-        float wantPitch = dPitch * speed * 0.016f * pitchEase * pitchRatio;
-
-        // Carry velocity so the arm has inertia instead of teleporting
-        float k = 1.0f - smoothing;
-        if (k < 0.05f) k = 0.05f;
-        s_yawVelocity   += (wantYaw   - s_yawVelocity)   * k;
-        s_pitchVelocity += (wantPitch - s_pitchVelocity) * k;
-
-        float stepYaw   = s_yawVelocity;
-        float stepPitch = s_pitchVelocity;
-
-        if (jitterPct > 0.0f) {
-            float r = jitterPct * 0.01f;
-            std::uniform_real_distribution<float> d(-r, r);
-            stepYaw   *= (1.0f + d(s_rng));
-            stepPitch *= (1.0f + d(s_rng));
-        }
-
         // Never move further than the target: overrunning on the
-        // final tick looks like a snap back.
+        // final tick looks like a snap back. Applies to every mode.
         if (std::fabs(stepYaw)   > std::fabs(dYaw))   stepYaw   = dYaw;
         if (std::fabs(stepPitch) > std::fabs(dPitch)) stepPitch = dPitch;
 
         // The grid is the last thing applied, so the value written
-        // is one a mouse could actually have produced. This is why
-        // pitchRatio cannot be applied by the caller after the fact.
+        // is one a mouse could actually have produced. Every mode
+        // passes through here, which is why none of them may be
+        // scaled by the caller afterwards.
         stepYaw   = Quantise(stepYaw);
         stepPitch = Quantise(stepPitch);
 
