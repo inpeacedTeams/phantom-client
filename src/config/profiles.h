@@ -27,15 +27,14 @@
 // that value, and the user gets a config that is subtly wrong in a
 // way nobody can see.
 //
-// That already happened once. Half of these entries were pointing
-// at settings that had been renamed during the module rewrites, so
-// applying a preset was doing about two thirds of what it claimed.
+// That has now happened twice. So Apply counts every entry it could
+// not match and NAMES the first few in the notification, because a
+// count alone tells you something is wrong but not what, and the
+// console it used to print to does not exist in a release build.
 //
-// So Apply counts every entry it could not match and says so. It
-// used to say "see console", which was useless: the console only
-// exists in a debug build, behind a fullscreen game. It now names
-// the first few misses in the notification itself, which is the
-// only place the person who can fix it will actually look.
+// There is also a Verify() that walks every preset without applying
+// anything, so a mismatch can be caught at startup instead of the
+// first time somebody presses a preset button.
 // =================================================================
 
 struct ProfileValue {
@@ -76,7 +75,7 @@ public:
             { "Fly", "Kill Aura", "No Jump Delay", "Backtrack", "Aim Assist" },
             {
                 // ---- Velocity: legit modes only ----
-                { "Velocity", "Mode",             5 },   // Combined
+                { "Velocity", "Mode",             5 },   // Both
                 { "Velocity", "Jump Chance",     65 },
                 { "Velocity", "Jump Delay Min",   0 },
                 { "Velocity", "Jump Delay Max",   2 },
@@ -84,33 +83,34 @@ public:
                 { "Velocity", "Strafe Chance",   60 },
                 { "Velocity", "Strafe Delay",     1 },
                 { "Velocity", "Strafe Ticks",     2 },
-                { "Velocity", "Strafe Toward",    1 },
+                { "Velocity", "Toward Attacker",  1 },
                 { "Velocity", "Only In Combat",   1 },
 
                 // ---- Sprint Reset ----
                 // W-Tap. Never Ctrl here: toggling the sprint key is
                 // the one variant AGC watches for.
-                { "Sprint Reset", "Method",          0 },
-                { "Sprint Reset", "Chance",         88 },
-                { "Sprint Reset", "Reset Ticks Min", 1 },
-                { "Sprint Reset", "Reset Ticks Max", 2 },
-                { "Sprint Reset", "Hit Delay",       0 },
-                { "Sprint Reset", "Only On Hit",     1 },
-                { "Sprint Reset", "Require Sprint",  1 },
+                { "Sprint Reset", "Method",               0 },
+                { "Sprint Reset", "Chance",              88 },
+                { "Sprint Reset", "Hold Min",             1 },
+                { "Sprint Reset", "Hold Max",             2 },
+                { "Sprint Reset", "Hit Delay",            0 },
+                { "Sprint Reset", "Only On Landed Hits",  1 },
+                { "Sprint Reset", "Require Sprint",       1 },
+                { "Sprint Reset", "Re-arm Sprint",        1 },
 
                 // ---- Auto Blockhit ----
                 // Predict their swing and block around it. Coverage
                 // is a consequence of how often they attack, not a
                 // number we set.
                 { "Auto Blockhit", "Mode",             0 },   // Predict
-                { "Auto Blockhit", "Block Range",    3.6f },
+                { "Auto Blockhit", "Reach",          3.6f },
                 { "Auto Blockhit", "Detect Range",   6.0f },
                 { "Auto Blockhit", "Lead",           120 },
                 { "Auto Blockhit", "Reaction Min",    40 },
                 { "Auto Blockhit", "Reaction Max",   100 },
                 { "Auto Blockhit", "Swing Gap",        1 },
                 { "Auto Blockhit", "After Hit",        2 },
-                { "Auto Blockhit", "Max Block Ticks", 12 },
+                { "Auto Blockhit", "Max Hold",        12 },
                 { "Auto Blockhit", "Chance",          92 },
                 { "Auto Blockhit", "Timing Noise",    30 },
                 { "Auto Blockhit", "Only Sword",       1 },
@@ -139,7 +139,7 @@ public:
                 { "Speed", "Mode",             0 },
                 { "Speed", "Require Sprint",   1 },
                 { "Speed", "Forward Only",     1 },
-                { "Speed", "Pause In Combat",  1 },
+                { "Speed", "Pause After A Hit", 1 },
                 { "Speed", "Combat Pause",     8 },
                 { "Speed", "Skip Chance",      9 },
                 { "Speed", "Ground Ticks Min", 1 },
@@ -148,12 +148,12 @@ public:
                 // ---- ESP ----
                 // Quiet. A duel is one opponent; names and tracers
                 // are clutter you do not need.
-                { "ESP", "Max Range",     48 },
-                { "ESP", "Box Style",      0 },
-                { "ESP", "Show Name",      0 },
-                { "ESP", "Show Tracers",   0 },
-                { "ESP", "Show Health",    1 },
-                { "ESP", "Show Distance",  0 },
+                { "ESP", "Range",     48 },
+                { "ESP", "Box Style",  0 },
+                { "ESP", "Name",       0 },
+                { "ESP", "Tracers",    0 },
+                { "ESP", "Health",     1 },
+                { "ESP", "Distance",   0 },
             }
         };
     }
@@ -175,63 +175,65 @@ public:
               "ESP", "Fullbright" },
             { "Fly", "Kill Aura", "Backtrack" },
             {
-                { "Velocity", "Mode",           5 },
-                { "Velocity", "Jump Chance",   75 },
-                { "Velocity", "Strafe Chance", 70 },
-                { "Velocity", "Strafe Toward",  1 },
+                { "Velocity", "Mode",            5 },
+                { "Velocity", "Jump Chance",    75 },
+                { "Velocity", "Strafe Chance",  70 },
+                { "Velocity", "Toward Attacker", 1 },
 
-                { "Sprint Reset", "Method",          0 },
-                { "Sprint Reset", "Chance",         92 },
-                { "Sprint Reset", "Reset Ticks Min", 1 },
-                { "Sprint Reset", "Reset Ticks Max", 2 },
-                { "Sprint Reset", "Only On Hit",     1 },
+                { "Sprint Reset", "Method",              0 },
+                { "Sprint Reset", "Chance",             92 },
+                { "Sprint Reset", "Hold Min",            1 },
+                { "Sprint Reset", "Hold Max",            2 },
+                { "Sprint Reset", "Only On Landed Hits", 1 },
 
                 // Slightly earlier block than on AGC: Polar cares
                 // less about the block cadence itself.
                 { "Auto Blockhit", "Mode",          0 },
-                { "Auto Blockhit", "Block Range", 3.7f },
+                { "Auto Blockhit", "Reach",      3.7f },
                 { "Auto Blockhit", "Lead",        150 },
                 { "Auto Blockhit", "Chance",       96 },
                 { "Auto Blockhit", "Timing Noise", 26 },
                 { "Auto Blockhit", "Only Sword",    1 },
 
                 // Aim assist is usable on Polar, but stay slow.
-                { "Aim Assist", "Speed",          2.4f },
-                { "Aim Assist", "Pitch Ratio",    0.55f },
-                { "Aim Assist", "Smoothing",      0.6f },
-                { "Aim Assist", "FOV",             70 },
-                { "Aim Assist", "Range",          3.4f },
-                { "Aim Assist", "Require Swing",    1 },
-                { "Aim Assist", "Jitter",          18 },
-                { "Aim Assist", "Wander",         0.22f },
-                { "Aim Assist", "Breaks",           1 },
-                { "Aim Assist", "Break Chance",    12 },
+                { "Aim Assist", "Speed",                2.4f },
+                { "Aim Assist", "Pitch Ratio",          0.55f },
+                { "Aim Assist", "Smoothing",            0.6f },
+                { "Aim Assist", "FOV",                   70 },
+                { "Aim Assist", "Range",                3.4f },
+                { "Aim Assist", "Only While Swinging",    1 },
+                { "Aim Assist", "Jitter",                18 },
+                { "Aim Assist", "Wander",               0.22f },
+                { "Aim Assist", "Breaks",                 1 },
+                { "Aim Assist", "Break Chance",          12 },
 
                 { "AutoClicker", "CPS",      12 },
                 { "AutoClicker", "Variance", 20 },
                 { "AutoClicker", "Drift",     1 },
 
-                // Bridge Assist pace: 1 is Balanced
-                { "Bridge Assist", "Mode",           1 },
-                { "Bridge Assist", "Edge Distance", 0.30f },
-                { "Bridge Assist", "Release Delay",  1 },
-                { "Bridge Assist", "Press Delay",    2 },
-                { "Bridge Assist", "Only Backward",  1 },
+                // Bridge Assist pace: 1 is Balanced, and the three
+                // timings below are exactly its numbers, so the
+                // preset does not immediately flip to Custom.
+                { "Bridge Assist", "Pace",                        1 },
+                { "Bridge Assist", "Edge Distance",           0.30f },
+                { "Bridge Assist", "Release Delay",               1 },
+                { "Bridge Assist", "Press Delay",                 2 },
+                { "Bridge Assist", "Only While Walking Backwards", 1 },
 
                 // Hopping across a bedwars map is most of the value
-                { "Speed", "Mode",            0 },
-                { "Speed", "Require Sprint",  1 },
-                { "Speed", "Forward Only",    1 },
-                { "Speed", "Pause In Combat", 1 },
-                { "Speed", "Combat Pause",    6 },
-                { "Speed", "Skip Chance",     7 },
+                { "Speed", "Mode",             0 },
+                { "Speed", "Require Sprint",   1 },
+                { "Speed", "Forward Only",     1 },
+                { "Speed", "Pause After A Hit", 1 },
+                { "Speed", "Combat Pause",     6 },
+                { "Speed", "Skip Chance",      7 },
 
                 // A team game: knowing who is where matters more
                 // than keeping the screen clean.
-                { "ESP", "Max Range",    64 },
-                { "ESP", "Show Name",     1 },
-                { "ESP", "Show Health",   1 },
-                { "ESP", "Show Tracers",  0 },
+                { "ESP", "Range",    64 },
+                { "ESP", "Name",      1 },
+                { "ESP", "Health",    1 },
+                { "ESP", "Tracers",   0 },
             }
         };
     }
@@ -251,15 +253,15 @@ public:
               "Backtrack", "AutoClicker", "ESP", "No Jump Delay",
               "Hit Select" },
             {
-                { "Sprint Reset", "Method",       0 },
-                { "Sprint Reset", "Chance",      70 },
-                { "Sprint Reset", "Only On Hit",  1 },
+                { "Sprint Reset", "Method",              0 },
+                { "Sprint Reset", "Chance",             70 },
+                { "Sprint Reset", "Only On Landed Hits", 1 },
 
                 // Reactive only: blocks while they are visibly
                 // mid-swing and never guesses. On a recording it
                 // reads as someone with good reactions.
                 { "Auto Blockhit", "Mode",             1 },
-                { "Auto Blockhit", "Block Range",    3.4f },
+                { "Auto Blockhit", "Reach",          3.4f },
                 { "Auto Blockhit", "Chance",          75 },
                 { "Auto Blockhit", "After Hit",        3 },
                 { "Auto Blockhit", "Only Sword",       1 },
@@ -267,14 +269,14 @@ public:
 
                 // Loose hop rhythm. Someone watching should see a
                 // player bunny hopping, not a metronome.
-                { "Speed", "Mode",             0 },
-                { "Speed", "Require Sprint",   1 },
-                { "Speed", "Forward Only",     1 },
-                { "Speed", "Pause In Combat",  1 },
-                { "Speed", "Combat Pause",    10 },
-                { "Speed", "Skip Chance",     16 },
-                { "Speed", "Ground Ticks Min", 1 },
-                { "Speed", "Ground Ticks Max", 4 },
+                { "Speed", "Mode",              0 },
+                { "Speed", "Require Sprint",    1 },
+                { "Speed", "Forward Only",      1 },
+                { "Speed", "Pause After A Hit", 1 },
+                { "Speed", "Combat Pause",     10 },
+                { "Speed", "Skip Chance",      16 },
+                { "Speed", "Ground Ticks Min",  1 },
+                { "Speed", "Ground Ticks Max",  4 },
             }
         };
     }
@@ -294,15 +296,15 @@ public:
             {
                 { "Velocity", "Mode", 1 },   // Cancel
 
-                { "Kill Aura", "Range",     4.2f },
-                { "Kill Aura", "Min CPS",     14 },
-                { "Kill Aura", "Max CPS",     18 },
-                { "Kill Aura", "Rotate",       1 },
+                { "Kill Aura", "Range",            4.2f },
+                { "Kill Aura", "Min CPS",            14 },
+                { "Kill Aura", "Max CPS",            18 },
+                { "Kill Aura", "Rotate To Target",    1 },
 
                 // Nothing to hide from, so hold the block whenever
                 // anyone is close enough to swing at you.
                 { "Auto Blockhit", "Mode",             2 },   // In Range
-                { "Auto Blockhit", "Block Range",    4.0f },
+                { "Auto Blockhit", "Reach",          4.0f },
                 { "Auto Blockhit", "Chance",         100 },
                 { "Auto Blockhit", "Protect Movement", 1 },
 
@@ -315,15 +317,60 @@ public:
                 { "AutoClicker", "Variance", 10 },
                 { "AutoClicker", "Floor",    20 },
 
-                { "ESP", "Show Tracers",  1 },
-                { "ESP", "Show Distance", 1 },
-                { "ESP", "Show Name",     1 },
+                { "ESP", "Tracers",  1 },
+                { "ESP", "Distance", 1 },
+                { "ESP", "Name",     1 },
             }
         };
     }
 
     static std::vector<Profile> All() {
         return { Minemen(), Polar(), Legit(), Blatant() };
+    }
+
+    // ---------------------------------------------------------
+    // Verify
+    //
+    // Walks every preset and checks that each module and setting it
+    // names still exists, WITHOUT changing anything. Called once at
+    // startup so a rename is caught immediately rather than the
+    // first time somebody presses a preset button in a fight.
+    //
+    // Returns the number of broken entries and describes the first
+    // few, which is all anyone needs to go and fix it.
+    // ---------------------------------------------------------
+    static int Verify(std::string* detail) {
+        int broken = 0;
+        std::string firstFew;
+
+        auto note = [&](const std::string& what) {
+            broken++;
+            if (broken > 3) return;
+            if (!firstFew.empty()) firstFew += ", ";
+            firstFew += what;
+        };
+
+        for (const auto& p : All()) {
+            for (const char* n : p.enable)
+                if (!ModuleManager::Find(n)) note(std::string(p.name) + ": " + n);
+            for (const char* n : p.disable)
+                if (!ModuleManager::Find(n)) note(std::string(p.name) + ": " + n);
+
+            for (const auto& v : p.values) {
+                Module* m = ModuleManager::Find(v.module);
+                if (!m) { note(std::string(v.module)); continue; }
+
+                bool found = false;
+                for (const auto& s : m->GetSettings()) {
+                    if (s.name == v.setting) { found = true; break; }
+                }
+                if (!found)
+                    note(std::string(v.module) + "." + v.setting);
+            }
+        }
+
+        if (detail) *detail = firstFew;
+        return broken;
     }
 
     // ---------------------------------------------------------
