@@ -12,28 +12,132 @@ enum class ModuleCategory {
     MISC
 };
 
-// -----------------------------------------------------------------
+// =================================================================
 // Setting
-// -----------------------------------------------------------------
-// A named pointer to a member field. Modules register their tunables
-// in the constructor so config profiles can set them by name without
-// every module needing bespoke apply code.
+// =================================================================
+// A setting used to be a name and a pointer, and nothing else. The
+// panel that showed it was then written out by hand, in raw ImGui,
+// once per module. That had three consequences and all three were
+// real bugs rather than theory:
 //
-// Registering a setting is NOT the same as showing it. Everything
-// stays bound so profiles can tune it, but only the handful that
-// change how a module feels are drawn by default. The rest live
-// behind Advanced.
-// -----------------------------------------------------------------
+//   1. The config key and the label on screen were two different
+//      strings that had to be kept in step by hand. They drifted,
+//      and a preset that named the old one silently did nothing.
+//   2. A setting could be bound and never drawn, so it existed in
+//      the config file and nowhere in the interface.
+//   3. Fifteen hand-written panels meant fifteen slightly different
+//      sliders. Some had a typed value, some did not. Some clamped,
+//      some did not.
+//
+// So a setting now carries everything needed to draw itself, and
+// there is exactly ONE renderer for all of them. The name is the
+// config key AND the label, so they cannot disagree. The hint is
+// mandatory in spirit: a control nobody can explain should not be
+// exposed at all.
+// =================================================================
 struct Setting {
-    enum class Type { Bool, Int, Float };
+    enum class Type { Bool, Int, Float, Mode };
 
-    std::string name;
-    Type type;
-    void* ptr;
+    std::string name;               // config key and on-screen label
+    const char* hint = nullptr;     // one line under the control
+    Type  type = Type::Bool;
+    void* ptr  = nullptr;
+
+    float lo = 0.0f;
+    float hi = 1.0f;
+    const char* fmt = "%.2f";
+
+    const char* const* options = nullptr;   // Mode only
+    int optionCount = 0;
+
+    // Everyday settings are on the panel. Everything else is behind
+    // Advanced, which most people will never open and should never
+    // need to.
+    bool advanced = false;
+
+    // A control that does nothing in the current mode is worse than
+    // a missing one, because it invites you to change it and then
+    // ignores you. Rows can declare which mode they belong to and
+    // simply are not drawn otherwise.
+    int  dependOn    = -1;      // index of the governing setting
+    int  dependValue = 0;
+    bool dependEqual = true;
 
     bool  AsBool()  const { return *(bool*)ptr; }
     int   AsInt()   const { return *(int*)ptr; }
     float AsFloat() const { return *(float*)ptr; }
+
+    // The value a config file stores, whatever the type underneath.
+    float Read() const {
+        switch (type) {
+            case Type::Bool:  return *(bool*)ptr ? 1.0f : 0.0f;
+            case Type::Int:
+            case Type::Mode:  return (float)*(int*)ptr;
+            default:          return *(float*)ptr;
+        }
+    }
+
+    // Clamped on the way in, so a hand-edited or outdated config
+    // cannot push a module into a state its own interface can never
+    // produce.
+    void Write(float v) {
+        switch (type) {
+            case Type::Bool:
+                *(bool*)ptr = (v != 0.0f);
+                break;
+            case Type::Mode: {
+                int i = (int)v;
+                if (i < 0) i = 0;
+                if (optionCount > 0 && i >= optionCount) i = optionCount - 1;
+                *(int*)ptr = i;
+                break;
+            }
+            case Type::Int: {
+                float c = v < lo ? lo : (v > hi ? hi : v);
+                *(int*)ptr = (int)(c + (c < 0.0f ? -0.5f : 0.5f));
+                break;
+            }
+            default:
+                *(float*)ptr = v < lo ? lo : (v > hi ? hi : v);
+                break;
+        }
+    }
+};
+
+class Module;
+
+// Small fluent handle returned by Bind. It holds an index rather
+// than a reference because push_back moves the vector out from
+// under anything holding a pointer into it.
+struct SettingRef {
+    std::vector<Setting>* vec = nullptr;
+    size_t index = 0;
+
+    Setting& S() const { return (*vec)[index]; }
+
+    SettingRef& Hint(const char* h)      { S().hint = h; return *this; }
+    SettingRef& Advanced()               { S().advanced = true; return *this; }
+    SettingRef& Format(const char* f)    { S().fmt = f; return *this; }
+
+    // Draw this row only while another setting holds a given value.
+    SettingRef& When(const char* other, int value) {
+        return Depend(other, value, true);
+    }
+    SettingRef& Unless(const char* other, int value) {
+        return Depend(other, value, false);
+    }
+
+private:
+    SettingRef& Depend(const char* other, int value, bool equal) {
+        for (size_t i = 0; i < vec->size(); i++) {
+            if ((*vec)[i].name != other) continue;
+            S().dependOn    = (int)i;
+            S().dependValue = value;
+            S().dependEqual = equal;
+            break;
+        }
+        return *this;
+    }
 };
 
 class Module {
@@ -55,14 +159,52 @@ protected:
 
     std::vector<Setting> m_settings;
 
-    void Bind(const char* name, bool* p) {
-        m_settings.push_back({ name, Setting::Type::Bool, (void*)p });
+    SettingRef Push(Setting s) {
+        m_settings.push_back(s);
+        return SettingRef{ &m_settings, m_settings.size() - 1 };
     }
-    void Bind(const char* name, int* p) {
-        m_settings.push_back({ name, Setting::Type::Int, (void*)p });
+
+    SettingRef Bind(const char* name, bool* p, const char* hint = nullptr) {
+        Setting s;
+        s.name = name; s.hint = hint;
+        s.type = Setting::Type::Bool; s.ptr = p;
+        return Push(s);
     }
-    void Bind(const char* name, float* p) {
-        m_settings.push_back({ name, Setting::Type::Float, (void*)p });
+
+    SettingRef Bind(const char* name, int* p, int lo, int hi,
+                    const char* hint = nullptr)
+    {
+        Setting s;
+        s.name = name; s.hint = hint;
+        s.type = Setting::Type::Int; s.ptr = p;
+        s.lo = (float)lo; s.hi = (float)hi; s.fmt = "%.0f";
+        return Push(s);
+    }
+
+    SettingRef Bind(const char* name, float* p, float lo, float hi,
+                    const char* fmt = "%.2f", const char* hint = nullptr)
+    {
+        Setting s;
+        s.name = name; s.hint = hint;
+        s.type = Setting::Type::Float; s.ptr = p;
+        s.lo = lo; s.hi = hi; s.fmt = fmt;
+        return Push(s);
+    }
+
+    // A mode is an int with names. It is drawn as a segmented
+    // control and stored as a number, and the number is clamped to
+    // the option count on load so removing a mode in a later build
+    // cannot leave an old config pointing at nothing.
+    SettingRef BindMode(const char* name, int* p,
+                        const char* const* options, int count,
+                        const char* hint = nullptr)
+    {
+        Setting s;
+        s.name = name; s.hint = hint;
+        s.type = Setting::Type::Mode; s.ptr = p;
+        s.options = options; s.optionCount = count;
+        s.lo = 0.0f; s.hi = (float)(count - 1); s.fmt = "%.0f";
+        return Push(s);
     }
 
 public:
@@ -100,21 +242,35 @@ public:
     // JNI is safe to use here, but the player and world may be null.
     virtual void OnReset(JNIEnv*) {}
 
-    // ---- Panel ----
-    // RenderSettings is the everyday panel: the mode, and the two or
-    // three values worth touching. Keep it short enough to read at a
-    // glance.
+    // -------------------------------------------------------------
+    // Panel
+    // -------------------------------------------------------------
+    // Modules no longer draw their own settings. The renderer walks
+    // the bound settings and produces the same rows, in the same
+    // order, with the same behaviour, for every module in the
+    // client. That is the only way "every slider works the same"
+    // stays true six modules from now.
     //
-    // RenderAdvanced is everything else. A module with thirty knobs
-    // is not more powerful than one with four, it is just harder to
-    // set up, and most people never open it.
-    virtual void RenderSettings() {}
-    virtual void RenderAdvanced() {}
-    virtual bool HasAdvanced() const { return false; }
+    // Notice is the one exception, and it is not a control: it is a
+    // line of text the module wants to say about the situation right
+    // now, such as a keybind it could not resolve. Returning a
+    // severity lets the renderer style it like every other notice
+    // rather than each module picking its own shade of red.
+    enum class NoticeLevel { None, Info, Warning, Danger };
+
+    virtual NoticeLevel Notice(const char** text) const {
+        (void)text;
+        return NoticeLevel::None;
+    }
 
     // A one-line live state string for the collapsed row, so the
     // panel does not have to be open to see what a module is doing.
     virtual const char* StatusLine() const { return nullptr; }
+
+    bool HasAdvanced() const {
+        for (auto& s : m_settings) if (s.advanced) return true;
+        return false;
+    }
 
     void Toggle(JNIEnv* env) {
         SetEnabled(!m_enabled.load(), env);
@@ -132,16 +288,14 @@ public:
     bool SetValue(const std::string& setting, float value) {
         for (auto& s : m_settings) {
             if (s.name != setting) continue;
-            switch (s.type) {
-                case Setting::Type::Bool:  *(bool*)s.ptr  = (value != 0.f); return true;
-                case Setting::Type::Int:   *(int*)s.ptr   = (int)value;     return true;
-                case Setting::Type::Float: *(float*)s.ptr = value;          return true;
-            }
+            s.Write(value);
+            return true;
         }
         return false;
     }
 
     const std::vector<Setting>& GetSettings() const { return m_settings; }
+    std::vector<Setting>&       GetSettings()       { return m_settings; }
 
     const std::string& GetName() const        { return m_name; }
     const std::string& GetDescription() const { return m_description; }
