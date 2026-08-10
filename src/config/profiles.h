@@ -8,9 +8,8 @@
 // =================================================================
 // Config profiles
 // =================================================================
-// The previous config headers were just constants nothing ever read.
-// This applies real values through Module::SetValue, matching on the
-// names each module registers with Bind() in its constructor.
+// Applies real values through Module::SetValue, matching the names
+// each module registers with Bind() in its constructor.
 //
 // A profile says three things:
 //   enable    modules to turn on
@@ -18,6 +17,10 @@
 //   values    setting overrides, module + setting + value
 //
 // Anything not mentioned is left exactly as the user had it.
+//
+// A misspelt name is not silently ignored: Apply counts unmatched
+// entries and the Configs tab shows the total, which is how the
+// stale autoblock names got caught.
 // =================================================================
 
 struct ProfileValue {
@@ -84,16 +87,21 @@ public:
                 { "Sprint Reset", "Reset Ticks Max",  2 },
                 { "Sprint Reset", "Hit Delay",        0 },
 
-                // Auto Blockhit: high coverage is fine, cadence is not
-                { "Auto Blockhit", "Mode",                4 },
-                { "Auto Blockhit", "Coverage",           94 },
-                { "Auto Blockhit", "Swing Gap",           1 },
-                { "Auto Blockhit", "Micro Release",       1 },
-                { "Auto Blockhit", "Micro Chance",        7 },
-                { "Auto Blockhit", "Timing Noise",       34 },
-                { "Auto Blockhit", "Only Sword",          1 },
-                { "Auto Blockhit", "Predictive",          1 },
-                { "Auto Blockhit", "Predict Range",     3.6f },
+                // Auto Blockhit: predict their swing and block around
+                // it. Coverage is a consequence of how often they
+                // attack, not a number we set.
+                { "Auto Blockhit", "Mode",             0 },   // Predict
+                { "Auto Blockhit", "Block Range",    3.6f },
+                { "Auto Blockhit", "Detect Range",   6.0f },
+                { "Auto Blockhit", "Lead",           120 },
+                { "Auto Blockhit", "Reaction Min",    40 },
+                { "Auto Blockhit", "Reaction Max",   100 },
+                { "Auto Blockhit", "Swing Gap",        1 },
+                { "Auto Blockhit", "After Hit",        2 },
+                { "Auto Blockhit", "Max Block Ticks", 30 },
+                { "Auto Blockhit", "Chance",          92 },
+                { "Auto Blockhit", "Timing Noise",    30 },
+                { "Auto Blockhit", "Only Sword",       1 },
 
                 // Click Assist: 20 CPS is fine, but only as butterfly
                 { "Click Assist", "Pattern",          1 },
@@ -141,9 +149,14 @@ public:
                 { "Sprint Reset", "Reset Ticks Min", 1 },
                 { "Sprint Reset", "Reset Ticks Max", 2 },
 
-                { "Auto Blockhit", "Mode",         4 },
-                { "Auto Blockhit", "Coverage",    92 },
-                { "Auto Blockhit", "Timing Noise", 30 },
+                // Slightly earlier block than on AGC: Polar cares
+                // less about the block cadence itself.
+                { "Auto Blockhit", "Mode",            0 },
+                { "Auto Blockhit", "Block Range",   3.7f },
+                { "Auto Blockhit", "Lead",          150 },
+                { "Auto Blockhit", "Chance",         96 },
+                { "Auto Blockhit", "Timing Noise",   26 },
+                { "Auto Blockhit", "Only Sword",      1 },
 
                 // Aim assist is usable on Polar, but stay slow
                 { "Aim Assist", "Yaw Speed",          2.2f },
@@ -181,10 +194,14 @@ public:
                 { "Sprint Reset", "Method",  0 },
                 { "Sprint Reset", "Chance", 70 },
 
-                { "Auto Blockhit", "Mode",             1 },  // Timed
-                { "Auto Blockhit", "Chance",          65 },
-                { "Auto Blockhit", "Hit Interval Min", 2 },
-                { "Auto Blockhit", "Hit Interval Max", 4 },
+                // Reactive only: blocks while they are visibly
+                // mid-swing and never guesses. On a recording it
+                // reads as someone with good reactions.
+                { "Auto Blockhit", "Mode",          1 },
+                { "Auto Blockhit", "Block Range", 3.4f },
+                { "Auto Blockhit", "Chance",       75 },
+                { "Auto Blockhit", "After Hit",     3 },
+                { "Auto Blockhit", "Only Sword",    1 },
             }
         };
     }
@@ -197,14 +214,21 @@ public:
         return {
             "Blatant",
             "No-anticheat servers only. Detected everywhere else.",
-            { "Kill Aura", "Velocity", "Speed", "Sprint", "ESP",
-              "Fullbright", "No Jump Delay", "Click Assist" },
+            { "Kill Aura", "Velocity", "Auto Blockhit", "Speed", "Sprint",
+              "ESP", "Fullbright", "No Jump Delay", "Click Assist" },
             { "Backtrack" },
             {
                 { "Velocity", "Mode",       1 },   // Cancel
                 { "Kill Aura", "Range",   4.2f },
                 { "Kill Aura", "Min CPS",  14 },
                 { "Kill Aura", "Max CPS",  18 },
+
+                // Nothing to hide from, so just hold it whenever
+                // anyone is close enough to swing at you.
+                { "Auto Blockhit", "Mode",         2 },   // In Range
+                { "Auto Blockhit", "Block Range",  4.0f },
+                { "Auto Blockhit", "Chance",     100 },
+
                 { "Click Assist", "Pattern", 2 },
                 { "Click Assist", "Max CPS", 22 },
                 { "ESP", "Show Snaplines",   1 },
@@ -243,8 +267,12 @@ public:
         }
 
         char buf[160];
-        snprintf(buf, sizeof(buf), "%s applied: %d values, %d unmatched",
-                 p.name, applied, missing);
+        if (missing > 0) {
+            snprintf(buf, sizeof(buf), "%s: %d applied, %d UNMATCHED (see console)",
+                     p.name, applied, missing);
+        } else {
+            snprintf(buf, sizeof(buf), "%s applied, %d values", p.name, applied);
+        }
         s_lastReport = buf;
         printf("[Profile] %s\n", buf);
     }
