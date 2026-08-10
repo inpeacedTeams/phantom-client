@@ -21,6 +21,13 @@
 // A misspelt name is not silently ignored: Apply counts unmatched
 // entries and the Configs tab shows the total, which is how the
 // stale autoblock names got caught.
+//
+// NOTE ON SPEED
+// Speed used to be disabled everywhere except Blatant, because it
+// only rewrote motion. Its default mode is now Sprint Jump, which
+// presses the jump key and nothing else, so it is safe on every
+// profile. Any profile that wants the motion modes has to ask for
+// them by setting Mode explicitly.
 // =================================================================
 
 struct ProfileValue {
@@ -63,9 +70,9 @@ public:
             "Duel server, prediction AC. Keyboard-level only.",
             // enable
             { "Velocity", "Sprint Reset", "Auto Blockhit", "Hit Select",
-              "Click Assist", "Sprint", "ESP", "Fullbright" },
+              "Click Assist", "Sprint", "Speed", "ESP", "Fullbright" },
             // disable: movement prediction catches every one of these
-            { "Speed", "Fly", "Kill Aura", "No Jump Delay", "Backtrack",
+            { "Fly", "Kill Aura", "No Jump Delay", "Backtrack",
               "Aim Assist" },
             {
                 // Velocity: legit only
@@ -119,6 +126,18 @@ public:
 
                 { "Hit Select", "Chance",            75 },
                 { "Sprint",     "Omni Sprint",        0 },
+
+                // Sprint jump only, and it stands down during an
+                // exchange so More KB keeps the ground it needs.
+                { "Speed", "Mode",             0 },
+                { "Speed", "Require Sprint",   1 },
+                { "Speed", "Forward Only",     1 },
+                { "Speed", "Pause In Combat",  1 },
+                { "Speed", "Combat Pause",     8 },
+                { "Speed", "Skip Chance",      9 },
+                { "Speed", "Ground Ticks Min", 1 },
+                { "Speed", "Ground Ticks Max", 3 },
+
                 { "ESP",        "Max Range",         48 },
                 { "ESP",        "Show Name",          0 },
             }
@@ -137,8 +156,9 @@ public:
             "Polar",
             "MineBlaze, Pika, GommeHD. Legit combat plus bridging.",
             { "Velocity", "Sprint Reset", "Auto Blockhit", "Aim Assist",
-              "Click Assist", "Bridge Assist", "Sprint", "ESP", "Fullbright" },
-            { "Speed", "Fly", "Kill Aura", "Backtrack" },
+              "Click Assist", "Bridge Assist", "Sprint", "Speed",
+              "ESP", "Fullbright" },
+            { "Fly", "Kill Aura", "Backtrack" },
             {
                 { "Velocity", "Mode",             5 },
                 { "Velocity", "Jump Chance",     75 },
@@ -174,6 +194,14 @@ public:
 
                 { "Bridge Assist", "Mode",          0 },
                 { "Bridge Assist", "Edge Distance", 0.26f },
+
+                // Hopping across a bedwars map is most of the value
+                { "Speed", "Mode",             0 },
+                { "Speed", "Require Sprint",   1 },
+                { "Speed", "Forward Only",     1 },
+                { "Speed", "Pause In Combat",  1 },
+                { "Speed", "Combat Pause",     6 },
+                { "Speed", "Skip Chance",      7 },
             }
         };
     }
@@ -187,8 +215,8 @@ public:
         return {
             "Legit",
             "Minimum values. Safe under spectator and on video.",
-            { "Sprint Reset", "Auto Blockhit", "Sprint", "Fullbright" },
-            { "Velocity", "Aim Assist", "Kill Aura", "Speed", "Fly",
+            { "Sprint Reset", "Auto Blockhit", "Sprint", "Speed", "Fullbright" },
+            { "Velocity", "Aim Assist", "Kill Aura", "Fly",
               "Backtrack", "Click Assist", "ESP", "No Jump Delay" },
             {
                 { "Sprint Reset", "Method",  0 },
@@ -202,6 +230,17 @@ public:
                 { "Auto Blockhit", "Chance",       75 },
                 { "Auto Blockhit", "After Hit",     3 },
                 { "Auto Blockhit", "Only Sword",    1 },
+
+                // Loose hop rhythm. Someone watching the recording
+                // should see a player bunny hopping, not a metronome.
+                { "Speed", "Mode",             0 },
+                { "Speed", "Require Sprint",   1 },
+                { "Speed", "Forward Only",     1 },
+                { "Speed", "Pause In Combat",  1 },
+                { "Speed", "Combat Pause",    10 },
+                { "Speed", "Skip Chance",     16 },
+                { "Speed", "Ground Ticks Min", 1 },
+                { "Speed", "Ground Ticks Max", 4 },
             }
         };
     }
@@ -229,6 +268,11 @@ public:
                 { "Auto Blockhit", "Block Range",  4.0f },
                 { "Auto Blockhit", "Chance",     100 },
 
+                // The only profile that asks for raw motion
+                { "Speed", "Mode",         1 },   // Strafe
+                { "Speed", "Multiplier", 1.6f },
+                { "Speed", "Ground Only",  0 },
+
                 { "Click Assist", "Pattern", 2 },
                 { "Click Assist", "Max CPS", 22 },
                 { "ESP", "Show Snaplines",   1 },
@@ -251,11 +295,10 @@ public:
             Module* m = Find(name);
             if (m) m->SetEnabled(false, env);
         }
-        for (const char* name : p.enable) {
-            Module* m = Find(name);
-            if (m) m->SetEnabled(true, env);
-        }
 
+        // Values are written BEFORE the enables, so a module that
+        // reads its settings in OnEnable sees the profile's values
+        // rather than whatever was left over from the last one.
         for (const auto& v : p.values) {
             Module* m = Find(v.module);
             if (m && m->SetValue(v.setting, v.value)) {
@@ -264,6 +307,11 @@ public:
                 missing++;
                 printf("[Profile] unknown setting: %s / %s\n", v.module, v.setting);
             }
+        }
+
+        for (const char* name : p.enable) {
+            Module* m = Find(name);
+            if (m) m->SetEnabled(true, env);
         }
 
         char buf[160];
