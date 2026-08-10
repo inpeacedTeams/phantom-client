@@ -13,27 +13,16 @@
 #include "../mc/combat_state.h"
 #include "../mc/rotation.h"
 #include "../mc/mouse_control.h"
-#include "../input/click_scheduler.h"
 #include "../input/key_capture.h"
 #include "../input/focus.h"
 #include "../render/camera.h"
 #include "../gui/notifications.h"
 
 // Combat
-#include "combat/aim_assist.h"
-#include "combat/kill_aura.h"
 #include "combat/velocity.h"
 #include "combat/sprint_reset.h"
-#include "combat/autoblockhit.h"
-#include "combat/hitselect.h"
-#include "combat/backtrack.h"
-#include "combat/autoclicker.h"
 
 // Movement
-#include "movement/speed.h"
-#include "movement/sprint.h"
-#include "movement/fly.h"
-#include "movement/bridge_assist.h"
 #include "movement/no_jump_delay.h"
 
 // Visual
@@ -55,10 +44,6 @@
 // call into Minecraft, so the window thread only sets a flag and
 // this tick acts on it.
 //
-// The click timer runs on a third thread. It never touches JNI or
-// module state either: it watches the mouse button and increments a
-// counter, which this tick drains and hands to the game.
-//
 // Every tick runs inside a JNI local frame. Without it the local
 // reference table fills up within seconds and the JVM aborts.
 //
@@ -66,18 +51,14 @@
 //
 //   1. Push the local frame, invalidate the entity cache.
 //   2. Lifecycle: has the world changed under us, did we just die?
-//   3. Backtrack restores real positions. Everything downstream,
-//      including the ESP, must see the world as the server has it.
-//   4. Camera snapshot, taken before any module rotates the player.
-//   5. CombatState, so every module reads the same facts about this
+//   3. Camera snapshot, taken before any module rotates the player.
+//   4. CombatState, so every module reads the same facts about this
 //      tick rather than each deriving its own from the mouse.
-//   6. Mouse grab follows the menu.
-//   7. UI actions, keybinds, then the modules themselves. While the
+//   5. Mouse grab follows the menu.
+//   6. UI actions, keybinds, then the modules themselves. While the
 //      menu is open the gameplay modules are held down, because the
 //      cursor is the UI's and their input would be aimed at it.
-//   8. Queued clicks are handed to the game LAST, so a click fired
-//      by a module this tick goes out on this tick.
-//   9. Key reconciliation, after everything has had its say.
+//   7. Key reconciliation, after everything has had its say.
 //
 // KEY SAFETY
 // Modules hold real keybinds down, and KeyBinding.pressed is edge
@@ -97,22 +78,15 @@
 // dies and respawns, the connection drops and comes back. In every
 // one of those cases the module is still enabled and still running,
 // but everything it remembers is about a situation that no longer
-// exists: a target that despawned, a timer counting toward a fight
-// that ended, recorded positions from another world.
+// exists.
 //
-// Rather than have fifteen modules each try to notice, the manager
-// watches for it once and calls OnReset on all of them.
+// Rather than have each module try to notice, the manager watches
+// for it once and calls OnReset on all of them.
 //
 // FAULT ISOLATION
-// A module that throws used to have its stack trace printed to a
-// console behind the game, and then be called again next tick, and
-// the tick after that, forever. Twenty times a second of exception
-// handling is a visible frame cost and the user is told nothing.
-//
-// Faults are now counted per module. A few in a row means the
-// module is broken rather than unlucky, so it is switched off and
-// the user gets a notification saying which one and why. The rest
-// of the client keeps running.
+// A module that throws is counted; a few faults in a row means it is
+// broken rather than unlucky, so it is switched off and the user is
+// told which one and why. The rest of the client keeps running.
 // =================================================================
 
 class ModuleManager {
@@ -130,8 +104,6 @@ private:
 
     inline static HWND s_gameWindow = nullptr;
     inline static std::shared_ptr<ESP> s_esp;
-    inline static std::shared_ptr<Backtrack> s_backtrack;
-    inline static std::shared_ptr<AutoClicker> s_autoClicker;
     inline static bool s_wasInGame = false;
 
     // ---- Lifecycle tracking ----
@@ -154,22 +126,17 @@ private:
 
     // Latches the menu-open edge on the client thread. While the
     // menu is up the cursor belongs to the UI, so gameplay modules
-    // stand down: one that kept moving the camera or firing clicks
-    // would be acting on input the player is aiming at a switch. The
-    // edge is where held keys and any queued clicks are let go, once.
+    // stand down: one that kept moving the camera would be acting on
+    // input the player is aiming at a switch. The edge is where held
+    // keys are let go, once.
     inline static bool s_gameplayHalted = false;
 
     // A packed lobby can hold 60+ players, and the entity scan takes
     // a couple of refs each on top of whatever the modules allocate.
-    // 256 was close enough to the edge to matter.
     static constexpr jint kLocalFrameSize = 768;
 
     // -------------------------------------------------------------
     // Swallow a pending Java exception and say whether there was one.
-    //
-    // ExceptionDescribe is deliberately not called: it writes a
-    // stack trace to a console the user cannot see, and it is slow
-    // enough to matter if something throws every tick.
     // -------------------------------------------------------------
     static bool ClearJavaException(JNIEnv* env) {
         if (!env->ExceptionCheck()) return false;
@@ -185,9 +152,6 @@ private:
         bool faulted = false;
         const char* reason = "threw an exception";
 
-        // A module reaching a bad JNI object throws C++ side; a
-        // module calling into Minecraft badly throws Java side. Both
-        // have to be caught or the client dies with the game.
         try {
             mod->OnTick(env);
             if (ClearJavaException(env)) {
@@ -203,8 +167,6 @@ private:
         }
 
         if (!faulted) {
-            // A clean tick clears the record. Only CONSECUTIVE
-            // failures mean the module is actually broken.
             auto it = s_faults.find(name);
             if (it != s_faults.end()) s_faults.erase(it);
             return;
@@ -213,8 +175,6 @@ private:
         int count = ++s_faults[name];
         if (count < kFaultLimit) return;
 
-        // Persistently broken. Turn it off, release whatever it was
-        // holding, and tell the user which one and why.
         s_faults.erase(name);
         try {
             mod->SetEnabled(false, env);
@@ -234,13 +194,10 @@ private:
     // Hand every module a clean slate. Enabled modules stay enabled.
     // -------------------------------------------------------------
     static void BroadcastReset(JNIEnv* env) {
-        // Shared state first, so a module's OnReset reads a world
-        // that has already been cleared rather than a half-old one.
         CombatState::Reset();
         Rotation::ResetVelocity();
         Camera::Invalidate();
         EntityList::BeginTick();
-        ClickScheduler::ClearPending();
         s_faults.clear();
 
         for (auto& mod : s_modules) {
@@ -250,10 +207,7 @@ private:
             ClearJavaException(env);
         }
 
-        // Whatever was being held was being held for a situation
-        // that no longer exists.
         KeyBinds::ReleaseAll(env);
-        KeyBinds::ClearClickQueue(env);
         ClearJavaException(env);
     }
 
@@ -267,9 +221,6 @@ private:
         bool changed = false;
 
         if (!world) {
-            // Between worlds. Drop the ref now so coming back into a
-            // world always counts as a change, even in the unlikely
-            // case the JVM hands us the same address again.
             if (s_lastWorld) {
                 env->DeleteGlobalRef(s_lastWorld);
                 s_lastWorld = nullptr;
@@ -284,9 +235,6 @@ private:
             ClearJavaException(env);
         }
 
-        // Death and respawn both matter. Dying mid-combo leaves
-        // every combat module mid-combo; respawning puts you
-        // somewhere else entirely.
         jobject player = Minecraft::GetPlayer(env);
         ClearJavaException(env);
 
@@ -299,90 +247,35 @@ private:
         if (changed) BroadcastReset(env);
     }
 
-    // -------------------------------------------------------------
-    // Hand the game whatever the click timer produced.
-    //
-    // This is the only place clicks reach Minecraft. Writing to
-    // KeyBinding.pressTime makes runTick call clickMouse() exactly
-    // that many times, which is the same path a physical click
-    // takes, so the swing and the attack packet are identical.
-    // -------------------------------------------------------------
-    static void DispatchClicks(JNIEnv* env) {
-        if (!KeyBinds::HasClickQueue()) return;
-
-        int left  = ClickScheduler::DrainLeft();
-        int right = ClickScheduler::DrainRight();
-        if (left <= 0 && right <= 0) return;
-
-        // A screen is open: runTick stops consuming pressTime, so
-        // anything written now would sit there and then fire all at
-        // once when the menu closes.
-        if (Minecraft::IsInGui(env)) return;
-
-        if (left  > 0) KeyBinds::QueueAttack(env, left);
-        if (right > 0) KeyBinds::QueueUse(env, right);
-    }
-
 public:
     static void Init() {
-        // Combat, core first so they sit at the top of the tab
+        // Combat
         s_modules.push_back(std::make_shared<Velocity>());
         s_modules.push_back(std::make_shared<SprintReset>());
-        s_modules.push_back(std::make_shared<AutoBlockhit>());
-        s_modules.push_back(std::make_shared<AimAssist>());
-        s_modules.push_back(std::make_shared<HitSelect>());
-
-        s_backtrack = std::make_shared<Backtrack>();
-        s_modules.push_back(s_backtrack);
-
-        s_autoClicker = std::make_shared<AutoClicker>();
-        s_modules.push_back(s_autoClicker);
-
-        s_modules.push_back(std::make_shared<KillAura>());
 
         // Movement
-        s_modules.push_back(std::make_shared<BridgeAssist>());
-        s_modules.push_back(std::make_shared<Sprint>());
         s_modules.push_back(std::make_shared<NoJumpDelay>());
-        s_modules.push_back(std::make_shared<Speed>());
-        s_modules.push_back(std::make_shared<Fly>());
 
         // Visual
         s_esp = std::make_shared<ESP>();
         s_modules.push_back(s_esp);
         s_modules.push_back(std::make_shared<Fullbright>());
-
-        // The click timer runs on its own 1ms thread and watches the
-        // mouse itself; the 20 TPS loop can express neither a 27ms
-        // gap nor a prompt release.
-        ClickScheduler::Start();
     }
 
     static void SetGameWindow(HWND hwnd) {
         s_gameWindow = hwnd;
-        ClickScheduler::SetWindow(hwnd);
-        // Publish to the shared Focus helper too, so modules can ask
-        // "does the game have focus" without each keeping their own
-        // handle or skipping the check.
+        // The shared Focus helper answers "does the game have focus"
+        // for the modules that read the mouse directly.
         Focus::SetWindow(hwnd);
     }
 
     // Called from the window thread when INSERT is pressed. Does no
-    // JNI work itself: releasing the grab is a JNI call and belongs
-    // on the client thread, which reads s_menuOpen next tick.
-    //
-    // The click engine, though, polls the mouse on its own thread
-    // and cannot wait for a tick to learn the menu opened, so its
-    // flag is pushed straight through here. That is safe off-thread:
-    // it only touches an atomic.
-    static void SetMenuOpen(bool open) {
-        s_menuOpen.store(open);
-        ClickScheduler::SetMenuOpen(open);
-    }
+    // work itself: releasing the grab is a JNI call and belongs on
+    // the client thread, which reads s_menuOpen next tick.
+    static void SetMenuOpen(bool open) { s_menuOpen.store(open); }
     static bool IsMenuOpen()           { return s_menuOpen.load(); }
 
     static std::shared_ptr<ESP> GetESP() { return s_esp; }
-    static std::shared_ptr<Backtrack> GetBacktrack() { return s_backtrack; }
 
     template <typename T>
     static std::shared_ptr<T> Get() {
@@ -418,8 +311,6 @@ public:
         if (!s_wasInGame) return;
         s_wasInGame = false;
 
-        ClickScheduler::SetArmed(false);
-        ClickScheduler::ClearPending();
         Camera::Invalidate();       // overlays stop drawing stale geometry
         CombatState::Reset();       // swing history from the last server is meaningless
         Rotation::ResetVelocity();  // or the arm keeps drifting in the next game
@@ -429,9 +320,6 @@ public:
         s_gameplayHalted = false;   // re-entry re-evaluates the menu edge cleanly
 
         if (env) {
-            // Modules are still enabled and will run again the
-            // moment the next world loads, so they get the same
-            // clean slate a mid-game world change would give them.
             for (auto& mod : s_modules) {
                 try {
                     mod->OnReset(env);
@@ -445,7 +333,6 @@ public:
             }
 
             KeyBinds::ReleaseAll(env);
-            KeyBinds::ClearClickQueue(env);
             ClearJavaException(env);
         }
     }
@@ -468,23 +355,13 @@ public:
         UpdateLifecycle(env);
         ClearJavaException(env);
 
-        // Undo last tick's rewind before anything reads an entity.
-        // Runs even while the module is off, so a toggle mid-rewind
-        // still leaves the world in the right place.
-        if (s_backtrack) {
-            s_backtrack->RestoreBeforeScan(env);
-            ClearJavaException(env);
-        }
-
-        // Camera before the modules: aim assist rotates the player
-        // later in the tick, and the overlays should match the frame
-        // the game is about to draw.
+        // Camera before the modules: the overlays should match the
+        // frame the game is about to draw.
         Camera::Update(env);
         ClearJavaException(env);
 
         // One read of "what happened this tick", shared by every
-        // module. Before this existed each of them polled the mouse
-        // button and called that an attack.
+        // module.
         CombatState::Update(env);
         ClearJavaException(env);
 
@@ -514,18 +391,10 @@ public:
         }
 
         // ---- Keybinds, only while the game window is focused ----
-        // Suppressed while the menu is open, or typing near a bound
-        // letter toggles things behind the UI. Suppressed again
-        // while a bind is being captured: the whole point of that
-        // moment is that the next key means something else.
         bool focused = (s_gameWindow == nullptr)
                     || (GetForegroundWindow() == s_gameWindow);
         bool hotkeys = focused && !s_menuOpen.load() && !KeyCapture::IsActive();
 
-        // Coming back from a suppressed spell, adopt the current
-        // hardware state without acting on it. Otherwise a key the
-        // player never let go of reads as a brand new press the
-        // instant the menu closes, and a module toggles itself.
         if (hotkeys && !s_hotkeysWere) {
             for (auto& mod : s_modules) {
                 int key = mod->GetKeybind();
@@ -549,23 +418,13 @@ public:
 
         // ---- Run enabled modules ----
         // While the Phantom menu is open the mouse is the UI's, not
-        // the game's. A combat or movement module ticking then acts
-        // on input the player is aiming at a control: it whips the
-        // crosshair around or fires an attack behind the menu. So
-        // gameplay stands down while it is open. Visual modules (ESP,
-        // Fullbright) are pure rendering state and stay live, so
-        // their boxes and brightness do not blink in the menu.
-        //
-        // The open EDGE lets go of everything held for the player,
-        // once. Modules stay enabled and resume the moment it
-        // closes; this is the same clean slate a world change hands
-        // them, not a disable.
+        // the game's, so gameplay stands down. Visual modules (ESP,
+        // Fullbright) are pure rendering state and stay live. The
+        // open EDGE lets go of everything held for the player, once.
         bool menuOpen = s_menuOpen.load();
 
         if (menuOpen && !s_gameplayHalted) {
             KeyBinds::ReleaseAll(env);
-            KeyBinds::ClearClickQueue(env);
-            ClickScheduler::ClearPending();
             ClearJavaException(env);
             s_gameplayHalted = true;
         } else if (!menuOpen) {
@@ -579,27 +438,14 @@ public:
             RunModule(env, mod);
         }
 
-        // ---- Clicks, last, so this tick's requests go out now ----
-        // Skipped while the menu is open: the engine is already muted
-        // on the same edge, but draining into the game here would
-        // still be wrong.
-        if (!menuOpen) {
-            DispatchClicks(env);
-            ClearJavaException(env);
-        }
-
         // ---- Key reconciliation ----
-        // The reason a sprint reset could freeze you: pressed is
-        // edge driven, so a key we cleared while the player was
-        // holding it never came back on its own. Anything we are no
-        // longer driving gets put back in line with the hardware
-        // here, so a missed release costs one tick instead of the
-        // rest of the fight. This still runs while the menu is up, so
-        // a key the player is physically holding stays correct even
-        // with gameplay halted.
-        //
-        // Skipped inside a GUI, where the game clears every key on
-        // purpose and we would be fighting it.
+        // pressed is edge driven, so a key we cleared while the
+        // player was holding it never came back on its own. Anything
+        // we are no longer driving gets put back in line with the
+        // hardware here. Still runs while the menu is up, so a key
+        // the player is physically holding stays correct even with
+        // gameplay halted. Skipped inside a vanilla GUI, where the
+        // game clears every key on purpose and we would fight it.
         if (!Minecraft::IsInGui(env)) {
             KeyBinds::Reconcile(env);
             ClearJavaException(env);
@@ -611,9 +457,6 @@ public:
     }
 
     static void Shutdown(JNIEnv* env) {
-        // Stop the click thread first so nothing is queued while the
-        // modules are being torn down.
-        ClickScheduler::Stop();
         Camera::Invalidate();
         CombatState::Reset();
         Rotation::ResetVelocity();
@@ -625,8 +468,7 @@ public:
             ClearJavaException(env);
 
             // Disable everything so modules release the keybinds they
-            // took over instead of leaving keys stuck down. One that
-            // throws on the way out must not stop the others.
+            // took over instead of leaving keys stuck down.
             for (auto& mod : s_modules) {
                 if (!mod->IsEnabled()) continue;
                 try {
@@ -635,10 +477,7 @@ public:
                 ClearJavaException(env);
             }
 
-            // Backstop: a module that threw during OnDisable would
-            // still have left something held.
             KeyBinds::ReleaseAll(env);
-            KeyBinds::ClearClickQueue(env);
             ClearJavaException(env);
 
             if (s_lastWorld) {
@@ -652,9 +491,7 @@ public:
             s_actions.clear();
         }
         s_faults.clear();
-        s_backtrack.reset();
         s_esp.reset();
-        s_autoClicker.reset();
         s_modules.clear();
     }
 
@@ -663,9 +500,6 @@ public:
 
     // -------------------------------------------------------------
     // Category lists are read once per frame per tab by the menu.
-    // Building a fresh vector for each of those was a few hundred
-    // allocations a second to produce a list that only changes when
-    // the module set does, which is never after startup.
     // -------------------------------------------------------------
     static const std::vector<std::shared_ptr<Module>>&
     GetModulesByCategory(ModuleCategory cat) {
