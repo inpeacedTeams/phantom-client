@@ -40,7 +40,8 @@ private:
     float m_colorEnemy[4] = { 1.0f, 0.30f, 0.30f, 1.0f };
 
     std::vector<EntitySnapshot> m_targets;
-    std::mutex m_mutex;
+    mutable std::mutex m_mutex;
+    mutable char m_status[48] = {};
 
 public:
     ESP() : Module("ESP", "Highlight players through walls", ModuleCategory::VISUAL, 'X')
@@ -209,23 +210,62 @@ public:
         }
     }
 
+    const char* StatusLine() const override {
+        int n;
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            n = (int)m_targets.size();
+        }
+        snprintf(m_status, sizeof(m_status), "%d player%s",
+                 n, n == 1 ? "" : "s");
+        return m_status;
+    }
+
+    // =============================================================
+    // Everyday panel: what to draw. Nothing else.
+    // =============================================================
     void RenderSettings() override {
-        const char* styles[] = { "2D Corners", "2D Full" };
+        const char* styles[] = { "Corners", "Full Box" };
         ImGui::Combo("Box Style", &m_boxStyle, styles, 2);
+
         ImGui::Checkbox("Box", &m_showBox);
-        ImGui::Checkbox("Health Bar", &m_showHealthBar);
+        ImGui::SameLine();
+        ImGui::Checkbox("Health", &m_showHealthBar);
         ImGui::Checkbox("Name", &m_showName);
+        ImGui::SameLine();
         ImGui::Checkbox("Distance", &m_showDistance);
+
+        ImGui::SliderFloat("Range", &m_maxRange, 16.f, 128.f, "%.0f m");
+    }
+
+    bool HasAdvanced() const override { return true; }
+
+    void RenderAdvanced() override {
+        ImGui::ColorEdit4("Colour", m_colorEnemy);
+        ImGui::TextDisabled("Flashes white on the tick a player takes damage.");
+
+        ImGui::Separator();
         ImGui::Checkbox("Snaplines", &m_showSnaplines);
-        ImGui::Checkbox("Interpolate", &m_interpolate);
-        ImGui::SliderFloat("Max Range", &m_maxRange, 16.f, 128.f, "%.0f");
+        if (m_showSnaplines) {
+            ImGui::TextColored(ImVec4(1.f, 0.7f, 0.3f, 1.f),
+                "Very obvious on a recording");
+        }
         ImGui::SliderFloat("Line Thickness", &m_lineThickness, 1.f, 4.f, "%.1f");
-        ImGui::ColorEdit4("Color", m_colorEnemy);
+
+        ImGui::Separator();
+        ImGui::Checkbox("Interpolate", &m_interpolate);
+        ImGui::TextDisabled("Smooths boxes between the 20 ticks a second the "
+                            "game updates positions. Turn off to see raw "
+                            "server positions.");
 
         ImGui::Separator();
         {
             std::lock_guard<std::mutex> lock(m_mutex);
             ImGui::TextDisabled("Tracking %d players", (int)m_targets.size());
+        }
+        if (!Camera::Get().valid) {
+            ImGui::TextColored(ImVec4(1.f, 0.7f, 0.3f, 1.f),
+                "Camera not resolved yet: join a world");
         }
     }
 };
