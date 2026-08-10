@@ -4,10 +4,10 @@
 #include "../../mc/keybinds.h"
 #include "../../mc/entity_list.h"
 #include "../../mc/combat_state.h"
+#include "../../mc/movement.h"
 #include "../../jni/class_resolver.h"
 #include "../../jni/jvmti_util.h"
 #include "../../util/log.h"
-#include <imgui.h>
 #include <unordered_map>
 #include <deque>
 #include <string>
@@ -102,8 +102,12 @@ private:
         unsigned long long lastSeen = 0;
     };
 
+    enum Mode { PREDICT = 0, REACTIVE, IN_RANGE };
+
+    static constexpr const char* kModes[] = { "Predict", "Reactive", "In Range" };
+
     // ---- Core ----
-    int   m_mode       = 0;    // 0 Predict, 1 Reactive, 2 In Range
+    int   m_mode       = PREDICT;
     float m_blockRange = 3.6f;
     float m_chance     = 95.0f;
 
@@ -161,7 +165,8 @@ private:
     int  m_ticksTotal   = 0;
     int  m_speedSaves   = 0;
     const char* m_why   = "idle";
-    char m_status[48]   = { 0 };
+    char m_status[56]   = { 0 };
+    mutable char m_notice[200] = { 0 };
 
     // ---- Tuning ----
     static constexpr int kItemRecheckTicks = 5;   // 4x a second is plenty
@@ -170,6 +175,10 @@ private:
     static constexpr long long kMinSwingGapMs = 60;
     static constexpr long long kMaxSwingGapMs = 1200;
     static constexpr size_t kIntervalWindow = 8;
+
+    // Past this share of the fight the module is costing you more
+    // in movement than it saves in damage.
+    static constexpr float kCoverageWarn = 55.0f;
 
     // ---- JNI ----
     jfieldID  m_fInventory  = nullptr;
@@ -199,6 +208,10 @@ private:
         std::uniform_real_distribution<float> d(-r, r);
         long long v = base + (long long)d(m_rng);
         return v < 0 ? 0 : v;
+    }
+
+    float Coverage() const {
+        return m_ticksTotal > 0 ? (100.0f * m_ticksBlocked / m_ticksTotal) : 0.0f;
     }
 
     // -------------------------------------------------------------
@@ -313,10 +326,9 @@ private:
         if (!m_fYaw) return true;              // cannot tell, assume yes
 
         float yaw = env->GetFloatField(ent, m_fYaw);
-        const double DEG = 3.14159265358979 / 180.0;
 
-        double lx = -std::sin(yaw * DEG);
-        double lz =  std::cos(yaw * DEG);
+        double lx = -std::sin(yaw * Movement::kDegToRad);
+        double lz =  std::cos(yaw * Movement::kDegToRad);
 
         double dx = px - ex, dz = pz - ez;
         double len = std::sqrt(dx*dx + dz*dz);
@@ -327,7 +339,7 @@ private:
         if (dot > 1.0) dot = 1.0;
         if (dot < -1.0) dot = -1.0;
 
-        double angle = std::acos(dot) / DEG;
+        double angle = std::acos(dot) / Movement::kDegToRad;
         return angle <= (m_facingFov * 0.5);
     }
 
@@ -357,31 +369,108 @@ public:
         : Module("Auto Blockhit", "Blocks around the enemy's swing, not always",
                  ModuleCategory::COMBAT, 0)
     {
-        Bind("Mode", &m_mode);
-        Bind("Block Range", &m_blockRange);
-        Bind("Chance", &m_chance);
-        Bind("Detect Range", &m_detectRange);
-        Bind("Require Facing", &m_requireFacing);
-        Bind("Facing FOV", &m_facingFov);
-        Bind("Require Aggro", &m_requireAggro);
-        Bind("Aggro Window", &m_aggroMs);
-        Bind("Lead", &m_leadMs);
-        Bind("Tail", &m_tailMs);
-        Bind("Default Cycle", &m_defaultCycle);
-        Bind("Reaction Min", &m_reactionMin);
-        Bind("Reaction Max", &m_reactionMax);
-        Bind("Swing Gap", &m_swingGap);
-        Bind("After Hit", &m_afterHit);
-        Bind("Max Block Ticks", &m_maxBlockTicks);
-        Bind("Protect Movement", &m_protectMovement);
-        Bind("Max Moving Ticks", &m_maxMovingTicks);
-        Bind("Moving Cooldown", &m_movingCooldown);
-        Bind("Never While Sprinting", &m_neverWhileSprint);
-        Bind("Vary Timing", &m_varyTiming);
-        Bind("Timing Noise", &m_timingNoise);
-        Bind("Only Sword", &m_onlySword);
-        Bind("Pause On Flag", &m_pauseOnFlag);
-        Bind("Flag Pause Ticks", &m_flagPauseTicks);
+        BindMode("Mode", &m_mode, kModes, 3,
+                 "Predict learns their rhythm and blocks just before the "
+                 "swing. Reactive waits until an arm is actually moving. "
+                 "In Range blocks whenever a facing enemy is close.");
+
+        Bind("Reach", &m_blockRange, 2.0f, 6.0f, "%.1f",
+             "How close someone has to be to be worth blocking");
+
+        Bind("Chance", &m_chance, 50.0f, 100.0f, "%.0f%%",
+             "How many opportunities are taken");
+
+        // ---- Movement ----
+        Bind("Protect Movement", &m_protectMovement,
+             "Blocking cuts your speed to a fifth. This caps how long it "
+             "can hold you while you are trying to walk.")
+            .Advanced();
+
+        Bind("Max Ticks Walking", &m_maxMovingTicks, 2, 20,
+             "Longest the block may hold while you are moving")
+            .When("Protect Movement", 1).Advanced();
+
+        Bind("Cooldown After", &m_movingCooldown, 1, 12,
+             "Forced open ticks once the budget runs out")
+            .When("Protect Movement", 1).Advanced();
+
+        Bind("Never While Sprinting", &m_neverWhileSprint,
+             "Keeps your sprint under any circumstances")
+            .Advanced();
+
+        // ---- Threat gate ----
+        Bind("Detect Range", &m_detectRange, 3.0f, 12.0f, "%.1f",
+             "How far out enemies are watched and their rhythm learned")
+            .Advanced();
+
+        Bind("Require Facing", &m_requireFacing,
+             "Someone looking away cannot land a hit")
+            .Advanced();
+
+        Bind("Facing FOV", &m_facingFov, 30.0f, 200.0f, "%.0f",
+             "How far off centre still counts as looking at you")
+            .When("Require Facing", 1).Advanced();
+
+        Bind("Require Aggression", &m_requireAggro,
+             "Only treat someone as a threat once they have swung")
+            .Advanced();
+
+        Bind("Aggro Window", &m_aggroMs, 400, 4000,
+             "Milliseconds a swing keeps counting for")
+            .When("Require Aggression", 1).Advanced();
+
+        // ---- Window ----
+        Bind("Lead", &m_leadMs, 40, 320,
+             "Milliseconds before the predicted swing that the block drops")
+            .When("Mode", PREDICT).Advanced();
+
+        Bind("Tail", &m_tailMs, 0, 300,
+             "How long it stays down afterwards")
+            .When("Mode", PREDICT).Advanced();
+
+        Bind("Assumed Cycle", &m_defaultCycle, 100, 400,
+             "Swing interval assumed before one has been measured")
+            .When("Mode", PREDICT).Advanced();
+
+        Bind("Reaction Min", &m_reactionMin, 0, 150,
+             "A human does not react instantly, and neither should this")
+            .When("Mode", PREDICT).Advanced();
+
+        Bind("Reaction Max", &m_reactionMax, 0, 250)
+            .When("Mode", PREDICT).Advanced();
+
+        // ---- Release ----
+        Bind("Swing Gap", &m_swingGap, 1, 4,
+             "Ticks the block stays open after your own swing")
+            .Advanced();
+
+        Bind("After Hit", &m_afterHit, 0, 6,
+             "Ticks it stays open once their hit has landed")
+            .Advanced();
+
+        Bind("Max Hold", &m_maxBlockTicks, 4, 40,
+             "Nothing legitimate holds a block longer than this")
+            .Advanced();
+
+        // ---- Safety ----
+        Bind("Vary Timing", &m_varyTiming,
+             "Jitters the window so the same interval never repeats")
+            .Advanced();
+
+        Bind("Timing Noise", &m_timingNoise, 0.0f, 60.0f, "%.0f%%",
+             "How much the window wanders")
+            .When("Vary Timing", 1).Advanced();
+
+        Bind("Only Sword", &m_onlySword,
+             "Right-clicking anything else places a block or draws a bow")
+            .Advanced();
+
+        Bind("Pause On Flag", &m_pauseOnFlag,
+             "Stand down for a moment after the server corrects you")
+            .Advanced();
+
+        Bind("Flag Pause Ticks", &m_flagPauseTicks, 5, 60)
+            .When("Pause On Flag", 1).Advanced();
     }
 
     void OnTick(JNIEnv* env) override {
@@ -392,6 +481,8 @@ public:
         if (!player) { StandDown(env, "no player"); return; }
 
         m_tick++;
+
+        if (m_reactionMin > m_reactionMax) m_reactionMin = m_reactionMax;
 
         if (Minecraft::IsInGui(env)) { StandDown(env, "menu"); return; }
 
@@ -431,10 +522,6 @@ public:
         // =========================================================
         // Movement budget
         // =========================================================
-        // Blocking multiplies movement by 0.2. Held through an
-        // exchange that reads as being stuck in mud, so the block
-        // gets a leash whenever the player is actually trying to go
-        // somewhere.
         bool walking = KeyBinds::PhysMoving(env);
 
         if (m_protectMovement && walking && m_blocking) {
@@ -570,17 +657,17 @@ public:
         const char* why = "open";
 
         switch (m_mode) {
-            case 1:   // Reactive: only while an arm is actually moving
+            case REACTIVE:
                 want = swingingNow;
                 why = want ? "mid-swing" : "waiting";
                 break;
 
-            case 2:   // In Range: any qualified threat is enough
+            case IN_RANGE:
                 want = true;
                 why = "in range";
                 break;
 
-            default: { // Predict
+            default: {
                 if (swingingNow) {
                     want = true;
                     why = "mid-swing";
@@ -673,115 +760,39 @@ public:
         return m_status[0] ? m_status : nullptr;
     }
 
-    bool HasAdvanced() const override { return true; }
-
-    // -------------------------------------------------------------
-    // Core panel
-    // -------------------------------------------------------------
-    void RenderSettings() override {
-        // Fail-closed states first: without these the module simply
-        // does nothing and the reason is not obvious.
+    NoticeLevel Notice(const char** text) const override {
         if (m_onlySword && !m_itemUsable) {
-            ImGui::TextColored(ImVec4(1.f, 0.35f, 0.3f, 1.f),
-                "Held item unreadable: module disabled");
-            ImGui::TextDisabled("Blocking blind would place blocks or draw a bow.");
+            *text = "The held item cannot be read in this build of the game. "
+                    "Blocking blind would place blocks or draw a bow, so the "
+                    "module stays off.";
+            return NoticeLevel::Danger;
         }
         if (!KeyBinds::HasUseItem()) {
-            ImGui::TextColored(ImVec4(1.f, 0.8f, 0.3f, 1.f),
-                "Use-item keybind unresolved: module inactive");
+            *text = "The use-item keybind could not be found, so the block "
+                    "cannot be pressed.";
+            return NoticeLevel::Danger;
+        }
+        if (m_mode == PREDICT && !m_fSwinging && !m_fSwingProg) {
+            *text = "Enemy swings cannot be seen in this build, so prediction "
+                    "is blind. Use In Range instead.";
+            return NoticeLevel::Warning;
         }
 
-        const char* modes[] = { "Predict", "Reactive", "In Range" };
-        ImGui::Combo("Mode", &m_mode, modes, 3);
-        switch (m_mode) {
-            case 0: ImGui::TextDisabled("Learns their rhythm and blocks just before the swing."); break;
-            case 1: ImGui::TextDisabled("Blocks only while an arm is actually moving."); break;
-            case 2: ImGui::TextDisabled("Blocks whenever a facing enemy is in reach."); break;
+        float cov = Coverage();
+        if (cov > kCoverageWarn) {
+            snprintf(m_notice, sizeof(m_notice),
+                     "Blocking %.0f%% of the time. That is most of the fight "
+                     "spent at a fifth of your walking speed.", cov);
+            *text = m_notice;
+            return NoticeLevel::Warning;
         }
-        if (m_mode == 0 && !m_fSwinging && !m_fSwingProg) {
-            ImGui::TextColored(ImVec4(1.f, 0.5f, 0.35f, 1.f),
-                "Enemy swing field unresolved: prediction is blind, use In Range");
+        if (m_ticksTotal > 40) {
+            snprintf(m_notice, sizeof(m_notice),
+                     "Blocking %.0f%% of the time, holding %s.", cov,
+                     m_heldName.empty() ? "nothing readable" : m_heldName.c_str());
+            *text = m_notice;
+            return NoticeLevel::Info;
         }
-
-        ImGui::SliderFloat("Reach", &m_blockRange, 2.f, 6.f, "%.1f blocks");
-        ImGui::SliderFloat("Chance", &m_chance, 50.f, 100.f, "%.0f%%");
-
-        // How much of the fight this is costing you, which is the
-        // one number that decides whether the module is helping.
-        float cov = m_ticksTotal > 0 ? (100.f * m_ticksBlocked / m_ticksTotal) : 0.f;
-        ImVec4 col = cov > 55.f ? ImVec4(1.f, 0.5f, 0.35f, 1.f)
-                                : ImVec4(0.55f, 0.55f, 0.6f, 1.f);
-        ImGui::TextColored(col, "Blocking %.0f%% of the time", cov);
-        if (cov > 55.f) {
-            ImGui::TextDisabled("Blocking cuts your speed to 20%%. "
-                                "That is most of the fight spent slow.");
-        }
-    }
-
-    // -------------------------------------------------------------
-    // Advanced
-    // -------------------------------------------------------------
-    void RenderAdvanced() override {
-        ImGui::TextColored(m_blocking ? ImVec4(0.2f, 0.8f, 0.4f, 1.f)
-                                      : ImVec4(0.55f, 0.55f, 0.6f, 1.f),
-            "%s  (%s)", m_blocking ? "BLOCKING" : "open", m_why);
-        ImGui::TextDisabled("Nearby %d | threats %d | holding: %s",
-            m_tracked, m_threats,
-            m_heldName.empty() ? "?" : m_heldName.c_str());
-        if (m_predictMs >= 0) {
-            ImGui::TextDisabled("Next swing ~%lld ms (cycle %lld ms)",
-                m_predictMs, m_shownCycle);
-        }
-
-        ImGui::SeparatorText("Movement");
-        ImGui::Checkbox("Protect Movement", &m_protectMovement);
-        if (m_protectMovement) {
-            ImGui::SliderInt("Max Ticks Walking", &m_maxMovingTicks, 2, 20);
-            ImGui::SliderInt("Cooldown After", &m_movingCooldown, 1, 12);
-            if (m_speedSaves > 0)
-                ImGui::TextDisabled("Cut the block short %d time(s)", m_speedSaves);
-        } else {
-            ImGui::TextColored(ImVec4(1.f, 0.5f, 0.35f, 1.f),
-                "Off: the block can pin you at a fifth speed mid-fight");
-        }
-        ImGui::Checkbox("Never While Sprinting", &m_neverWhileSprint);
-
-        ImGui::SeparatorText("Threat gate");
-        ImGui::SliderFloat("Detect Range", &m_detectRange, 3.f, 12.f, "%.1f");
-        ImGui::Checkbox("Require Facing", &m_requireFacing);
-        if (m_requireFacing) {
-            ImGui::SliderFloat("Facing FOV", &m_facingFov, 30.f, 200.f, "%.0f");
-            if (!m_fYaw) {
-                ImGui::TextColored(ImVec4(1.f, 0.7f, 0.3f, 1.f),
-                    "Enemy yaw unresolved: this check always passes");
-            }
-        }
-        ImGui::Checkbox("Require Aggression", &m_requireAggro);
-        if (m_requireAggro)
-            ImGui::SliderInt("Aggro Window (ms)", &m_aggroMs, 400, 4000);
-
-        if (m_mode == 0) {
-            ImGui::SeparatorText("Window");
-            ImGui::SliderInt("Lead (ms)", &m_leadMs, 40, 320);
-            ImGui::SliderInt("Tail (ms)", &m_tailMs, 0, 300);
-            ImGui::SliderInt("Assumed Cycle (ms)", &m_defaultCycle, 100, 400);
-            ImGui::SliderInt("Reaction Min (ms)", &m_reactionMin, 0, 150);
-            ImGui::SliderInt("Reaction Max (ms)", &m_reactionMax, 0, 250);
-            if (m_reactionMin > m_reactionMax) m_reactionMin = m_reactionMax;
-        }
-
-        ImGui::SeparatorText("Release");
-        ImGui::SliderInt("Swing Gap (ticks)", &m_swingGap, 1, 4);
-        ImGui::SliderInt("After Hit (ticks)", &m_afterHit, 0, 6);
-        ImGui::SliderInt("Max Hold (ticks)", &m_maxBlockTicks, 4, 40);
-
-        ImGui::SeparatorText("Safety");
-        ImGui::Checkbox("Vary Timing", &m_varyTiming);
-        if (m_varyTiming)
-            ImGui::SliderFloat("Timing Noise", &m_timingNoise, 0.f, 60.f, "%.0f%%");
-        ImGui::Checkbox("Only Sword", &m_onlySword);
-        ImGui::Checkbox("Pause On Flag", &m_pauseOnFlag);
-        if (m_pauseOnFlag)
-            ImGui::SliderInt("Flag Pause Ticks", &m_flagPauseTicks, 5, 60);
+        return NoticeLevel::None;
     }
 };
