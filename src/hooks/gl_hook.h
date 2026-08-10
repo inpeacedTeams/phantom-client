@@ -10,6 +10,7 @@
 
 #include "../gui/menu.h"
 #include "../gui/splash.h"
+#include "../gui/notifications.h"
 #include "../input/key_capture.h"
 #include "../mc/mouse_control.h"
 #include "../modules/module_manager.h"
@@ -43,6 +44,14 @@ typedef BOOL(WINAPI* fnWglSwapBuffers)(HDC);
 // lives here and runs BEFORE the menu hotkeys. Otherwise binding
 // ESC or INSERT would close the menu instead of binding anything.
 //
+// DRAW ORDER
+//   world overlays   ESP and backtrack, behind everything
+//   HUD              watermark and module list
+//   menu             the sheet, with its own dimmed backdrop
+//   splash           the intro, once
+//   notifications    last, because a warning nobody can see is not
+//                    a warning
+//
 // EJECT IS THE DANGEROUS PART
 // The render thread runs this hook while the client thread tears
 // everything down. A frame still inside Menu::Render() when the
@@ -50,6 +59,11 @@ typedef BOOL(WINAPI* fnWglSwapBuffers)(HDC);
 // there is a shutdown flag plus an in-flight counter: Remove()
 // raises the flag, waits for the counter to reach zero, and only
 // then destroys anything.
+//
+// On top of that the whole frame is wrapped in a catch-all. An
+// exception escaping into Minecraft's render loop takes the game
+// down with it, and a broken overlay is a far better outcome than
+// a crashed game.
 // =================================================================
 
 class GLHook {
@@ -64,6 +78,12 @@ private:
     inline static std::atomic<bool> s_shuttingDown{ false };
     inline static std::atomic<int>  s_inFlight{ 0 };
     inline static std::atomic<bool> s_menuOpen{ false };
+
+    // A frame that threw. If it keeps happening the overlay is
+    // switched off rather than throwing sixty times a second.
+    inline static std::atomic<int>  s_renderFaults{ 0 };
+    inline static std::atomic<bool> s_renderDisabled{ false };
+    static constexpr int kRenderFaultLimit = 30;
 
     // One place that changes menu state, so the mouse grab can never
     // fall out of step with what is on screen.
@@ -199,9 +219,32 @@ private:
         return true;
     }
 
+    // Everything the client draws, in one place so the caller can
+    // wrap it in a single guard.
+    static void DrawFrame(bool open) {
+        ImGui_ImplOpenGL2_NewFrame();
+        ImGui_ImplWin32_NewFrame();
+        ImGui::NewFrame();
+
+        Menu::RenderOverlays();   // world overlays, every frame
+        Menu::RenderHUD();
+
+        // Called every frame rather than only while open: the menu
+        // owns its fade, and skipping the call would cut it off
+        // mid-dissolve.
+        Menu::Render(open);
+
+        iOS::Splash::Render();
+        iOS::Notify::Render();
+
+        ImGui::Render();
+        ImGui_ImplOpenGL2_RenderDrawData(ImGui::GetDrawData());
+    }
+
     static BOOL WINAPI HookedSwapBuffers(HDC hdc) {
         // Teardown in progress: pass straight through, touch nothing
         if (s_shuttingDown.load()) return oSwapBuffers(hdc);
+        if (s_renderDisabled.load()) return oSwapBuffers(hdc);
 
         HGLRC gameCtx = wglGetCurrentContext();
         HDC   gameDC  = wglGetCurrentDC();
@@ -235,26 +278,23 @@ private:
             // released.
             ImGui::GetIO().MouseDrawCursor = open && !MouseControl::IsReleased();
 
-            ImGui_ImplOpenGL2_NewFrame();
-            ImGui_ImplWin32_NewFrame();
-            ImGui::NewFrame();
+            // An exception loose in the game's render loop kills the
+            // game. Whatever went wrong in our overlay, it is not
+            // worth that.
+            try {
+                DrawFrame(open);
+                s_renderFaults.store(0);
+            } catch (...) {
+                int n = s_renderFaults.fetch_add(1) + 1;
+                if (n >= kRenderFaultLimit) {
+                    s_renderDisabled.store(true);
+                    printf("[GLHook] overlay disabled after %d failed frames\n", n);
+                }
+            }
 
-            Menu::RenderOverlays();   // world overlays, every frame
-            Menu::RenderHUD();
-
-            // Called every frame rather than only while open: the
-            // menu owns its fade, and skipping the call would cut it
-            // off mid-dissolve.
-            Menu::Render(open);
-
-            // Last, on the foreground list, so the intro sits over
-            // everything the client just drew.
-            iOS::Splash::Render();
-
-            ImGui::Render();
-            ImGui_ImplOpenGL2_RenderDrawData(ImGui::GetDrawData());
-
-            // Give the game back exactly the context it had
+            // Give the game back exactly the context it had. Outside
+            // the try, because skipping it would leave the game
+            // rendering into ours.
             wglMakeCurrent(gameDC, gameCtx);
         }
 
