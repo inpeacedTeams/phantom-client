@@ -2,6 +2,7 @@
 #include "../module.h"
 #include "../../mc/minecraft.h"
 #include "../../mc/keybinds.h"
+#include "../../mc/combat_state.h"
 #include "../../jni/class_resolver.h"
 #include "../../jni/jvmti_util.h"
 #include <imgui.h>
@@ -19,14 +20,24 @@
 // Sprint resetting drops and re-applies sprint so each hit counts
 // as a fresh sprint hit.
 //
-// IMPLEMENTATION
-// Everything goes through KeyBinds. Two reasons:
+// WHAT CHANGED AND WHY IT MATTERS
 //
-//   1. setSprinting() alone does not hold. onLivingUpdate recomputes
-//      the sprint state from the keys every tick and overwrites us.
-//   2. KeyBinds tracks which keys we forced, so ReleaseAll() can
-//      free them on disconnect or eject. A key set behind its back
-//      would stay stuck down with no way for the player to clear it.
+// This used to fire on GetAsyncKeyState(VK_LBUTTON). That is the
+// mouse button, not an attack: clicking at the sky, at a block or
+// at empty air all reset your sprint for nothing. Losing forward
+// momentum for a swing that hit no one is strictly worse than not
+// having the module at all.
+//
+// It now triggers on CombatState::AttackedThisTick(), which means
+// the arm actually swung AND something was in reach. Same event the
+// server processes, so the reset lands where it is worth having.
+//
+// EVERYTHING GOES THROUGH KEYBINDS
+//   1. setSprinting() alone does not hold: onLivingUpdate recomputes
+//      sprint from the keys every tick and overwrites it.
+//   2. KeyBinds records which keys we forced, so ReleaseAll() frees
+//      them on disconnect or eject. A key set behind its back stays
+//      stuck down with no way for the player to clear it.
 //
 // METHODS
 //   0 W-Tap     release forward for a tick
@@ -39,22 +50,33 @@
 
 class SprintReset : public Module {
 private:
+    // ---- Behaviour ----
     int   m_method          = 0;
     float m_chance          = 100.0f;
     int   m_resetTicksMin   = 1;
     int   m_resetTicksMax   = 1;
-    bool  m_onlyWhileMoving = true;
     int   m_hitDelay        = 0;
 
-    // State
+    // ---- Gating ----
+    bool  m_onlyWhileMoving = true;
+    bool  m_onlyOnHit       = true;   // a real attack, not a click
+    bool  m_requireSprint   = true;   // pointless if not sprinting
+
+    // ---- State ----
     bool m_resetting       = false;
     int  m_resetCountdown  = 0;
     int  m_delayCountdown  = 0;
     bool m_waitingForDelay = false;
     bool m_lastLMB         = false;
-    int  m_activeMethod    = 0;   // method used to start the current reset
+    int  m_activeMethod    = 0;   // method that started the current reset
+
+    // ---- Readout ----
+    int m_resets  = 0;
+    int m_skipped = 0;
+    const char* m_why = "idle";
 
     jmethodID m_setSprinting = nullptr;
+    jmethodID m_isSprinting  = nullptr;
     bool m_resolved = false;
 
     std::mt19937 m_rng{ std::random_device{}() };
@@ -75,6 +97,8 @@ private:
         if (ClassResolver::entity) {
             m_setSprinting = JvmtiUtil::FindMethod(env, ClassResolver::entity,
                 { "func_70031_b", "setSprinting" }, 1);
+            m_isSprinting = JvmtiUtil::FindMethod(env, ClassResolver::entity,
+                { "func_70051_ag", "isSprinting" }, 0);
         }
         m_resolved = true;
     }
@@ -85,8 +109,16 @@ private:
         if (env->ExceptionCheck()) env->ExceptionClear();
     }
 
-    // Undo whatever the reset did. Uses m_activeMethod, not m_method,
-    // so changing the method mid-reset cannot strand a key.
+    bool IsSprinting(JNIEnv* env, jobject player) {
+        if (!m_isSprinting || !player) return true;   // cannot tell, allow
+        jboolean v = env->CallBooleanMethod(player, m_isSprinting);
+        if (env->ExceptionCheck()) { env->ExceptionClear(); return true; }
+        return v != 0;
+    }
+
+    // Undo whatever the reset did. Keyed on m_activeMethod rather
+    // than m_method, so changing the method mid-reset cannot leave a
+    // key held down forever.
     void EndReset(JNIEnv* env, jobject player) {
         switch (m_activeMethod) {
             case 0: KeyBinds::ReleaseForward(env); break;
@@ -105,6 +137,7 @@ private:
 
     void BeginReset(JNIEnv* env, jobject player) {
         m_activeMethod = m_method;
+        m_resets++;
 
         switch (m_method) {
             case 0: KeyBinds::SetForward(env, false); break;
@@ -127,15 +160,17 @@ private:
 
 public:
     SprintReset()
-        : Module("Sprint Reset", "Reset sprint on every hit for full knockback",
+        : Module("Sprint Reset", "Reset sprint on every landed hit for full knockback",
                  ModuleCategory::COMBAT, 0)
     {
         Bind("Method", &m_method);
         Bind("Chance", &m_chance);
         Bind("Reset Ticks Min", &m_resetTicksMin);
         Bind("Reset Ticks Max", &m_resetTicksMax);
-        Bind("Only While Moving", &m_onlyWhileMoving);
         Bind("Hit Delay", &m_hitDelay);
+        Bind("Only While Moving", &m_onlyWhileMoving);
+        Bind("Only On Hit", &m_onlyOnHit);
+        Bind("Require Sprint", &m_requireSprint);
     }
 
     void OnTick(JNIEnv* env) override {
@@ -149,20 +184,32 @@ public:
 
         if (Minecraft::IsInGui(env)) {
             if (m_resetting) EndReset(env, player);
+            m_why = "menu";
             return;
         }
 
-        // Always finish an in-flight reset before starting another
+        // Always finish an in-flight reset before considering another
         if (m_resetting) {
             if (m_resetCountdown <= 0) EndReset(env, player);
             else m_resetCountdown--;
+            m_why = "resetting";
             return;
         }
 
-        // Read the game's own forward state, not the physical W key.
+        // Read the game's forward state rather than the physical key.
         // The player may have rebound movement, and other modules may
         // be driving forward themselves.
-        if (m_onlyWhileMoving && !KeyBinds::GetForward(env)) return;
+        if (m_onlyWhileMoving && !KeyBinds::GetForward(env)) {
+            m_why = "not moving";
+            return;
+        }
+
+        // Resetting a sprint you do not have costs momentum and
+        // gains nothing.
+        if (m_requireSprint && !IsSprinting(env, player)) {
+            m_why = "not sprinting";
+            return;
+        }
 
         if (m_waitingForDelay) {
             if (m_delayCountdown > 0) { m_delayCountdown--; return; }
@@ -171,10 +218,23 @@ public:
             return;
         }
 
-        bool lmb = (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0;
-        bool justClicked = lmb && !m_lastLMB;
-        m_lastLMB = lmb;
-        if (!justClicked) return;
+        // ---- The trigger ----
+        bool trigger;
+        if (m_onlyOnHit) {
+            // A real swing with something in reach. This is the whole
+            // point: air swings no longer cost you momentum.
+            trigger = CombatState::AttackedThisTick();
+            if (CombatState::SwungThisTick() && !trigger) m_skipped++;
+        } else {
+            bool lmb = (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0;
+            trigger = lmb && !m_lastLMB;
+            m_lastLMB = lmb;
+        }
+
+        if (!trigger) {
+            m_why = "waiting for a hit";
+            return;
+        }
 
         if (m_hitDelay > 0) {
             m_delayCountdown  = m_hitDelay;
@@ -183,6 +243,7 @@ public:
         }
 
         if (Roll(m_chance)) BeginReset(env, player);
+        else m_why = "missed one";
     }
 
     void OnDisable(JNIEnv* env) override {
@@ -196,6 +257,14 @@ public:
     }
 
     void RenderSettings() override {
+        // ---- Live ----
+        ImGui::TextColored(m_resetting ? ImVec4(0.2f, 0.8f, 0.4f, 1.f)
+                                       : ImVec4(0.55f, 0.55f, 0.6f, 1.f),
+            "%s  (%s)", m_resetting ? "RESETTING" : "idle", m_why);
+        ImGui::TextDisabled("Resets %d | air swings ignored %d | your CPS %.1f",
+            m_resets, m_skipped, CombatState::CPS());
+
+        ImGui::Separator();
         const char* methods[] = {
             "W-Tap", "S-Tap", "Blockhit", "Sneak Tap", "Ctrl Spam", "Packet"
         };
@@ -212,7 +281,15 @@ public:
         ImGui::SliderInt("Reset Ticks Max", &m_resetTicksMax, 1, 5);
         if (m_resetTicksMin > m_resetTicksMax) m_resetTicksMin = m_resetTicksMax;
         ImGui::SliderInt("Hit Delay (ticks)", &m_hitDelay, 0, 5);
+
+        ImGui::Separator();
+        ImGui::TextColored(ImVec4(0.5f, 0.8f, 1.f, 1.f), "Trigger");
+        ImGui::Checkbox("Only On Landed Hits", &m_onlyOnHit);
+        ImGui::TextDisabled(m_onlyOnHit
+            ? "Fires on a real swing with a target in reach."
+            : "Fires on any mouse click, including air swings.");
         ImGui::Checkbox("Only While Moving", &m_onlyWhileMoving);
+        ImGui::Checkbox("Require Sprint", &m_requireSprint);
 
         ImGui::Separator();
         switch (m_method) {
@@ -224,6 +301,10 @@ public:
             case 5: ImGui::TextWrapped("Toggles sprint within a single tick. Fastest, but detectable."); break;
         }
 
+        if (!CombatState::IsUsable() && m_onlyOnHit) {
+            ImGui::TextColored(ImVec4(1.f, 0.5f, 0.35f, 1.f),
+                "Swing field unresolved: turn off Only On Landed Hits");
+        }
         if (!KeyBinds::HasMovement()) {
             ImGui::TextColored(ImVec4(1.f, 0.8f, 0.3f, 1.f),
                 "Keybinds unresolved: only Packet mode works");
