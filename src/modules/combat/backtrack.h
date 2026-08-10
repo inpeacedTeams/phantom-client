@@ -9,6 +9,7 @@
 #include <unordered_map>
 #include <deque>
 #include <vector>
+#include <array>
 #include <string>
 #include <mutex>
 #include <chrono>
@@ -33,10 +34,9 @@
 // TARGETING
 // Picking "the oldest sample inside the window" wastes most of the
 // budget: an enemy strafing past you is only reachable for part of
-// their path. Intersect mode instead scans the whole history and
-// takes the sample closest to your crosshair that is still inside
-// reach. That is where the extra strength comes from, not from a
-// longer delay.
+// their path. Intersect mode scans the whole history and takes the
+// sample closest to your crosshair that is still inside reach. That
+// is where the strength comes from, not from a longer delay.
 //
 // STAYING QUIET
 //   - per-target delay drawn from a band, re-rolled periodically
@@ -44,20 +44,19 @@
 //   - range window, because rewinding a distant player buys nothing
 //   - ping-aware cap keeping ping + delay inside the comp window
 //   - restores on damage, on flag, on GUI, on disable
-//   - optional sprint-reset sync: only rewind on the ticks you are
-//     actually swinging, which is when it matters
+//   - swing sync: only rewind around the ticks you are swinging
 // =================================================================
 
 class Backtrack : public Module {
 public:
     // Published for the render thread. Plain data, no JNI.
     struct VisTarget {
-        double trueX, trueY, trueZ;      // where the server has them
-        double backX, backY, backZ;      // where we are holding them
+        double trueX = 0, trueY = 0, trueZ = 0;   // where the server has them
+        double backX = 0, backY = 0, backZ = 0;   // where we are holding them
         std::vector<std::array<double, 3>> trail;
         float  health = 20.f, maxHealth = 20.f;
         int    delayMs = 0;
-        double offset = 0.0;             // metres of rewind
+        double offset = 0.0;                      // metres of rewind
         bool   rewound = false;
         std::string name;
     };
@@ -88,14 +87,14 @@ private:
     int   m_hardCapMs  = 180;
 
     // ---- Strength ----
-    bool  m_aimLock      = false;  // pull the crosshair to the held spot
+    bool  m_aimLock      = false;
     float m_aimLockSpeed = 3.0f;
     float m_aimLockFov   = 60.0f;
-    bool  m_swingSync    = true;   // only rewind on swing ticks
-    int   m_swingWindow  = 3;      // ticks either side of a click
-    bool  m_holdThrough  = true;   // keep the pose while a swing lands
+    bool  m_swingSync    = true;
+    int   m_swingWindow  = 3;
+    bool  m_holdThrough  = true;
     int   m_holdTicks    = 2;
-    float m_reachAssist  = 3.0f;   // treat this as your usable reach
+    float m_reachAssist  = 3.0f;
 
     // ---- Window ----
     bool  m_useRangeWindow = true;
@@ -121,10 +120,10 @@ private:
     // ---- Visibility ----
     bool  m_visEnabled   = true;
     int   m_visStyle     = 0;    // 0 Box, 1 Wireframe, 2 Trail, 3 Marker, 4 Text
-    bool  m_visLink      = true; // line from true position to held one
+    bool  m_visLink      = true;
     bool  m_visShowMs    = true;
     bool  m_visShowDist  = true;
-    bool  m_visGhost     = true; // faint marker at the true position
+    bool  m_visGhost     = true;
     float m_visThickness = 1.6f;
     float m_visColor[4]  = { 0.45f, 0.85f, 1.00f, 0.95f };
     float m_visGhostA    = 0.30f;
@@ -140,6 +139,7 @@ private:
     int  m_activeCount  = 0;
     int  m_measuredPing = 30;
     int  m_swingTicksLeft = 0;
+    int  m_holdLeft = 0;
     bool m_lastLMB = false;
     unsigned long long m_tick = 0;
     double m_maxOffsetSeen = 0.0;
@@ -227,7 +227,6 @@ private:
         if (t.ref) { env->DeleteGlobalRef(t.ref); t.ref = nullptr; }
     }
 
-    // Angle between the crosshair and a world point, in degrees
     float AngleTo(JNIEnv* env, jobject player, double x, double y, double z,
                   float yaw, float pitch)
     {
@@ -248,7 +247,6 @@ private:
         const int cap = EffectiveCap();
 
         if (m_targeting == 0) {
-            // Oldest inside the delay: the classic behaviour
             for (auto it = t.history.rbegin(); it != t.history.rend(); ++it) {
                 auto age = std::chrono::duration_cast<std::chrono::milliseconds>(
                     now - it->at).count();
@@ -257,45 +255,80 @@ private:
             return nullptr;
         }
 
-        // Intersect and Nearest both walk the whole history and score
-        // every sample. Only samples inside the compensation budget
-        // are eligible, otherwise the server rejects the hit.
+        // Intersect and Nearest score every sample in the history.
+        // Only samples inside the compensation budget are eligible,
+        // otherwise the server rejects the hit outright.
         const Sample* best = nullptr;
         double bestScore = 1e18;
 
         for (const auto& s : t.history) {
             auto age = std::chrono::duration_cast<std::chrono::milliseconds>(
                 now - s.at).count();
-            if (age > cap) continue;               // outside the window
-            if (age < 10) continue;                // effectively now
+            if (age > cap) continue;
+            if (age < 10) continue;
 
             double dx = s.x - pX, dy = s.y - pY, dz = s.z - pZ;
             double dist = std::sqrt(dx*dx + dy*dy + dz*dz);
-            if (dist > m_reachAssist) continue;    // could not hit it anyway
+            if (dist > m_reachAssist) continue;
 
-            double score;
-            if (m_targeting == 1) {
-                // Intersect: closest to where you are already aiming.
-                // This is what makes a strafing enemy hittable.
-                score = AngleTo(env, player, s.x, s.y, s.z, yaw, pitch);
-            } else {
-                // Nearest: shortest distance, easiest to land
-                score = dist;
-            }
+            double score = (m_targeting == 1)
+                ? AngleTo(env, player, s.x, s.y, s.z, yaw, pitch)
+                : dist;
 
             if (score < bestScore) { bestScore = score; best = &s; }
         }
 
         if (best) return best;
 
-        // Nothing scored: fall back to the plain delay pick so the
-        // module still does something rather than silently idling.
+        // Nothing scored: fall back to the plain delay pick rather
+        // than idling.
         for (auto it = t.history.rbegin(); it != t.history.rend(); ++it) {
             auto age = std::chrono::duration_cast<std::chrono::milliseconds>(
                 now - it->at).count();
             if (age >= t.delayMs) return &(*it);
         }
         return nullptr;
+    }
+
+    // Plain-data copy for the render thread
+    void PublishVis() {
+        if (!m_visEnabled) {
+            std::lock_guard<std::mutex> lock(m_visMutex);
+            m_vis.clear();
+            return;
+        }
+
+        std::vector<VisTarget> out;
+        out.reserve(m_targets.size());
+
+        for (auto& kv : m_targets) {
+            Target& t = kv.second;
+            if (!t.rewound) continue;
+
+            VisTarget v;
+            v.trueX = t.trueX; v.trueY = t.trueY; v.trueZ = t.trueZ;
+            v.backX = t.backX; v.backY = t.backY; v.backZ = t.backZ;
+            v.health = t.health; v.maxHealth = t.maxHealth;
+            v.delayMs = t.delayMs;
+            v.rewound = true;
+            v.name = t.name;
+
+            double dx = t.backX - t.trueX;
+            double dy = t.backY - t.trueY;
+            double dz = t.backZ - t.trueZ;
+            v.offset = std::sqrt(dx*dx + dy*dy + dz*dz);
+
+            if (m_visStyle == 2) {
+                v.trail.reserve(t.history.size());
+                for (const auto& s : t.history)
+                    v.trail.push_back({ s.x, s.y, s.z });
+            }
+
+            out.push_back(std::move(v));
+        }
+
+        std::lock_guard<std::mutex> lock(m_visMutex);
+        m_vis.swap(out);
     }
 
 public:
@@ -360,6 +393,7 @@ public:
         m_rewinding    = true;
         m_pauseCounter = 0;
         m_activeCount  = 0;
+        m_holdLeft     = 0;
         m_maxOffsetSeen = 0.0;
     }
 
@@ -410,8 +444,14 @@ public:
         bool lmb = (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0;
         bool justClicked = lmb && !m_lastLMB;
         m_lastLMB = lmb;
-        if (justClicked) m_swingTicksLeft = m_swingWindow;
-        else if (m_swingTicksLeft > 0) m_swingTicksLeft--;
+
+        if (justClicked) {
+            m_swingTicksLeft = m_swingWindow;
+            m_holdLeft = m_holdThrough ? m_holdTicks : 0;
+        } else {
+            if (m_swingTicksLeft > 0) m_swingTicksLeft--;
+            if (m_holdLeft > 0) m_holdLeft--;
+        }
 
         // ---- Pulse cycling ----
         if (m_mode == 1) {
@@ -426,10 +466,17 @@ public:
             m_rewinding = true;
         }
 
-        bool clicking = lmb;
+        // Swing sync keeps the desync to the ticks that matter. Hold
+        // Through extends it a few ticks so a swing already in flight
+        // still lands, but it has to expire: leaving it permanently
+        // true made the whole option a no-op.
+        bool swingOk = !m_swingSync
+                    || m_swingTicksLeft > 0
+                    || m_holdLeft > 0;
+
         bool active = m_rewinding
-                   && (!m_onlyWhileClicking || clicking)
-                   && (!m_swingSync || m_swingTicksLeft > 0 || m_holdThrough);
+                   && (!m_onlyWhileClicking || lmb)
+                   && swingOk;
 
         auto now = std::chrono::steady_clock::now();
 
@@ -443,9 +490,8 @@ public:
         float  yaw   = Minecraft::GetYaw(env, player);
         float  pitch = Minecraft::GetPitch(env, player);
 
-        // Best rewound spot this tick, used by aim lock
-        const double* lockTo = nullptr;
         double lockBuf[3] = { 0, 0, 0 };
+        bool   haveLock = false;
         float  lockAngle = m_aimLockFov * 0.5f;
 
         for (auto& e : ents) {
@@ -483,7 +529,6 @@ public:
                 continue;
 
             if (m_mode == 2) {
-                // Adaptive: further targets get more of the budget
                 float span = m_rangeMax - m_rangeMin;
                 float f = span > 0.f ? (float)((dist - m_rangeMin) / span) : 0.5f;
                 if (f < 0.f) f = 0.f;
@@ -517,18 +562,18 @@ public:
                     lockBuf[0] = chosen->x;
                     lockBuf[1] = chosen->y;
                     lockBuf[2] = chosen->z;
-                    lockTo = lockBuf;
+                    haveLock = true;
                 }
             }
         }
 
         // ---- Aim lock ----
         // Rewinding puts the hitbox somewhere your crosshair is not.
-        // This nudges it back onto the held pose. It is a rotation
-        // change like any aim assist, so it carries the same risk.
-        if (m_aimLock && lockTo) {
+        // This nudges it onto the held pose. It is a rotation change
+        // like any aim assist and carries the same risk.
+        if (m_aimLock && haveLock) {
             auto rot = Minecraft::GetRotationsToPos(env, player,
-                lockTo[0], lockTo[1] + 1.0, lockTo[2]);
+                lockBuf[0], lockBuf[1] + 1.0, lockBuf[2]);
             float dy = WrapAngle(rot.yaw - yaw);
             float dp = rot.pitch - pitch;
             float step = m_aimLockSpeed * 0.02f;
@@ -553,61 +598,20 @@ public:
         PublishVis();
     }
 
-    // Plain-data copy for the render thread
-    void PublishVis() {
-        if (!m_visEnabled) {
-            std::lock_guard<std::mutex> lock(m_visMutex);
-            m_vis.clear();
-            return;
-        }
-
-        std::vector<VisTarget> out;
-        out.reserve(m_targets.size());
-
-        for (auto& kv : m_targets) {
-            Target& t = kv.second;
-            if (!t.rewound) continue;
-
-            VisTarget v;
-            v.trueX = t.trueX; v.trueY = t.trueY; v.trueZ = t.trueZ;
-            v.backX = t.backX; v.backY = t.backY; v.backZ = t.backZ;
-            v.health = t.health; v.maxHealth = t.maxHealth;
-            v.delayMs = t.delayMs;
-            v.rewound = true;
-            v.name = t.name;
-
-            double dx = t.backX - t.trueX;
-            double dy = t.backY - t.trueY;
-            double dz = t.backZ - t.trueZ;
-            v.offset = std::sqrt(dx*dx + dy*dy + dz*dz);
-
-            if (m_visStyle == 2) {
-                v.trail.reserve(t.history.size());
-                for (const auto& s : t.history)
-                    v.trail.push_back({ s.x, s.y, s.z });
-            }
-
-            out.push_back(std::move(v));
-        }
-
-        std::lock_guard<std::mutex> lock(m_visMutex);
-        m_vis.swap(out);
-    }
-
-    // Render thread reads this. Never touches JNI.
+    // ---- Read by the render thread. No JNI. ----
     std::vector<VisTarget> TakeVis() {
         std::lock_guard<std::mutex> lock(m_visMutex);
         return m_vis;
     }
 
-    bool  VisEnabled() const   { return m_visEnabled && IsEnabled(); }
-    int   VisStyle() const     { return m_visStyle; }
-    bool  VisLink() const      { return m_visLink; }
-    bool  VisGhost() const     { return m_visGhost; }
-    bool  VisShowMs() const    { return m_visShowMs; }
-    bool  VisShowDist() const  { return m_visShowDist; }
-    float VisThickness() const { return m_visThickness; }
-    float VisGhostAlpha() const{ return m_visGhostA; }
+    bool  VisEnabled() const    { return m_visEnabled && IsEnabled(); }
+    int   VisStyle() const      { return m_visStyle; }
+    bool  VisLink() const       { return m_visLink; }
+    bool  VisGhost() const      { return m_visGhost; }
+    bool  VisShowMs() const     { return m_visShowMs; }
+    bool  VisShowDist() const   { return m_visShowDist; }
+    float VisThickness() const  { return m_visThickness; }
+    float VisGhostAlpha() const { return m_visGhostA; }
     const float* VisColor() const { return m_visColor; }
 
     void RenderSettings() override {
