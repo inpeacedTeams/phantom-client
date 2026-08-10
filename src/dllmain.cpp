@@ -6,6 +6,7 @@
 #include "jni/jni_helper.h"
 #include "jni/class_resolver.h"
 #include "hooks/gl_hook.h"
+#include "gui/splash.h"
 #include "mc/minecraft.h"
 #include "mc/entity_list.h"
 #include "mc/keybinds.h"
@@ -17,7 +18,7 @@ FILE* g_console = nullptr;
 // delays in ticks, so the client loop has to match. Running faster
 // made a "2 tick" delay expire in 2 milliseconds.
 //
-// Click timing does NOT live here: ClickScheduler runs on its own
+// Click timing does NOT live here: the autoclicker runs on its own
 // 1ms thread, because a 50ms loop cannot express a 27ms gap.
 static constexpr int TICK_MS = 50;
 
@@ -82,9 +83,20 @@ void MainThread(HMODULE hModule) {
         FreeLibraryAndExitThread(hModule, 1);
         return;
     }
+
+    // ---- 6. Say hello ----
+    // Only now, because everything above can still fail. A console
+    // window behind the game is not confirmation: you cannot see it.
+    // This is the first and only sign on screen that the client
+    // loaded, so it is armed at the point where that is true.
+    //
+    // Trigger only raises a flag. The render thread starts the clock
+    // on its next frame, once the fonts exist.
+    iOS::Splash::Trigger();
+
     printf("[Phantom] Ready. INSERT opens the menu, DELETE ejects.\n");
 
-    // ---- 6. Client loop ----
+    // ---- 7. Client loop ----
     auto next = std::chrono::steady_clock::now();
     bool ejectHeld = false;
 
@@ -109,7 +121,7 @@ void MainThread(HMODULE hModule) {
         else next = now;   // we fell behind, resync instead of spinning
     }
 
-    // ---- 7. Teardown ----
+    // ---- 8. Teardown ----
     // Order matters. GLHook::Remove stops the render thread from
     // calling into module state, so it has to happen before the
     // modules are destroyed.
