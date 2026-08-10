@@ -24,6 +24,25 @@
 // from eye position, yaw, pitch and FOV is deterministic and does
 // not care when we run.
 //
+// -----------------------------------------------------------------
+// WHY BOXES USED TO VANISH AND FLICKER
+// -----------------------------------------------------------------
+// The old code projected the eight corners of a bounding box one at
+// a time, threw away any that were behind the camera, and gave up
+// if fewer than four survived.
+//
+// That is wrong in the exact situation that matters most. Stand
+// next to someone and the lower corners of their box fall behind
+// the near plane while their head is still on screen. Corners drop
+// out, the 2D bounds are computed from whatever is left, and the
+// box either shrinks to a sliver or disappears entirely. Turn a few
+// degrees and it pops back. That is the flicker.
+//
+// A bounding box is not eight points, it is twelve EDGES. Clipping
+// each edge against the near plane keeps the silhouette correct no
+// matter how much of the box is behind you, because the clipped
+// intersection point is still a real point on the box.
+//
 // THREADING
 // Update() runs on the client thread and writes under a mutex.
 // Get() runs on the render thread and only reads.
@@ -45,12 +64,34 @@ struct CameraView {
     }
 };
 
+// A world point already rotated into camera space.
+//   x right, y up, depth forward. Behind the camera means depth < 0.
+struct ViewPoint {
+    double x = 0, y = 0, depth = 0;
+};
+
+// Screen-space bounds of a projected box
+struct ScreenBox {
+    float minX = 0, minY = 0, maxX = 0, maxY = 0;
+    bool  valid = false;
+
+    float Width()  const { return maxX - minX; }
+    float Height() const { return maxY - minY; }
+    float CenterX() const { return (minX + maxX) * 0.5f; }
+    float CenterY() const { return (minY + maxY) * 0.5f; }
+};
+
 class Camera {
 private:
     inline static CameraView s_view;
     inline static std::mutex s_mutex;
     inline static jfieldID   s_fFov = nullptr;
     inline static bool       s_fovResolved = false;
+
+    // Anything closer than this is treated as behind the camera.
+    // Matching Minecraft's own 0.05 near plane keeps the geometry
+    // consistent with what the game actually drew.
+    static constexpr double kNear = 0.05;
 
 public:
     // Client thread, once per tick
@@ -115,12 +156,15 @@ public:
         return a;
     }
 
-    // World point to screen point. False when behind the camera.
-    static bool Project(const CameraView& v,
-                        double wx, double wy, double wz,
-                        double camX, double camY, double camZ,
-                        float screenW, float screenH,
-                        float* outX, float* outY)
+    // -------------------------------------------------------------
+    // World point into camera space.
+    //
+    // Minecraft renders rotate(pitch, X) then rotate(yaw+180, Y),
+    // so the same order is reproduced here.
+    // -------------------------------------------------------------
+    static ViewPoint ToView(const CameraView& v,
+                            double wx, double wy, double wz,
+                            double camX, double camY, double camZ)
     {
         const double DEG = 3.14159265358979 / 180.0;
 
@@ -128,7 +172,6 @@ public:
         double dy = wy - camY;
         double dz = wz - camZ;
 
-        // Minecraft renders rotate(pitch, X) then rotate(yaw+180, Y)
         double ya = (v.yaw + 180.0) * DEG;
         double cy = std::cos(ya), sy = std::sin(ya);
         double x1 =  dx * cy + dz * sy;
@@ -137,21 +180,141 @@ public:
 
         double pa = v.pitch * DEG;
         double cp = std::cos(pa), sp = std::sin(pa);
-        double x2 = x1;
-        double y2 = y1 * cp - z1 * sp;
-        double z2 = y1 * sp + z1 * cp;
 
-        double depth = -z2;              // camera looks down -Z
-        if (depth < 0.05) return false;
+        ViewPoint p;
+        p.x     = x1;
+        p.y     = y1 * cp - z1 * sp;
+        p.depth = -(y1 * sp + z1 * cp);   // camera looks down -Z
+        return p;
+    }
+
+    // Camera space to pixels. Caller must ensure depth >= kNear.
+    static void ViewToScreen(const CameraView& v, const ViewPoint& p,
+                             float screenW, float screenH,
+                             float* outX, float* outY)
+    {
+        const double DEG = 3.14159265358979 / 180.0;
 
         double aspect = (screenH > 0) ? ((double)screenW / (double)screenH) : 1.777;
         double f = 1.0 / std::tan((v.fov * 0.5) * DEG);
 
-        double ndcX = (f / aspect) * (x2 / depth);
-        double ndcY = f * (y2 / depth);
+        double ndcX = (f / aspect) * (p.x / p.depth);
+        double ndcY = f * (p.y / p.depth);
 
         *outX = (float)((ndcX * 0.5 + 0.5) * screenW);
         *outY = (float)((1.0 - (ndcY * 0.5 + 0.5)) * screenH);
+    }
+
+    // World point to screen point. False when behind the camera.
+    static bool Project(const CameraView& v,
+                        double wx, double wy, double wz,
+                        double camX, double camY, double camZ,
+                        float screenW, float screenH,
+                        float* outX, float* outY)
+    {
+        ViewPoint p = ToView(v, wx, wy, wz, camX, camY, camZ);
+        if (p.depth < kNear) return false;
+        ViewToScreen(v, p, screenW, screenH, outX, outY);
+        return true;
+    }
+
+    // -------------------------------------------------------------
+    // Screen bounds of an axis-aligned world box.
+    //
+    // Walks the twelve edges and clips each against the near plane,
+    // so a box the camera is standing inside still yields correct
+    // bounds instead of collapsing. This is what stops the box from
+    // popping in and out as you turn.
+    // -------------------------------------------------------------
+    static ScreenBox ProjectBox(const CameraView& v,
+                                double minWX, double minWY, double minWZ,
+                                double maxWX, double maxWY, double maxWZ,
+                                double camX, double camY, double camZ,
+                                float screenW, float screenH)
+    {
+        ScreenBox out;
+
+        const double cx[8] = { minWX, maxWX, minWX, maxWX, minWX, maxWX, minWX, maxWX };
+        const double cy[8] = { minWY, minWY, maxWY, maxWY, minWY, minWY, maxWY, maxWY };
+        const double cz[8] = { minWZ, minWZ, minWZ, minWZ, maxWZ, maxWZ, maxWZ, maxWZ };
+
+        ViewPoint vp[8];
+        for (int i = 0; i < 8; i++)
+            vp[i] = ToView(v, cx[i], cy[i], cz[i], camX, camY, camZ);
+
+        // Every corner behind the near plane means the box really is
+        // behind us. Nothing to draw.
+        bool anyFront = false;
+        for (int i = 0; i < 8; i++) if (vp[i].depth >= kNear) { anyFront = true; break; }
+        if (!anyFront) return out;
+
+        static const int kEdges[12][2] = {
+            {0,1},{1,3},{3,2},{2,0},      // bottom face
+            {4,5},{5,7},{7,6},{6,4},      // top face
+            {0,4},{1,5},{2,6},{3,7}       // uprights
+        };
+
+        float minX = 1e9f, minY = 1e9f, maxX = -1e9f, maxY = -1e9f;
+        bool have = false;
+
+        auto accumulate = [&](const ViewPoint& p) {
+            float sx, sy;
+            ViewToScreen(v, p, screenW, screenH, &sx, &sy);
+            if (sx < minX) minX = sx;
+            if (sx > maxX) maxX = sx;
+            if (sy < minY) minY = sy;
+            if (sy > maxY) maxY = sy;
+            have = true;
+        };
+
+        for (int e = 0; e < 12; e++) {
+            ViewPoint a = vp[kEdges[e][0]];
+            ViewPoint b = vp[kEdges[e][1]];
+
+            bool aOk = a.depth >= kNear;
+            bool bOk = b.depth >= kNear;
+
+            if (aOk && bOk) {
+                accumulate(a);
+                accumulate(b);
+                continue;
+            }
+            if (!aOk && !bOk) continue;   // whole edge is behind
+
+            // One end crosses the plane. Slide it up to the plane and
+            // use the intersection, which is still a point on the box.
+            if (!aOk) { ViewPoint t = a; a = b; b = t; }
+
+            double span = a.depth - b.depth;
+            double t = (span != 0.0) ? (a.depth - kNear) / span : 0.0;
+            if (t < 0.0) t = 0.0;
+            if (t > 1.0) t = 1.0;
+
+            ViewPoint clip;
+            clip.x     = a.x + (b.x - a.x) * t;
+            clip.y     = a.y + (b.y - a.y) * t;
+            clip.depth = kNear;
+
+            accumulate(a);
+            accumulate(clip);
+        }
+
+        if (!have) return out;
+
+        out.minX = minX; out.minY = minY;
+        out.maxX = maxX; out.maxY = maxY;
+        out.valid = true;
+        return out;
+    }
+
+    // Is any part of this box on screen? Cheap reject before the
+    // caller starts building geometry.
+    static bool OnScreen(const ScreenBox& b, float screenW, float screenH,
+                         float margin = 64.0f)
+    {
+        if (!b.valid) return false;
+        if (b.maxX < -margin || b.minX > screenW + margin) return false;
+        if (b.maxY < -margin || b.minY > screenH + margin) return false;
         return true;
     }
 };
