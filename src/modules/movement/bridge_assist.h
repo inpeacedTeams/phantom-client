@@ -13,23 +13,25 @@
 // Holds sneak when the next step would take you off the block, so
 // you can bridge backwards without looking down.
 //
-// WHAT WAS BROKEN
-// The old edge test looked at the fractional part of the player's
-// coordinates and sneaked whenever it was near a boundary. Walking
-// across a flat floor crosses a boundary every block, so it
+// EDGE DETECTION
+// The old test looked at the fractional part of the player's
+// coordinates and sneaked whenever it was near a block boundary.
+// Walking across a flat floor crosses a boundary every block, so it
 // crouched constantly on solid ground: slower than not having it,
-// and nothing to do with bridging.
+// and nothing to do with bridging. The real question is whether
+// there is AIR under the place you are about to be, so this
+// projects your movement forward and asks the world.
 //
-// The real question is whether there is AIR under the place you are
-// about to be. This version projects your movement forward and asks
-// the world.
+// WHY THE SNEAK STATE IS RE-APPLIED EVERY TICK
+// It used to skip the write whenever its own cached flag already
+// matched. That assumes nothing else touches the sneak key, and
+// something does: Sprint Reset in Sneak Tap mode drives the same
+// bind, and when it hands the key back it restores the hardware
+// state, which is "shift is not held". Bridge Assist still believed
+// it was sneaking, never wrote again, and you walked off the edge.
 //
-// WHY SNEAK RATHER THAN ANYTHING CLEVERER
-// Holding shift is a vanilla input. The packet stream is a plain
-// sneak toggle, which is what a careful bridger produces anyway, so
-// there is nothing here for a server to flag. Driving the keybind
-// also matters mechanically: setSneaking() is recomputed from the
-// key every tick and would be overwritten.
+// Writing a boolean that is already true costs nothing, so the
+// state is simply re-asserted.
 //
 // MODES
 //   0 Eagle     sneak at the edge, release once clear
@@ -55,7 +57,7 @@ private:
     int   m_holdTicks    = 2;      // stay down briefly after clearing
 
     // ---- State ----
-    bool m_sneaking     = false;
+    bool m_sneaking     = false;   // what we WANT, not what we assume
     int  m_sneakCounter = 0;
     int  m_holdLeft     = 0;
     bool m_atEdge       = false;
@@ -64,10 +66,15 @@ private:
     const char* m_why = "idle";
     bool m_worldOk = false;
 
-    void SetSneak(JNIEnv* env, bool on) {
-        if (m_sneaking == on) return;
-        if (on) KeyBinds::SetSneak(env, true);
-        else    KeyBinds::ReleaseSneak(env);
+    // Re-asserted every tick rather than only on a change, because
+    // another module may have handed the key back since our last
+    // write and we would never notice.
+    void ApplySneak(JNIEnv* env, bool on) {
+        if (on) {
+            KeyBinds::SetSneak(env, true);
+        } else if (m_sneaking) {
+            KeyBinds::ReleaseSneak(env);
+        }
         m_sneaking = on;
     }
 
@@ -145,17 +152,26 @@ public:
         m_worldOk = World::Init(env);
 
         jobject player = Minecraft::GetPlayer(env);
-        if (!player) return;
+
+        // Losing the player mid-sneak used to leave shift held all
+        // the way into the next world.
+        if (!player) {
+            ApplySneak(env, false);
+            m_sneakCounter = 0;
+            m_holdLeft = 0;
+            m_why = "no player";
+            return;
+        }
 
         if (Minecraft::IsInGui(env)) {
-            SetSneak(env, false);
+            ApplySneak(env, false);
             m_why = "menu";
             return;
         }
 
         // Sneaking mid-air does nothing except look strange
         if (m_onlyOnGround && !Minecraft::IsOnGround(env, player)) {
-            SetSneak(env, false);
+            ApplySneak(env, false);
             m_sneakCounter = 0;
             m_holdLeft = 0;
             m_why = "airborne";
@@ -170,7 +186,7 @@ public:
                     : (m_onlyBackward ? back : any);
 
         if (!active) {
-            SetSneak(env, false);
+            ApplySneak(env, false);
             m_sneakCounter = 0;
             m_holdLeft = 0;
             m_why = "not moving";
@@ -189,7 +205,7 @@ public:
         switch (m_mode) {
             case 1: {   // Godbridge: toggle while over the drop
                 if (!want) {
-                    SetSneak(env, false);
+                    ApplySneak(env, false);
                     m_sneakCounter = 0;
                     m_why = "ground ahead";
                     break;
@@ -197,19 +213,21 @@ public:
                 m_sneakCounter++;
                 int limit = m_sneaking ? m_sneakTicks : m_unsneakTicks;
                 if (m_sneakCounter >= limit) {
-                    SetSneak(env, !m_sneaking);
+                    ApplySneak(env, !m_sneaking);
                     m_sneakCounter = 0;
+                } else {
+                    ApplySneak(env, m_sneaking);   // hold the current state
                 }
                 m_why = "godbridge";
                 break;
             }
             case 2: {   // Breezily: one tick down, one tick up
-                if (want) { SetSneak(env, !m_sneaking); m_why = "breezily"; }
-                else      { SetSneak(env, false); m_why = "ground ahead"; }
+                if (want) { ApplySneak(env, !m_sneaking); m_why = "breezily"; }
+                else      { ApplySneak(env, false); m_why = "ground ahead"; }
                 break;
             }
             default: {  // Eagle and Safewalk
-                SetSneak(env, want);
+                ApplySneak(env, want);
                 m_why = want ? "edge ahead" : "ground ahead";
                 break;
             }
@@ -217,9 +235,10 @@ public:
     }
 
     void OnDisable(JNIEnv* env) override {
-        SetSneak(env, false);
+        ApplySneak(env, false);
         m_sneakCounter = 0;
         m_holdLeft = 0;
+        m_why = "off";
     }
 
     void RenderSettings() override {
