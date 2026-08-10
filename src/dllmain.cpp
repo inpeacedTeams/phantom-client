@@ -1,6 +1,7 @@
 #include <Windows.h>
 #include <thread>
 #include <chrono>
+#include <string>
 #include <cstdio>
 
 #include "jni/jni_helper.h"
@@ -13,6 +14,7 @@
 #include "mc/keybinds.h"
 #include "modules/module_manager.h"
 #include "config/config_store.h"
+#include "config/profiles.h"
 
 // =================================================================
 // Entry point
@@ -128,6 +130,17 @@ void MainThread(HMODULE hModule) {
     ModuleManager::Init();
     printf("[Phantom] %d modules registered\n", ModuleManager::GetModuleCount());
 
+    // Presets name settings as STRINGS, so a rename in a module is
+    // invisible to the compiler and turns into a preset that half
+    // applies. Checking here means it is found on the first inject
+    // after the mistake rather than by a confused user mid-fight.
+    std::string presetDetail;
+    int presetBroken = Profiles::Verify(&presetDetail);
+    if (presetBroken > 0) {
+        printf("[Phantom] %d preset entries do not match: %s\n",
+               presetBroken, presetDetail.c_str());
+    }
+
     // ---- 5. Restore the last session ----
     // Before the overlay exists, so the very first frame already
     // shows the user's own accent, scale and module list rather
@@ -173,6 +186,12 @@ void MainThread(HMODULE hModule) {
         iOS::Notify::Warning("Clicking unavailable",
             "The game's click counter could not be found, so AutoClicker "
             "and Hit Select cannot send clicks.");
+    }
+    if (presetBroken > 0) {
+        iOS::Notify::Warning("Some presets are out of date",
+            std::to_string(presetBroken) + " preset values no longer match a "
+            "real setting (" + presetDetail + "). Presets will apply with "
+            "gaps until that is fixed.");
     }
 
     printf("[Phantom] Ready. INSERT opens the menu, DELETE ejects.\n");
