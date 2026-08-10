@@ -2,6 +2,7 @@
 #include <vector>
 #include <memory>
 #include <mutex>
+#include <atomic>
 #include <string>
 #include <functional>
 #include <Windows.h>
@@ -10,6 +11,7 @@
 #include "../mc/entity_list.h"
 #include "../mc/combat_state.h"
 #include "../mc/rotation.h"
+#include "../mc/mouse_control.h"
 #include "../input/click_scheduler.h"
 #include "../render/camera.h"
 
@@ -44,7 +46,10 @@
 //
 // The render thread draws the menu and reads module state but never
 // calls JNI. Anything the UI wants to do that needs a JNIEnv is
-// pushed onto the action queue and executed here instead.
+// pushed onto the action queue and executed here instead. That
+// includes opening the menu itself: releasing the mouse grab is a
+// call into Minecraft, so the window thread only sets a flag and
+// this tick acts on it.
 //
 // The click timer runs on a third thread. It never touches JNI or
 // module state either: it only increments a counter, which this
@@ -61,10 +66,11 @@
 //   3. Camera snapshot, taken before any module rotates the player.
 //   4. CombatState, so every module reads the same facts about this
 //      tick rather than each deriving its own from the mouse.
-//   5. UI actions, keybinds, then the modules themselves.
-//   6. Queued clicks are handed to the game LAST, so a click fired
+//   5. Mouse grab follows the menu.
+//   6. UI actions, keybinds, then the modules themselves.
+//   7. Queued clicks are handed to the game LAST, so a click fired
 //      by a module this tick goes out on this tick.
-//   7. Key reconciliation, after everything has had its say.
+//   8. Key reconciliation, after everything has had its say.
 //
 // KEY SAFETY
 // Modules hold real keybinds down, and KeyBinding.pressed is edge
@@ -92,6 +98,11 @@ private:
     inline static std::shared_ptr<Backtrack> s_backtrack;
     inline static std::shared_ptr<ClickAssist> s_clickAssist;
     inline static bool s_wasInGame = false;
+
+    // Written by the window thread, read here. The menu itself lives
+    // on the render side; this is only how the client thread learns
+    // that it should hand the cursor back to the player.
+    inline static std::atomic<bool> s_menuOpen{ false };
 
     // A packed lobby can hold 60+ players, and the entity scan takes
     // a couple of refs each on top of whatever the modules allocate.
@@ -164,6 +175,12 @@ public:
         ClickScheduler::SetWindow(hwnd);
     }
 
+    // Called from the window thread when INSERT is pressed. Does no
+    // work itself: releasing the grab is a JNI call and belongs on
+    // the client thread.
+    static void SetMenuOpen(bool open) { s_menuOpen.store(open); }
+    static bool IsMenuOpen()           { return s_menuOpen.load(); }
+
     static std::shared_ptr<ESP> GetESP() { return s_esp; }
     static std::shared_ptr<Backtrack> GetBacktrack() { return s_backtrack; }
 
@@ -200,6 +217,7 @@ public:
         Camera::Invalidate();       // overlays stop drawing stale geometry
         CombatState::Reset();       // swing history from the last server is meaningless
         Rotation::ResetVelocity();  // or the arm keeps drifting in the next game
+        MouseControl::Shutdown();   // the next world re-resolves and re-grabs
 
         if (env) {
             KeyBinds::ReleaseAll(env);
@@ -240,6 +258,13 @@ public:
         CombatState::Update(env);
         if (env->ExceptionCheck()) { env->ExceptionDescribe(); env->ExceptionClear(); }
 
+        // ---- Cursor ----
+        // The menu is useless without this. A grabbed mouse is
+        // pinned to the centre of the window and its movement is fed
+        // to the camera, so the pointer can never reach a control.
+        MouseControl::Apply(env, s_menuOpen.load());
+        if (env->ExceptionCheck()) { env->ExceptionDescribe(); env->ExceptionClear(); }
+
         // ---- Work handed over by the UI ----
         {
             std::vector<std::function<void(JNIEnv*)>> pending;
@@ -254,14 +279,17 @@ public:
         }
 
         // ---- Keybinds, only while the game window is focused ----
+        // Module hotkeys are suppressed while the menu is open, or
+        // typing near a bound letter toggles things behind the UI.
         bool focused = (s_gameWindow == nullptr)
                     || (GetForegroundWindow() == s_gameWindow);
+        bool hotkeys = focused && !s_menuOpen.load();
 
         for (auto& mod : s_modules) {
             int key = mod->GetKeybind();
             if (key <= 0 || key > 255) continue;
 
-            bool pressed = focused && ((GetAsyncKeyState(key) & 0x8000) != 0);
+            bool pressed = hotkeys && ((GetAsyncKeyState(key) & 0x8000) != 0);
             if (pressed && !s_keyStates[key]) mod->Toggle(env);
             s_keyStates[key] = pressed;
         }
@@ -309,6 +337,11 @@ public:
         Rotation::ResetVelocity();
 
         if (env) {
+            // Never eject with the cursor loose: the player would be
+            // left unable to look around.
+            MouseControl::ForceRestore(env);
+            if (env->ExceptionCheck()) env->ExceptionClear();
+
             // Disable everything so modules release the keybinds they
             // took over instead of leaving keys stuck down.
             for (auto& mod : s_modules)
@@ -319,6 +352,7 @@ public:
             KeyBinds::ReleaseAll(env);
             KeyBinds::ClearClickQueue(env);
         }
+        MouseControl::Shutdown();
         {
             std::lock_guard<std::mutex> lock(s_actionMutex);
             s_actions.clear();
