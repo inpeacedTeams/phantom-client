@@ -15,6 +15,7 @@
 #include "../mc/mouse_control.h"
 #include "../input/click_scheduler.h"
 #include "../input/key_capture.h"
+#include "../input/focus.h"
 #include "../render/camera.h"
 #include "../gui/notifications.h"
 
@@ -318,11 +319,8 @@ private:
         // once when the menu closes.
         if (Minecraft::IsInGui(env)) return;
 
-        int done = 0;
-        if (left  > 0) done += KeyBinds::QueueAttack(env, left);
-        if (right > 0) done += KeyBinds::QueueUse(env, right);
-
-        if (done > 0 && s_autoClicker) s_autoClicker->NoteDelivered(done);
+        if (left  > 0) KeyBinds::QueueAttack(env, left);
+        if (right > 0) KeyBinds::QueueUse(env, right);
     }
 
 public:
@@ -363,6 +361,10 @@ public:
     static void SetGameWindow(HWND hwnd) {
         s_gameWindow = hwnd;
         ClickScheduler::SetWindow(hwnd);
+        // Publish to the shared Focus helper too, so modules can ask
+        // "does the game have focus" without each keeping their own
+        // handle or skipping the check.
+        Focus::SetWindow(hwnd);
     }
 
     // Called from the window thread when INSERT is pressed. Does no

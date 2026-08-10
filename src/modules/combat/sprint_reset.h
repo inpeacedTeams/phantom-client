@@ -3,6 +3,7 @@
 #include "../../mc/minecraft.h"
 #include "../../mc/keybinds.h"
 #include "../../mc/combat_state.h"
+#include "../../input/focus.h"
 #include "../../jni/class_resolver.h"
 #include "../../jni/jvmti_util.h"
 #include <Windows.h>
@@ -299,7 +300,11 @@ public:
         // branch that uses it. Updating it lazily meant switching
         // trigger modes with the button already held read as a fresh
         // press and fired one reset for free.
-        bool lmb = (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0;
+        //
+        // Focus::KeyHeld rather than a bare GetAsyncKeyState: the
+        // latter is global, so a click in another window while
+        // alt-tabbed produced a rising edge and a phantom reset.
+        bool lmb = Focus::KeyHeld(VK_LBUTTON);
         bool lmbEdge = lmb && !m_lastLMB;
         m_lastLMB = lmb;
 

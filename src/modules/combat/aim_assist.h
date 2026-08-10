@@ -4,6 +4,7 @@
 #include "../../mc/entity_list.h"
 #include "../../mc/combat_state.h"
 #include "../../mc/rotation.h"
+#include "../../input/focus.h"
 #include "../../jni/class_resolver.h"
 #include "../../jni/jvmti_util.h"
 #include <Windows.h>
@@ -304,10 +305,12 @@ public:
 
         RefreshSensitivity(env);
 
-        // Only help while actually fighting.
+        // Only help while actually fighting. The holding check goes
+        // through Focus so a click in another window while alt-tabbed
+        // does not keep the module live.
         if (m_requireSwing) {
             bool swinging = CombatState::TicksSinceSwing() <= m_swingWindow;
-            bool holding  = (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0;
+            bool holding  = Focus::KeyHeld(VK_LBUTTON);
             if (!swinging && !holding) {
                 Rotation::ResetVelocity();
                 m_targetId = -1;

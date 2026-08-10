@@ -4,6 +4,7 @@
 #include "../../mc/entity_list.h"
 #include "../../mc/combat_state.h"
 #include "../../mc/rotation.h"
+#include "../../input/focus.h"
 #include "../../jni/class_resolver.h"
 #include "../../jni/jvmti_util.h"
 #include "../../util/log.h"
@@ -298,7 +299,10 @@ public:
 
         if (m_minCPS > m_maxCPS) m_minCPS = m_maxCPS;
 
-        if (m_requireClick && !(GetAsyncKeyState(VK_LBUTTON) & 0x8000)) {
+        // Focus::KeyHeld, not a bare GetAsyncKeyState: the latter is
+        // global and would let a click in another app while
+        // alt-tabbed count as holding the button.
+        if (m_requireClick && !Focus::KeyHeld(VK_LBUTTON)) {
             m_why = "not holding";
             return;
         }

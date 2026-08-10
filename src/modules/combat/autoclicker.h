@@ -59,7 +59,6 @@ private:
     int   m_floorMs      = 22;
 
     // ---- Readout ----
-    int  m_delivered = 0;
     const char* m_why = "idle";
     mutable char m_status[48] = {};
     mutable char m_notice[160] = {};
@@ -169,7 +168,6 @@ public:
         ClickScheduler::SetArmed(false);
         ClickScheduler::ClearPending();
         if (env) KeyBinds::ClearClickQueue(env);
-        m_delivered = 0;
         m_why = "waiting for the button";
     }
 
@@ -225,8 +223,6 @@ public:
             snprintf(m_status, sizeof(m_status), "%s", m_why);
         }
     }
-
-    void NoteDelivered(int n) { m_delivered += n; }
 
     const char* StatusLine() const override {
         return m_status[0] ? m_status : nullptr;
