@@ -10,6 +10,7 @@
 #include "ios_widgets.h"
 #include "ios_hud.h"
 #include "../mc/mouse_control.h"
+#include "../input/key_capture.h"
 #include "../modules/module_manager.h"
 #include "../render/backtrack_vis.h"
 #include "../config/profiles.h"
@@ -25,23 +26,33 @@
 // on the client thread where a valid JNIEnv exists.
 //
 // MOTION
-// Three things move, and all of them are frame-rate independent:
+// Everything that moves is a function of elapsed time, never of
+// frame count, so it looks the same at 60 and at 400 FPS:
 //
 //   the sheet    fades and lifts into place on open
 //   the rows     arrive staggered when a tab changes, which is what
 //                makes switching feel like a screen transition
 //                rather than a redraw
-//   the switches ease, and their row's accent dot brightens with
-//                the module
+//   the switches ease, and the row's accent dot gains a halo
+//   the chips    pulse while they are waiting for a key
 //
 // Nothing bounces or spins. The point is to make state changes
 // legible, not decorative.
 //
+// KEYBIND PICKER
+// The chip on each row is a button. Click it and the client listens
+// for the next key through KeyCapture, which reads real window
+// messages rather than scanning 256 virtual keys and guessing.
+// While a capture is live, module hotkeys are suppressed, so
+// binding R does not also toggle whatever R was bound to.
+//
+//   ESC        cancel, keep the old bind
+//   BACKSPACE  clear the bind
+//
 // TWO LEVELS OF SETTINGS
 // A module's panel shows its mode and the two or three values worth
 // touching. Everything else is behind Advanced. The full set is
-// still bound, so profiles reach all of it; it just is not in your
-// face when you open a module to flip one switch.
+// still bound, so profiles reach all of it.
 //
 // OPTIMISTIC SWITCHES
 // Because a toggle is queued, IsEnabled() still reads the old value
@@ -63,6 +74,10 @@ private:
     inline static std::unordered_map<std::string, bool> s_expanded;
     inline static std::unordered_map<std::string, bool> s_advanced;
 
+    // Which module is currently waiting for a key. Empty means none.
+    inline static std::string s_binding;
+    inline static float s_bindClock = 0.0f;
+
     static constexpr int kTabCount = 6;
     inline static const char* s_tabNames[kTabCount] = {
         "Combat", "Move", "Visual", "Player", "Misc", "Config"
@@ -83,16 +98,6 @@ private:
             case ModuleCategory::PLAYER:   return iOS::Col::Green;
             default:                       return iOS::Col::Orange;
         }
-    }
-
-    static void KeyLabel(int key, char* out, size_t n) {
-        if (key >= 'A' && key <= 'Z')  snprintf(out, n, "%c", (char)key);
-        else if (key == VK_CONTROL)    snprintf(out, n, "CTRL");
-        else if (key == VK_SHIFT)      snprintf(out, n, "SHIFT");
-        else if (key == VK_MENU)       snprintf(out, n, "ALT");
-        else if (key == VK_INSERT)     snprintf(out, n, "INS");
-        else if (key > 0)              snprintf(out, n, "0x%X", key);
-        else                           out[0] = '\0';
     }
 
     static float Clamp01(float v) {
@@ -123,6 +128,140 @@ private:
             return mod->IsEnabled();
         }
         return it->second;
+    }
+
+    // ---------------------------------------------------------
+    // Keybind chip
+    // ---------------------------------------------------------
+    // Draws the chip and handles the click. Returns the width it
+    // used, so the caller knows where the rest of the row ends.
+    //
+    // Submitted AFTER the row's expand button so it wins the hover
+    // test: in ImGui the later item claims the hovered id, which is
+    // exactly the layering we want here.
+    // ---------------------------------------------------------
+    static float KeybindChip(const std::shared_ptr<Module>& mod,
+                             ImVec2 rightEdge, float cy, float entry)
+    {
+        const std::string& name = mod->GetName();
+        bool capturing = (s_binding == name);
+
+        char label[40];
+        if (capturing) {
+            snprintf(label, sizeof(label), "Press a key...");
+        } else {
+            int key = mod->GetKeybind();
+            if (key > 0) KeyCapture::Label(key, label, sizeof(label));
+            else         snprintf(label, sizeof(label), "+");
+        }
+
+        iOS::Fonts::Push(iOS::Fonts::Caption);
+        ImVec2 ts = ImGui::CalcTextSize(label);
+        iOS::Fonts::Pop(iOS::Fonts::Caption);
+
+        float bw = ts.x + 16.0f;
+        if (bw < 30.0f) bw = 30.0f;
+        float bh = 21.0f;
+
+        ImVec2 a(rightEdge.x - bw, cy - bh * 0.5f);
+        ImVec2 b(rightEdge.x, cy + bh * 0.5f);
+
+        ImGui::SetCursorScreenPos(a);
+        ImGui::InvisibleButton("##bind", ImVec2(bw, bh));
+
+        bool hovered = ImGui::IsItemHovered();
+        bool clicked = ImGui::IsItemClicked();
+
+        if (clicked) {
+            if (capturing) {
+                KeyCapture::Cancel();
+                s_binding.clear();
+            } else {
+                KeyCapture::Begin();
+                s_binding = name;
+                s_bindClock = 0.0f;
+            }
+        }
+
+        float hov = iOS::Anim::To(ImGui::GetID("##bindh"),
+                                  hovered ? 1.0f : 0.0f, 18.0f);
+
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+
+        ImU32 bg, fg;
+        if (capturing) {
+            // Breathing highlight. A static "waiting" state reads as
+            // a stuck UI; a slow pulse reads as listening.
+            float pulse = 0.5f + 0.5f * std::sin(s_bindClock * 6.0f);
+            bg = iOS::Col::Alpha(iOS::Col::Blue, (0.16f + 0.16f * pulse) * entry);
+            fg = iOS::Col::Alpha(iOS::Col::Blue, entry);
+            dl->AddRect(a, b, iOS::Col::Alpha(iOS::Col::Blue,
+                        (0.35f + 0.35f * pulse) * entry), 6.0f, 0, 1.2f);
+        } else if (mod->GetKeybind() > 0) {
+            bg = iOS::Col::Alpha(
+                iOS::Col::Mix(iOS::Col::Fill, iOS::Col::BlueSoft, hov), entry);
+            fg = iOS::Col::Alpha(
+                iOS::Col::Mix(iOS::Col::Label2, iOS::Col::Blue, hov), entry);
+        } else {
+            // Unbound: nearly invisible until you go looking for it
+            bg = iOS::Col::Alpha(iOS::Col::Fill, (0.35f + 0.65f * hov) * entry);
+            fg = iOS::Col::Alpha(
+                iOS::Col::Mix(iOS::Col::Label3, iOS::Col::Blue, hov), entry);
+        }
+
+        dl->AddRectFilled(a, b, bg, 6.0f);
+
+        iOS::Fonts::Push(iOS::Fonts::Caption);
+        dl->AddText(ImVec2(a.x + (bw - ts.x) * 0.5f, cy - ts.y * 0.5f), fg, label);
+        iOS::Fonts::Pop(iOS::Fonts::Caption);
+
+        if (hovered && !capturing) {
+            ImGui::SetTooltip(mod->GetKeybind() > 0
+                ? "Click to rebind. Backspace clears, Escape cancels."
+                : "Click to set a key.");
+        }
+
+        return bw;
+    }
+
+    // Consume whatever the capture produced. Runs once per frame,
+    // outside the row loop, because the module list may be rebuilt
+    // between frames and the result has to survive that.
+    static void PollBinding(float dt) {
+        if (s_binding.empty()) return;
+        s_bindClock += dt;
+
+        int key = 0;
+        KeyCapture::Result r = KeyCapture::Poll(&key);
+        if (r == KeyCapture::None) {
+            // The capture can also be cancelled from the window
+            // procedure, for instance when focus is lost.
+            if (!KeyCapture::IsActive()) s_binding.clear();
+            return;
+        }
+
+        std::string target = s_binding;
+        s_binding.clear();
+
+        if (r == KeyCapture::Cancelled) return;
+
+        int newKey = (r == KeyCapture::Cleared) ? 0 : key;
+
+        // The bind is read on the client thread every tick, so it is
+        // set there rather than written from under it.
+        ModuleManager::QueueAction([target, newKey](JNIEnv*) {
+            for (auto& m : ModuleManager::GetModules()) {
+                if (m->GetName() != target) continue;
+                // Two modules on one key means one toggle fires both.
+                if (newKey > 0) {
+                    for (auto& other : ModuleManager::GetModules())
+                        if (other != m && other->GetKeybind() == newKey)
+                            other->SetKeybind(0);
+                }
+                m->SetKeybind(newKey);
+                break;
+            }
+        });
     }
 
     // ---------------------------------------------------------
@@ -200,14 +339,15 @@ private:
         ImDrawList* dl = ImGui::GetWindowDrawList();
 
         ImU32 accent = CategoryColor(mod->GetCategory());
+        float cy = p.y + h * 0.5f;
 
-        // Everything left of the switch expands the row
+        // Everything left of the switch expands the row. Submitted
+        // first so the chip, submitted later, sits on top of it.
         float switchZone = iOS::M::SwitchW + iOS::M::RowPadX * 2.0f;
         ImGui::InvisibleButton("##expand", ImVec2(w - switchZone, h));
         bool expandClicked = ImGui::IsItemClicked();
         bool expandHeld    = ImGui::IsItemActive();
         bool expandHover   = ImGui::IsItemHovered();
-        if (expandClicked) expanded = !expanded;
 
         // Hover is a whisper, press is a proper flash
         float hovT = iOS::Anim::To(ImGui::GetID("##rh"),
@@ -223,7 +363,6 @@ private:
         // Category dot brightens with the module
         float onT = iOS::Anim::To(ImGui::GetID("##dot"), on ? 1.0f : 0.0f, 14.0f);
         float dotX = p.x + iOS::M::RowPadX + 4.0f;
-        float cy = p.y + h * 0.5f;
 
         // A soft halo while it is on, so an active module reads from
         // across the panel without shouting
@@ -255,6 +394,10 @@ private:
                         iOS::Col::Alpha(iOS::Col::Label, entry), name.c_str());
         }
 
+        // ---- Keybind chip ----
+        float chipRight = p.x + w - switchZone - 22.0f;
+        float chipW = KeybindChip(mod, ImVec2(chipRight, cy), cy, entry);
+
         // Chevron rotates as the row opens
         float openT = iOS::Anim::To(ImGui::GetID("##ch"), expanded ? 1.0f : 0.0f, 16.0f);
         {
@@ -269,27 +412,14 @@ private:
             dl->AddLine(rot(-2.5f, -4.5f), rot(2.0f, 0.0f), c, 1.8f);
             dl->AddLine(rot(2.0f, 0.0f), rot(-2.5f, 4.5f), c, 1.8f);
         }
+        (void)chipW;
 
-        // Keybind chip
-        int key = mod->GetKeybind();
-        if (key > 0) {
-            char kb[16];
-            KeyLabel(key, kb, sizeof(kb));
-            if (kb[0]) {
-                iOS::Fonts::Push(iOS::Fonts::Caption);
-                ImVec2 bs = ImGui::CalcTextSize(kb);
-                float bw = bs.x + 12.0f;
-                float bx = p.x + w - switchZone - 24.0f - bw;
-                float by = cy - 10.0f;
-                dl->AddRectFilled(ImVec2(bx, by), ImVec2(bx + bw, by + 20.0f),
-                                  iOS::Col::Alpha(iOS::Col::Fill, entry), 6.0f);
-                dl->AddText(ImVec2(bx + 6.0f, by + (20.0f - bs.y) * 0.5f),
-                            iOS::Col::Alpha(iOS::Col::Label2, entry), kb);
-                iOS::Fonts::Pop(iOS::Fonts::Caption);
-            }
-        }
+        // The row only expands if the click was not on the chip.
+        // ImGui gives the later item the hover, so this is just a
+        // matter of asking after both have been submitted.
+        if (expandClicked && s_binding != name) expanded = !expanded;
 
-        // Switch
+        // ---- Switch ----
         ImGui::SetCursorScreenPos(ImVec2(p.x + w - iOS::M::SwitchW - iOS::M::RowPadX,
                                          cy - iOS::M::SwitchH * 0.5f));
         bool before = on;
@@ -422,7 +552,7 @@ private:
 
         iOS::SectionHeader("About");
         iOS::BeginCard();
-        iOS::ValueRow("Version", "2.5.0");
+        iOS::ValueRow("Version", "2.6.0");
         iOS::RowSeparator();
         iOS::ValueRow("Target", "Lunar 1.8.9");
         iOS::RowSeparator();
@@ -436,7 +566,8 @@ private:
             MouseControl::IsUsable() ? "Released by the game" : "Software fallback");
         iOS::EndCard();
 
-        iOS::Footnote("INSERT opens this menu, ESC closes it. DELETE ejects.");
+        iOS::Footnote("Click any key chip to rebind it. INSERT opens this menu, "
+                      "ESC closes it, DELETE ejects.");
         ImGui::Dummy(ImVec2(0, 10));
     }
 
@@ -503,7 +634,20 @@ public:
     // Called every frame. Owns its fade, so closing is a dissolve
     // rather than a cut.
     static void Render(bool open) {
+        float dt = ImGui::GetIO().DeltaTime;
+        if (dt > 0.1f) dt = 0.1f;
+
+        // A capture must resolve even if the menu is closing, or the
+        // client is left listening for a key nobody is going to press.
+        PollBinding(dt);
+
         s_fade = iOS::Anim::ToStr("menuFade", open ? 1.0f : 0.0f, 16.0f);
+
+        if (!open && !s_binding.empty()) {
+            KeyCapture::Cancel();
+            s_binding.clear();
+        }
+
         if (s_fade < 0.004f) {
             s_tabAge = 0.0f;      // next open replays the entry
             s_lastTab = -1;
@@ -511,8 +655,6 @@ public:
         }
 
         // Tab transition clock. Reset on a change, then run forward.
-        float dt = ImGui::GetIO().DeltaTime;
-        if (dt > 0.1f) dt = 0.1f;
         if (s_tab != s_lastTab) {
             s_lastTab = s_tab;
             s_tabAge = 0.0f;
