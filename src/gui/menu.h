@@ -11,6 +11,7 @@
 
 #include "ios_theme.h"
 #include "ios_widgets.h"
+#include "settings_view.h"
 #include "ios_hud.h"
 #include "config_panel.h"
 #include "notifications.h"
@@ -30,9 +31,10 @@
 // on the client thread where a valid JNIEnv exists.
 //
 // WHAT THIS FILE OWNS
-// The shell, the module list and the key picker. Configs live in
-// ConfigPanel and the HUD owns its own settings, because a class
-// that draws everything is a class nobody wants to open.
+// The shell, the module list and the key picker. The contents of an
+// open module are drawn by settings_view, configs by ConfigPanel,
+// and the HUD by ios_hud. A class that draws everything is a class
+// nobody wants to open.
 //
 // MOTION
 // Everything that moves is a function of elapsed time, never of
@@ -172,9 +174,15 @@ private:
 
     static bool Matches(const std::shared_ptr<Module>& m, const char* q) {
         if (!q || !q[0]) return true;
-        return Contains(m->GetName(), q)
-            || Contains(m->GetDescription(), q)
-            || Contains(CategoryName(m->GetCategory()), q);
+        if (Contains(m->GetName(), q)) return true;
+        if (Contains(m->GetDescription(), q)) return true;
+        if (Contains(CategoryName(m->GetCategory()), q)) return true;
+
+        // Settings are searchable too, so "fov" finds Aim Assist even
+        // though the word appears nowhere on the module itself.
+        for (auto& s : m->GetSettings())
+            if (Contains(s.name, q)) return true;
+        return false;
     }
 
     // The pending value if a toggle is in flight, else the real one
@@ -234,6 +242,12 @@ private:
                 s_binding = name;
                 s_bindClock = 0.0f;
             }
+        }
+
+        // Unbound chips are almost invisible, so the one hint that
+        // they are clickable has to come from the pointer.
+        if (hovered) {
+            ImGui::SetTooltip(key > 0 ? "Click to rebind" : "Click to set a key");
         }
 
         float hov = iOS::Anim::To(ImGui::GetID("##bindh"),
@@ -497,7 +511,7 @@ private:
         ImGui::SetCursorScreenPos(ImVec2(p.x, p.y + h));
 
         if (iOS::BeginCollapsible("advbody", open)) {
-            mod->RenderAdvanced();
+            iOS::RenderModuleAdvanced(*mod);
             ImGui::Dummy(ImVec2(0, 4));
             iOS::EndCollapsible();
         }
@@ -648,8 +662,6 @@ private:
         // EndCollapsible only balances a Begin that returned true.
         if (iOS::BeginCollapsible("body", expanded)) {
             ImGui::Indent(iOS::M::RowPadX);
-            ImGui::PushItemWidth(ImGui::GetContentRegionAvail().x
-                                 - iOS::M::RowPadX - 56.0f);
 
             const std::string& desc = mod->GetDescription();
             if (!desc.empty()) {
@@ -664,10 +676,9 @@ private:
                 ImGui::Dummy(ImVec2(0, 4));
             }
 
-            mod->RenderSettings();
+            iOS::RenderModuleSettings(*mod);
             AdvancedBlock(mod);
 
-            ImGui::PopItemWidth();
             ImGui::Unindent(iOS::M::RowPadX);
             ImGui::Dummy(ImVec2(0, 6));
 
@@ -731,8 +742,9 @@ private:
 
         if (hits.empty()) {
             EmptyState("Nothing matches that");
-            iOS::Footnote("Search looks at the name, the description and the "
-                          "category, so \"knockback\" finds Velocity.");
+            iOS::Footnote("Search looks at the name, the description, the "
+                          "category and every setting, so \"knockback\" finds "
+                          "Velocity and \"fov\" finds Aim Assist.");
             return;
         }
 
@@ -869,11 +881,17 @@ private:
             "fixed-function backend so it cannot disturb the game's GL state. "
             "Faking it with stacked quads costs frames and looks like a smear.");
 
+        // ---- HUD ----
+        // These settings existed for weeks with no screen that showed
+        // them, which is the same as not existing.
+        iOS::HUD::RenderSettings();
+
         ImGui::Dummy(ImVec2(0, 6));
         if (iOS::Button("Reset Interface",
                         ImGui::GetContentRegionAvail().x - iOS::M::RowPadX,
                         iOS::Col::Label2, false)) {
             UI::Reset();
+            iOS::HUD::Reset();
             iOS::Notify::Info("Interface reset", "Back to the default look.");
         }
         ImGui::Dummy(ImVec2(0, 10));
@@ -985,6 +1003,7 @@ public:
             s_hoverFade = 0.0f;
             s_search[0] = '\0';
             iOS::ConfigPanel::Reset();
+            iOS::HUD::SetEditing(false);
             RenderBindOverlay();   // the confirmation may still be fading
             return;
         }
@@ -1009,6 +1028,11 @@ public:
             s_tabAge += dt;
         }
 
+        // Leaving the UI tab puts the HUD back to normal, so the
+        // editor can never be left on with no way to see why the
+        // corner is full of drag handles.
+        if (s_tab != TAB_UI || s_search[0]) iOS::HUD::SetEditing(false);
+
         // Nothing hovered this frame until a row claims it
         std::string prevHover = s_hoverName;
         s_hoverName.clear();
@@ -1031,8 +1055,9 @@ public:
 
         // Mid-fade the menu is on its way out: visible but not
         // clickable, or a stray click lands on a ghost. The bind
-        // overlay locks it for the same reason.
-        if (!open || !s_binding.empty()) flags |= ImGuiWindowFlags_NoInputs;
+        // overlay and the HUD editor lock it for the same reason.
+        if (!open || !s_binding.empty() || iOS::HUD::IsDragging())
+            flags |= ImGuiWindowFlags_NoInputs;
 
         if (ImGui::Begin("##phantom", nullptr, flags)) {
             float width = ImGui::GetWindowWidth();
@@ -1064,14 +1089,12 @@ public:
                 ImGui::Dummy(ImVec2(0, (1.0f - EaseOut(s_fade)) * 14.0f));
 
             ImGui::Indent(16.0f);
-            ImGui::PushItemWidth(ImGui::GetContentRegionAvail().x - 32.0f);
 
             if (s_search[0])            RenderSearch();
             else if (s_tab == TAB_UI)     RenderInterface();
             else if (s_tab == TAB_CONFIG) iOS::ConfigPanel::Render();
             else                          RenderTab(s_tab);
 
-            ImGui::PopItemWidth();
             ImGui::Unindent(16.0f);
             ImGui::Dummy(ImVec2(0, 12));
             ImGui::EndChild();
