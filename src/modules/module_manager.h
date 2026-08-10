@@ -46,6 +46,10 @@
 // calls JNI. Anything the UI wants to do that needs a JNIEnv is
 // pushed onto the action queue and executed here instead.
 //
+// The click timer runs on a third thread. It never touches JNI or
+// module state either: it only increments a counter, which this
+// tick drains and hands to the game.
+//
 // Every tick runs inside a JNI local frame. Without it the local
 // reference table fills up within seconds and the JVM aborts.
 //
@@ -58,6 +62,8 @@
 //   4. CombatState, so every module reads the same facts about this
 //      tick rather than each deriving its own from the mouse.
 //   5. UI actions, keybinds, then the modules themselves.
+//   6. Queued clicks are handed to the game LAST, so a click fired
+//      by a module this tick goes out on this tick.
 //
 // KEY SAFETY
 // Modules hold real keybinds down. If the world goes away or we
@@ -76,12 +82,40 @@ private:
     inline static HWND s_gameWindow = nullptr;
     inline static std::shared_ptr<ESP> s_esp;
     inline static std::shared_ptr<Backtrack> s_backtrack;
+    inline static std::shared_ptr<ClickAssist> s_clickAssist;
     inline static bool s_wasInGame = false;
 
     // A packed lobby can hold 60+ players, and the entity scan takes
     // a couple of refs each on top of whatever the modules allocate.
     // 256 was close enough to the edge to matter.
     static constexpr jint kLocalFrameSize = 768;
+
+    // -------------------------------------------------------------
+    // Hand the game whatever the click timer produced.
+    //
+    // This is the only place clicks reach Minecraft. Writing to
+    // KeyBinding.pressTime makes runTick call clickMouse() exactly
+    // that many times, which is the same path a physical click
+    // takes, so the swing and the attack packet are identical.
+    // -------------------------------------------------------------
+    static void DispatchClicks(JNIEnv* env) {
+        if (!KeyBinds::HasClickQueue()) return;
+
+        int left  = ClickScheduler::DrainLeft();
+        int right = ClickScheduler::DrainRight();
+        if (left <= 0 && right <= 0) return;
+
+        // A screen is open: runTick stops consuming pressTime, so
+        // anything written now would sit there and then fire all at
+        // once when the menu closes.
+        if (Minecraft::IsInGui(env)) return;
+
+        int done = 0;
+        if (left  > 0) done += KeyBinds::QueueAttack(env, left);
+        if (right > 0) done += KeyBinds::QueueUse(env, right);
+
+        if (done > 0 && s_clickAssist) s_clickAssist->NoteDelivered(done);
+    }
 
 public:
     static void Init() {
@@ -95,7 +129,9 @@ public:
         s_backtrack = std::make_shared<Backtrack>();
         s_modules.push_back(s_backtrack);
 
-        s_modules.push_back(std::make_shared<ClickAssist>());
+        s_clickAssist = std::make_shared<ClickAssist>();
+        s_modules.push_back(s_clickAssist);
+
         s_modules.push_back(std::make_shared<KillAura>());
 
         // Movement
@@ -110,7 +146,7 @@ public:
         s_modules.push_back(s_esp);
         s_modules.push_back(std::make_shared<Fullbright>());
 
-        // Click emission runs on its own 1ms-resolution thread; the
+        // Click timing runs on its own 1ms-resolution thread; the
         // 20 TPS loop cannot express a 27ms gap.
         ClickScheduler::Start();
     }
@@ -152,11 +188,15 @@ public:
         s_wasInGame = false;
 
         ClickScheduler::SetActive(false);
+        ClickScheduler::ClearPending();
         Camera::Invalidate();       // overlays stop drawing stale geometry
         CombatState::Reset();       // swing history from the last server is meaningless
         Rotation::ResetVelocity();  // or the arm keeps drifting in the next game
 
-        if (env) KeyBinds::ReleaseAll(env);
+        if (env) {
+            KeyBinds::ReleaseAll(env);
+            KeyBinds::ClearClickQueue(env);
+        }
     }
 
     static void Tick(JNIEnv* env) {
@@ -228,14 +268,18 @@ public:
             }
         }
 
+        // ---- Clicks, last, so this tick's requests go out now ----
+        DispatchClicks(env);
+        if (env->ExceptionCheck()) { env->ExceptionDescribe(); env->ExceptionClear(); }
+
         // Drops every entity ref the cache was holding
         EntityList::BeginTick();
         env->PopLocalFrame(nullptr);
     }
 
     static void Shutdown(JNIEnv* env) {
-        // Stop the click thread before the modules go away: its
-        // callback captures a module pointer.
+        // Stop the click thread first so nothing is queued while the
+        // modules are being torn down.
         ClickScheduler::Stop();
         Camera::Invalidate();
         CombatState::Reset();
@@ -250,6 +294,7 @@ public:
             // Backstop: a module that threw during OnDisable would
             // still have left something held.
             KeyBinds::ReleaseAll(env);
+            KeyBinds::ClearClickQueue(env);
         }
         {
             std::lock_guard<std::mutex> lock(s_actionMutex);
@@ -257,6 +302,7 @@ public:
         }
         s_backtrack.reset();
         s_esp.reset();
+        s_clickAssist.reset();
         s_modules.clear();
     }
 
