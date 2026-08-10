@@ -50,6 +50,10 @@
 //     keyCode >= 0  ->  Keyboard.isKeyDown(keyCode)
 //     keyCode <  0  ->  Mouse.isButtonDown(keyCode + 100)
 //
+// The keycode is read fresh on every query rather than cached at
+// inject time: rebinding a key in the options menu changes it, and
+// a cached value would have us polling whatever W used to be.
+//
 // If LWJGL cannot be resolved we fall back to the value we saved
 // when the override began, which is right in the common case.
 //
@@ -83,9 +87,6 @@ private:
         bool overridden = false;     // we are driving this key
         bool value = false;          // what we forced it to
         bool saved = false;          // what it was before we touched it
-
-        jint keyCode = 0;
-        bool haveKeyCode = false;
     };
 
     inline static Bind s_forward, s_back, s_left, s_right;
@@ -164,23 +165,31 @@ private:
 
     // Is this key physically down right now? Returns false if we
     // have no way to find out, so the caller keeps its saved value.
+    //
+    // The keycode is read live. Caching it at inject time meant that
+    // rebinding forward in the options menu left us polling the old
+    // key forever, and every restore would then write whatever that
+    // dead key happened to be doing.
     static bool PhysicalState(JNIEnv* env, Bind& b, bool* out) {
-        if (!b.haveKeyCode) return false;
+        if (!b.obj || !s_fKeyCode) return false;
 
-        if (b.keyCode < 0) {
+        jint code = env->GetIntField(b.obj, s_fKeyCode);
+
+        if (code < 0) {
+            // LWJGL convention: negative means a mouse button,
+            // offset by 100.
             if (!s_isButtonDown) return false;
             jboolean v = env->CallStaticBooleanMethod(
-                s_mouseClass, s_isButtonDown, (jint)(b.keyCode + 100));
+                s_mouseClass, s_isButtonDown, (jint)(code + 100));
             if (env->ExceptionCheck()) { env->ExceptionClear(); return false; }
             *out = (v != 0);
             return true;
         }
 
-        if (b.keyCode == 0) return false;   // unbound
+        if (code == 0) return false;   // unbound
         if (!s_isKeyDown) return false;
 
-        jboolean v = env->CallStaticBooleanMethod(
-            s_keyboardClass, s_isKeyDown, b.keyCode);
+        jboolean v = env->CallStaticBooleanMethod(s_keyboardClass, s_isKeyDown, code);
         if (env->ExceptionCheck()) { env->ExceptionClear(); return false; }
         *out = (v != 0);
         return true;
@@ -216,11 +225,6 @@ private:
         }
         out.pressed = s_fPressed;
 
-        if (s_fKeyCode) {
-            out.keyCode = env->GetIntField(out.obj, s_fKeyCode);
-            out.haveKeyCode = true;
-        }
-
         env->DeleteLocalRef(kb);
     }
 
@@ -251,12 +255,13 @@ public:
             printf("[KeyBinds] resolved fwd=%p sneak=%p jump=%p use=%p attack=%p\n",
                 (void*)s_forward.obj, (void*)s_sneak.obj, (void*)s_jump.obj,
                 (void*)s_useItem.obj, (void*)s_attack.obj);
-            printf("[KeyBinds] pressed=%p pressTime=%p keyCode=%p (fwd key %d)\n",
-                (void*)s_fPressed, (void*)s_fPressTime, (void*)s_fKeyCode,
-                (int)s_forward.keyCode);
+            printf("[KeyBinds] pressed=%p pressTime=%p keyCode=%p\n",
+                (void*)s_fPressed, (void*)s_fPressTime, (void*)s_fKeyCode);
 
             if (!s_fPressTime)
                 printf("[KeyBinds] WARN: pressTime unresolved, native clicking is off\n");
+            if (!s_fKeyCode)
+                printf("[KeyBinds] WARN: keyCode unresolved, cannot poll the hardware\n");
         }
         return s_ready;
     }
@@ -274,7 +279,6 @@ public:
             all[i]->obj = nullptr;
             all[i]->pressed = nullptr;
             all[i]->overridden = false;
-            all[i]->haveKeyCode = false;
         }
 
         if (env) {
@@ -414,11 +418,22 @@ public:
 
     // What the player is physically doing, ignoring our overrides.
     // Modules that need to know whether the human is still holding
-    // W should ask this, not GetForward.
-    static bool PhysForward(JNIEnv* e) {
+    // a key should ask these, not the Get* pair.
+    static bool Phys(JNIEnv* e, Bind& b) {
         bool v = false;
-        if (PhysicalState(e, s_forward, &v)) return v;
-        return s_forward.overridden ? s_forward.saved : Get(e, s_forward);
+        if (PhysicalState(e, b, &v)) return v;
+        return b.overridden ? b.saved : Get(e, b);
+    }
+
+    static bool PhysForward(JNIEnv* e) { return Phys(e, s_forward); }
+    static bool PhysBack(JNIEnv* e)    { return Phys(e, s_back); }
+    static bool PhysLeft(JNIEnv* e)    { return Phys(e, s_left); }
+    static bool PhysRight(JNIEnv* e)   { return Phys(e, s_right); }
+    static bool PhysSneak(JNIEnv* e)   { return Phys(e, s_sneak); }
+    static bool PhysJump(JNIEnv* e)    { return Phys(e, s_jump); }
+
+    static bool PhysMoving(JNIEnv* e) {
+        return PhysForward(e) || PhysBack(e) || PhysLeft(e) || PhysRight(e);
     }
 
     static void ReleaseForward(JNIEnv* e) { Release(e, s_forward); }
@@ -429,13 +444,14 @@ public:
     static void ReleaseSneak(JNIEnv* e)   { Release(e, s_sneak); }
     static void ReleaseSprint(JNIEnv* e)  { Release(e, s_sprint); }
     static void ReleaseUseItem(JNIEnv* e) { Release(e, s_useItem); }
+    static void ReleaseAttack(JNIEnv* e)  { Release(e, s_attack); }
 
     // ---- Availability ----
-    static bool HasMovement()    { return s_forward.obj && s_back.obj; }
-    static bool HasSneak()       { return s_sneak.obj != nullptr; }
-    static bool HasJump()        { return s_jump.obj != nullptr; }
-    static bool HasUseItem()     { return s_useItem.obj != nullptr; }
-    static bool HasSprint()      { return s_sprint.obj != nullptr; }
-    static bool HasAttack()      { return s_attack.obj != nullptr; }
-    static bool CanReadHardware(){ return s_isKeyDown != nullptr; }
+    static bool HasMovement()     { return s_forward.obj && s_back.obj; }
+    static bool HasSneak()        { return s_sneak.obj != nullptr; }
+    static bool HasJump()         { return s_jump.obj != nullptr; }
+    static bool HasUseItem()      { return s_useItem.obj != nullptr; }
+    static bool HasSprint()       { return s_sprint.obj != nullptr; }
+    static bool HasAttack()       { return s_attack.obj != nullptr; }
+    static bool CanReadHardware() { return s_isKeyDown != nullptr; }
 };
