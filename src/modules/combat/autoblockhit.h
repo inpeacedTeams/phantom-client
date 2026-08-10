@@ -6,8 +6,8 @@
 #include "../../mc/combat_state.h"
 #include "../../jni/class_resolver.h"
 #include "../../jni/jvmti_util.h"
+#include "../../util/log.h"
 #include <imgui.h>
-#include <Windows.h>
 #include <unordered_map>
 #include <deque>
 #include <string>
@@ -71,6 +71,13 @@
 // with a bow it starts drawing. Blocking with the wrong item is
 // worse than not blocking, so an unresolved item check disables the
 // module rather than guessing.
+//
+// WHY THERE IS AN OnReset
+// m_blocking is our belief about a key we do not own. A respawn or
+// a server change releases every key from underneath us, and a
+// module still believing it holds the block will never press it
+// again, because SetBlock only acts on a change. It looked exactly
+// like the module had died.
 // =================================================================
 
 class AutoBlockhit : public Module {
@@ -139,7 +146,6 @@ private:
     int  m_blockHeldTicks = 0;
     int  m_movingHeld     = 0;
     int  m_flagPause      = 0;
-    int  m_lastHurtTime   = 0;
     unsigned long long m_tick = 0;
 
     bool m_itemOk        = false;
@@ -156,6 +162,14 @@ private:
     int  m_speedSaves   = 0;
     const char* m_why   = "idle";
     char m_status[48]   = { 0 };
+
+    // ---- Tuning ----
+    static constexpr int kItemRecheckTicks = 5;   // 4x a second is plenty
+    static constexpr int kForgetTicks      = 60;
+    static constexpr int kCoverageWindow   = 400; // ticks before the ratio decays
+    static constexpr long long kMinSwingGapMs = 60;
+    static constexpr long long kMaxSwingGapMs = 1200;
+    static constexpr size_t kIntervalWindow = 8;
 
     // ---- JNI ----
     jfieldID  m_fInventory  = nullptr;
@@ -228,7 +242,7 @@ private:
         m_itemUsable = (m_fInventory != nullptr && m_mCurItem != nullptr);
         m_resolved = true;
 
-        printf("[AutoBlock] inv=%p item=%p swing=%p yaw=%p id=%p usable=%d\n",
+        PH_LOG("[AutoBlock] inv=%p item=%p swing=%p yaw=%p id=%p usable=%d",
             (void*)m_fInventory, (void*)m_mCurItem, (void*)m_fSwinging,
             (void*)m_fYaw, (void*)m_getEntityId, (int)m_itemUsable);
     }
@@ -331,6 +345,13 @@ private:
         if (!on) m_blockHeldTicks = 0;
     }
 
+    // Stand down and clear the collapsed-row readout, so a stale
+    // "blocking" does not sit in the menu after we have stopped.
+    void StandDown(JNIEnv* env, const char* why) {
+        SetBlock(env, false, why);
+        m_status[0] = '\0';
+    }
+
 public:
     AutoBlockhit()
         : Module("Auto Blockhit", "Blocks around the enemy's swing, not always",
@@ -368,28 +389,28 @@ public:
         Resolve(env);
 
         jobject player = Minecraft::GetPlayer(env);
-        if (!player) { SetBlock(env, false, "no player"); return; }
+        if (!player) { StandDown(env, "no player"); return; }
 
         m_tick++;
 
-        if (Minecraft::IsInGui(env)) { SetBlock(env, false, "menu"); return; }
+        if (Minecraft::IsInGui(env)) { StandDown(env, "menu"); return; }
 
         if (m_flagPause > 0) {
             m_flagPause--;
-            SetBlock(env, false, "flagged");
+            StandDown(env, "flagged");
             return;
         }
 
         // ---- What are we holding ----
         if (--m_itemTimer <= 0) {
             m_itemOk = CheckHeldItem(env, player);
-            m_itemTimer = 5;
+            m_itemTimer = kItemRecheckTicks;
         }
-        if (!m_itemOk) { SetBlock(env, false, "no sword"); return; }
+        if (!m_itemOk) { StandDown(env, "no sword"); return; }
 
         m_ticksTotal++;
         if (m_blocking) m_ticksBlocked++;
-        if (m_ticksTotal > 400) { m_ticksTotal /= 2; m_ticksBlocked /= 2; }
+        if (m_ticksTotal > kCoverageWindow) { m_ticksTotal /= 2; m_ticksBlocked /= 2; }
 
         // ---- Our own swing frees the key ----
         // Driven by the real swing rather than the mouse button, so
@@ -401,12 +422,11 @@ public:
         }
 
         // ---- Their hit landed, the block did its job ----
-        int hurt = Minecraft::GetHurtTime(env, player);
-        if (hurt > 0 && m_lastHurtTime == 0) {
+        // CombatState owns the hurtTime edge for the whole client.
+        if (CombatState::HitTakenThisTick()) {
             SetBlock(env, false, "hit passed");
             m_releaseLeft = m_afterHit;
         }
-        m_lastHurtTime = hurt;
 
         // =========================================================
         // Movement budget
@@ -432,7 +452,7 @@ public:
 
         if (m_neverWhileSprint && Minecraft::HasSprintCheck()
             && Minecraft::IsSprinting(env, player)) {
-            SetBlock(env, false, "sprinting");
+            StandDown(env, "sprinting");
             return;
         }
 
@@ -446,7 +466,7 @@ public:
         m_shownCycle = 0;
 
         if (ents.empty()) {
-            SetBlock(env, false, "nobody near");
+            StandDown(env, "nobody near");
             return;
         }
 
@@ -482,9 +502,10 @@ public:
             if (swinging && !en.wasSwinging) {
                 if (en.hasSwung) {
                     long long gap = MsSince(en.lastSwing);
-                    if (gap >= 60 && gap <= 1200) {
+                    if (gap >= kMinSwingGapMs && gap <= kMaxSwingGapMs) {
                         en.intervals.push_back(gap);
-                        if (en.intervals.size() > 8) en.intervals.pop_front();
+                        if (en.intervals.size() > kIntervalWindow)
+                            en.intervals.pop_front();
                         long long sum = 0;
                         for (auto v : en.intervals) sum += v;
                         en.avgInterval = sum / (long long)en.intervals.size();
@@ -525,7 +546,7 @@ public:
 
         // Forget anyone who walked away
         for (auto it = m_enemies.begin(); it != m_enemies.end(); ) {
-            if (m_tick - it->second.lastSeen > 60) it = m_enemies.erase(it);
+            if (m_tick - it->second.lastSeen > kForgetTicks) it = m_enemies.erase(it);
             else ++it;
         }
 
@@ -534,13 +555,13 @@ public:
         // ---- Still inside a forced release ----
         if (m_releaseLeft > 0) {
             m_releaseLeft--;
-            SetBlock(env, false, "recovering");
+            StandDown(env, "recovering");
             return;
         }
 
         // ---- No threat means no block, whatever the mode ----
         if (!anyThreat) {
-            SetBlock(env, false, m_tracked ? "no threat" : "nobody near");
+            StandDown(env, m_tracked ? "no threat" : "nobody near");
             return;
         }
 
@@ -612,6 +633,36 @@ public:
         m_enemies.clear();
         m_predictMs = -1;
         m_status[0] = '\0';
+    }
+
+    // -------------------------------------------------------------
+    // World change, respawn, reconnect.
+    //
+    // Two things are stale. Every swing rhythm belongs to players
+    // who are no longer here, and m_blocking describes a key that
+    // has already been released underneath us. The second one is
+    // the dangerous half: SetBlock is edge-triggered, so a module
+    // that still believes it is blocking will never press again.
+    // -------------------------------------------------------------
+    void OnReset(JNIEnv* env) override {
+        if (env) KeyBinds::ReleaseUseItem(env);
+        m_blocking       = false;
+        m_why            = "idle";
+        m_releaseLeft    = 0;
+        m_blockHeldTicks = 0;
+        m_movingHeld     = 0;
+        m_flagPause      = 0;
+        m_itemOk         = false;
+        m_itemTimer      = 0;   // re-read the hand on the very next tick
+        m_heldName.clear();
+        m_enemies.clear();
+        m_predictMs   = -1;
+        m_shownCycle  = 0;
+        m_threats     = 0;
+        m_tracked     = 0;
+        m_ticksBlocked = 0;
+        m_ticksTotal   = 0;
+        m_status[0]   = '\0';
     }
 
     void OnServerCorrection() {
