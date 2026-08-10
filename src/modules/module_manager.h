@@ -5,6 +5,7 @@
 #include <atomic>
 #include <string>
 #include <functional>
+#include <unordered_map>
 #include <Windows.h>
 #include "module.h"
 #include "../mc/keybinds.h"
@@ -15,6 +16,7 @@
 #include "../input/click_scheduler.h"
 #include "../input/key_capture.h"
 #include "../render/camera.h"
+#include "../gui/notifications.h"
 
 // Combat
 #include "combat/aim_assist.h"
@@ -84,6 +86,17 @@
 // and every tick ends with KeyBinds::Reconcile, which puts any key
 // we are no longer driving back in line with the hardware. Worst
 // case a key is wrong for one tick.
+//
+// FAULT ISOLATION
+// A module that throws used to have its stack trace printed to a
+// console behind the game, and then be called again next tick, and
+// the tick after that, forever. Twenty times a second of exception
+// handling is a visible frame cost and the user is told nothing.
+//
+// Faults are now counted per module. A few in a row means the
+// module is broken rather than unlucky, so it is switched off and
+// the user gets a notification saying which one and why. The rest
+// of the client keeps running.
 // =================================================================
 
 class ModuleManager {
@@ -100,6 +113,11 @@ private:
     inline static std::shared_ptr<AutoClicker> s_autoClicker;
     inline static bool s_wasInGame = false;
 
+    // Consecutive faults per module. Reset by a clean tick, because
+    // one bad frame during a world change is not a broken module.
+    inline static std::unordered_map<std::string, int> s_faults;
+    static constexpr int kFaultLimit = 5;
+
     // Written by the window thread, read here. The menu itself lives
     // on the render side; this is only how the client thread learns
     // that it should hand the cursor back to the player.
@@ -109,6 +127,72 @@ private:
     // a couple of refs each on top of whatever the modules allocate.
     // 256 was close enough to the edge to matter.
     static constexpr jint kLocalFrameSize = 768;
+
+    // -------------------------------------------------------------
+    // Swallow a pending Java exception and say whether there was one.
+    //
+    // ExceptionDescribe is deliberately not called: it writes a
+    // stack trace to a console the user cannot see, and it is slow
+    // enough to matter if something throws every tick.
+    // -------------------------------------------------------------
+    static bool ClearJavaException(JNIEnv* env) {
+        if (!env->ExceptionCheck()) return false;
+        env->ExceptionClear();
+        return true;
+    }
+
+    // -------------------------------------------------------------
+    // Run one module's tick with a net under it.
+    // -------------------------------------------------------------
+    static void RunModule(JNIEnv* env, const std::shared_ptr<Module>& mod) {
+        const std::string& name = mod->GetName();
+        bool faulted = false;
+        const char* reason = "threw an exception";
+
+        // A module reaching a bad JNI object throws C++ side; a
+        // module calling into Minecraft badly throws Java side. Both
+        // have to be caught or the client dies with the game.
+        try {
+            mod->OnTick(env);
+            if (ClearJavaException(env)) {
+                faulted = true;
+                reason = "a call into Minecraft failed";
+            }
+        } catch (const std::exception&) {
+            ClearJavaException(env);
+            faulted = true;
+        } catch (...) {
+            ClearJavaException(env);
+            faulted = true;
+        }
+
+        if (!faulted) {
+            // A clean tick clears the record. Only CONSECUTIVE
+            // failures mean the module is actually broken.
+            auto it = s_faults.find(name);
+            if (it != s_faults.end()) s_faults.erase(it);
+            return;
+        }
+
+        int count = ++s_faults[name];
+        if (count < kFaultLimit) return;
+
+        // Persistently broken. Turn it off, release whatever it was
+        // holding, and tell the user which one and why.
+        s_faults.erase(name);
+        try {
+            mod->SetEnabled(false, env);
+            ClearJavaException(env);
+        } catch (...) {
+            ClearJavaException(env);
+        }
+        KeyBinds::ReleaseAll(env);
+        ClearJavaException(env);
+
+        iOS::Notify::Error(name + " was disabled",
+            std::string("It ") + reason +
+            " repeatedly. The rest of the client is unaffected.");
+    }
 
     // -------------------------------------------------------------
     // Hand the game whatever the click timer produced.
@@ -195,6 +279,12 @@ public:
         return nullptr;
     }
 
+    static Module* Find(const std::string& name) {
+        for (auto& m : s_modules)
+            if (m->GetName() == name) return m.get();
+        return nullptr;
+    }
+
     // Called from the render thread. Never touches JNI itself.
     static void QueueAction(std::function<void(JNIEnv*)> fn) {
         if (!fn) return;
@@ -220,10 +310,12 @@ public:
         CombatState::Reset();       // swing history from the last server is meaningless
         Rotation::ResetVelocity();  // or the arm keeps drifting in the next game
         MouseControl::Shutdown();   // the next world re-resolves and re-grabs
+        s_faults.clear();           // a world change is not a module fault
 
         if (env) {
             KeyBinds::ReleaseAll(env);
             KeyBinds::ClearClickQueue(env);
+            ClearJavaException(env);
         }
     }
 
@@ -232,7 +324,7 @@ public:
         s_wasInGame = true;
 
         if (env->PushLocalFrame(kLocalFrameSize) != 0) {
-            if (env->ExceptionCheck()) env->ExceptionClear();
+            ClearJavaException(env);
             return;
         }
 
@@ -245,27 +337,27 @@ public:
         // still leaves the world in the right place.
         if (s_backtrack) {
             s_backtrack->RestoreBeforeScan(env);
-            if (env->ExceptionCheck()) { env->ExceptionDescribe(); env->ExceptionClear(); }
+            ClearJavaException(env);
         }
 
         // Camera before the modules: aim assist rotates the player
         // later in the tick, and the overlays should match the frame
         // the game is about to draw.
         Camera::Update(env);
-        if (env->ExceptionCheck()) { env->ExceptionDescribe(); env->ExceptionClear(); }
+        ClearJavaException(env);
 
         // One read of "what happened this tick", shared by every
         // module. Before this existed each of them polled the mouse
         // button and called that an attack.
         CombatState::Update(env);
-        if (env->ExceptionCheck()) { env->ExceptionDescribe(); env->ExceptionClear(); }
+        ClearJavaException(env);
 
         // ---- Cursor ----
         // The menu is useless without this. A grabbed mouse is
         // pinned to the centre of the window and its movement is fed
         // to the camera, so the pointer can never reach a control.
         MouseControl::Apply(env, s_menuOpen.load());
-        if (env->ExceptionCheck()) { env->ExceptionDescribe(); env->ExceptionClear(); }
+        ClearJavaException(env);
 
         // ---- Work handed over by the UI ----
         {
@@ -275,8 +367,13 @@ public:
                 pending.swap(s_actions);
             }
             for (auto& fn : pending) {
-                fn(env);
-                if (env->ExceptionCheck()) { env->ExceptionDescribe(); env->ExceptionClear(); }
+                try {
+                    fn(env);
+                } catch (...) {
+                    iOS::Notify::Error("An action failed",
+                        "Something the menu asked for could not be applied.");
+                }
+                ClearJavaException(env);
             }
         }
 
@@ -294,23 +391,22 @@ public:
             if (key <= 0 || key > 255) continue;
 
             bool pressed = hotkeys && ((GetAsyncKeyState(key) & 0x8000) != 0);
-            if (pressed && !s_keyStates[key]) mod->Toggle(env);
+            if (pressed && !s_keyStates[key]) {
+                mod->Toggle(env);
+                ClearJavaException(env);
+            }
             s_keyStates[key] = pressed;
         }
 
         // ---- Run enabled modules ----
         for (auto& mod : s_modules) {
             if (!mod->IsEnabled()) continue;
-            mod->OnTick(env);
-            if (env->ExceptionCheck()) {
-                env->ExceptionDescribe();
-                env->ExceptionClear();
-            }
+            RunModule(env, mod);
         }
 
         // ---- Clicks, last, so this tick's requests go out now ----
         DispatchClicks(env);
-        if (env->ExceptionCheck()) { env->ExceptionDescribe(); env->ExceptionClear(); }
+        ClearJavaException(env);
 
         // ---- Key reconciliation ----
         // The reason a sprint reset could freeze you: pressed is
@@ -324,7 +420,7 @@ public:
         // purpose and we would be fighting it.
         if (!Minecraft::IsInGui(env)) {
             KeyBinds::Reconcile(env);
-            if (env->ExceptionCheck()) { env->ExceptionDescribe(); env->ExceptionClear(); }
+            ClearJavaException(env);
         }
 
         // Drops every entity ref the cache was holding
@@ -344,23 +440,31 @@ public:
             // Never eject with the cursor loose: the player would be
             // left unable to look around.
             MouseControl::ForceRestore(env);
-            if (env->ExceptionCheck()) env->ExceptionClear();
+            ClearJavaException(env);
 
             // Disable everything so modules release the keybinds they
-            // took over instead of leaving keys stuck down.
-            for (auto& mod : s_modules)
-                if (mod->IsEnabled()) mod->SetEnabled(false, env);
+            // took over instead of leaving keys stuck down. One that
+            // throws on the way out must not stop the others.
+            for (auto& mod : s_modules) {
+                if (!mod->IsEnabled()) continue;
+                try {
+                    mod->SetEnabled(false, env);
+                } catch (...) {}
+                ClearJavaException(env);
+            }
 
             // Backstop: a module that threw during OnDisable would
             // still have left something held.
             KeyBinds::ReleaseAll(env);
             KeyBinds::ClearClickQueue(env);
+            ClearJavaException(env);
         }
         MouseControl::Shutdown();
         {
             std::lock_guard<std::mutex> lock(s_actionMutex);
             s_actions.clear();
         }
+        s_faults.clear();
         s_backtrack.reset();
         s_esp.reset();
         s_autoClicker.reset();
