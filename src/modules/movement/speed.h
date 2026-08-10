@@ -45,6 +45,7 @@ private:
     bool  m_requireSprint  = true;   // only hop when actually sprinting
     bool  m_forwardOnly    = true;   // no hopping while strafing sideways
     bool  m_pauseInCombat  = true;   // leave the ground to More KB / Velocity
+    int   m_combatPause    = 6;      // ticks of quiet after taking a hit
     float m_skipChance     = 7.0f;   // human hop streaks are not perfect
     int   m_groundTicksMin = 1;      // ticks on the ground between hops
     int   m_groundTicksMax = 2;
@@ -91,7 +92,12 @@ private:
         m_groundTicks++;
 
         if (KeyBinds::GetSneak(env)) return;
-        if (m_pauseInCombat && CombatState::HitTakenThisTick()) return;
+
+        // Knockback and sprint reset both need the ground. Hopping
+        // through an exchange throws away the reset and turns your
+        // own knockback into a floaty arc.
+        if (m_pauseInCombat && CombatState::TicksSinceHit() < m_combatPause)
+            return;
 
         bool fwd   = KeyBinds::GetForward(env);
         bool left  = KeyBinds::GetLeft(env);
@@ -104,7 +110,10 @@ private:
         double mz = Minecraft::GetMotionZ(env, player);
         if (std::sqrt(mx * mx + mz * mz) < 0.08) return;
 
-        if (m_requireSprint && !Minecraft::IsSprinting(env, player)) return;
+        // If the flag could not be resolved we hop anyway rather
+        // than silently doing nothing forever.
+        if (m_requireSprint && Minecraft::HasSprintCheck()
+            && !Minecraft::IsSprinting(env, player)) return;
 
         if (m_groundTicks < m_targetGround) return;
 
@@ -182,6 +191,7 @@ public:
         Bind("Require Sprint", &m_requireSprint);
         Bind("Forward Only", &m_forwardOnly);
         Bind("Pause In Combat", &m_pauseInCombat);
+        Bind("Combat Pause", &m_combatPause);
         Bind("Skip Chance", &m_skipChance);
         Bind("Ground Ticks Min", &m_groundTicksMin);
         Bind("Ground Ticks Max", &m_groundTicksMax);
@@ -222,6 +232,7 @@ public:
             ImGui::Checkbox("Forward Only", &m_forwardOnly);
             ImGui::Checkbox("Pause After Taking A Hit", &m_pauseInCombat);
             if (m_pauseInCombat) {
+                ImGui::SliderInt("Combat Pause (ticks)", &m_combatPause, 2, 20);
                 ImGui::TextColored(ImVec4(0.6f, 0.7f, 0.85f, 1.f),
                     "Keeps the ground free for More KB and Velocity");
             }
@@ -240,6 +251,10 @@ public:
             if (!KeyBinds::HasJump()) {
                 ImGui::TextColored(ImVec4(1.f, 0.8f, 0.3f, 1.f),
                     "Jump keybind unresolved: module inactive");
+            }
+            if (m_requireSprint && !Minecraft::HasSprintCheck()) {
+                ImGui::TextColored(ImVec4(1.f, 0.8f, 0.3f, 1.f),
+                    "Sprint flag unresolved: hopping without the check");
             }
             return;
         }
