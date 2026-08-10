@@ -18,6 +18,11 @@ enum class ModuleCategory {
 // A named pointer to a member field. Modules register their tunables
 // in the constructor so config profiles can set them by name without
 // every module needing bespoke apply code.
+//
+// Registering a setting is NOT the same as showing it. Everything
+// stays bound so profiles can tune it, but only the handful that
+// change how a module feels are drawn by default. The rest live
+// behind Advanced.
 // -----------------------------------------------------------------
 struct Setting {
     enum class Type { Bool, Int, Float };
@@ -64,7 +69,22 @@ public:
     virtual void OnTick(JNIEnv* env) = 0;
     virtual void OnEnable(JNIEnv*) {}
     virtual void OnDisable(JNIEnv*) {}
+
+    // ---- Panel ----
+    // RenderSettings is the everyday panel: the mode, and the two or
+    // three values worth touching. Keep it short enough to read at a
+    // glance.
+    //
+    // RenderAdvanced is everything else. A module with thirty knobs
+    // is not more powerful than one with four, it is just harder to
+    // set up, and most people never open it.
     virtual void RenderSettings() {}
+    virtual void RenderAdvanced() {}
+    virtual bool HasAdvanced() const { return false; }
+
+    // A one-line live state string for the collapsed row, so the
+    // panel does not have to be open to see what a module is doing.
+    virtual const char* StatusLine() const { return nullptr; }
 
     void Toggle(JNIEnv* env) {
         SetEnabled(!m_enabled.load(), env);
