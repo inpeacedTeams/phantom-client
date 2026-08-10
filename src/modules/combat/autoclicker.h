@@ -4,6 +4,8 @@
 #include "../../mc/keybinds.h"
 #include "../../mc/combat_state.h"
 #include "../../input/click_scheduler.h"
+#include "../../jni/class_resolver.h"
+#include "../../jni/jvmti_util.h"
 #include <cstdio>
 
 // =================================================================
@@ -27,12 +29,27 @@
 //
 // WHAT THIS MODULE STILL DOES
 // Decides whether clicking is ALLOWED. Being in a world, not in a
-// menu, optionally only with something in front of you. The button
-// itself is the engine's business.
+// menu, optionally only with something in front of you, and NOT
+// while breaking a block. The button itself is the engine's
+// business.
 //
-// THE PANEL IS ONE SLIDER
-// You want a CPS. Everything else has a defensible default derived
-// from how hands actually behave, and lives behind Advanced.
+// -----------------------------------------------------------------
+// WHY IT STANDS DOWN WHILE MINING
+// -----------------------------------------------------------------
+// A queued click is one clickMouse() call. On an entity that is an
+// attack. On a block it re-starts the swing and RESETS the break
+// progress, so a spammed left button can never break anything:
+// mining in 1.8 is driven by HOLDING the key, not by clicks. If the
+// clicker kept firing while you held attack on a block you would
+// mine at a crawl or not at all, which is exactly the "it fights my
+// mining" complaint.
+//
+// PlayerControllerMP.isHittingBlock is true for precisely the window
+// the player is breaking a block. While it is set the clicker does
+// not arm; the physical hold mines normally and the clicker resumes
+// the instant the block breaks or the crosshair leaves it. Hitting
+// an entity or swinging at air never sets it, so combat is
+// untouched.
 // =================================================================
 
 class AutoClicker : public Module {
@@ -47,6 +64,7 @@ private:
     bool  m_requireTarget = false;
     float m_targetRange   = 4.0f;
     bool  m_blockInGui    = true;
+    bool  m_pauseMining   = true;   // do not fight block breaking
 
     // ---- Humanisation ----
     float m_variance     = 18.0f;
@@ -62,6 +80,10 @@ private:
     const char* m_why = "idle";
     mutable char m_status[48] = {};
     mutable char m_notice[160] = {};
+
+    // ---- JNI: mining state ----
+    jfieldID m_fHittingBlock = nullptr;
+    bool m_resolved = false;
 
     // Above this a click stream stops looking like a hand and starts
     // looking like a loop, whatever the humanisation does.
@@ -87,6 +109,32 @@ private:
     // say so rather than quietly lying.
     float CeilingCPS() const {
         return m_floorMs > 0 ? 1000.0f / (float)m_floorMs : 99.0f;
+    }
+
+    void Resolve(JNIEnv* env) {
+        if (m_resolved) return;
+        if (ClassResolver::playerController) {
+            m_fHittingBlock = JvmtiUtil::FindField(env,
+                ClassResolver::playerController,
+                { "field_78778_j", "isHittingBlock" });
+        }
+        m_resolved = true;
+    }
+
+    // Is the player mid-swing on a block right now? Only meaningful
+    // for the LEFT button; right-click use has nothing to do with
+    // breaking. Fail-open: an unresolved field means we cannot tell,
+    // so do not block clicking.
+    bool BreakingBlock(JNIEnv* env) {
+        if (!m_pauseMining) return false;
+        if (m_button != 0) return false;         // only the attack button mines
+        if (!m_fHittingBlock) return false;      // cannot tell, do not gate
+
+        jobject pc = Minecraft::GetPlayerController(env);
+        if (!pc) return false;
+        bool hitting = env->GetBooleanField(pc, m_fHittingBlock) != 0;
+        if (env->ExceptionCheck()) { env->ExceptionClear(); return false; }
+        return hitting;
     }
 
 public:
@@ -140,6 +188,12 @@ public:
              "Chests and inventories are not places to be clicking")
             .Advanced();
 
+        Bind("Do Not Break Mining", &m_pauseMining,
+             "Pause while you are breaking a block, so holding left-click "
+             "mines normally instead of the clicker resetting it. Left "
+             "button only.")
+            .Advanced();
+
         Bind("Floor", &m_floorMs, 18, 60,
              "Hard minimum milliseconds between clicks, shared with Hit "
              "Select so the two cannot stack. Nothing under 20 is "
@@ -174,6 +228,7 @@ public:
     // Only decides whether clicking is permitted. The engine handles
     // the button and the timing.
     void OnTick(JNIEnv* env) override {
+        Resolve(env);
         ClickScheduler::SetConfig(BuildConfig());
 
         jobject player = Minecraft::GetPlayer(env);
@@ -197,7 +252,16 @@ public:
         bool allowed = true;
         const char* why = "ready";
 
-        if (m_requireTarget && CombatState::TargetDist() > (double)m_targetRange) {
+        // Breaking a block: hand the button back to vanilla mining.
+        // A queued click here just resets the break, so the clicker
+        // would stop you mining rather than help.
+        if (BreakingBlock(env)) {
+            allowed = false;
+            why = "mining";
+        }
+
+        if (allowed && m_requireTarget
+            && CombatState::TargetDist() > (double)m_targetRange) {
             allowed = false;
             why = "nothing in range";
         }
@@ -212,6 +276,11 @@ public:
         if (!allowed)                         m_why = why;
         else if (ClickScheduler::IsHolding()) m_why = "clicking";
         else                                  m_why = "hold the button to start";
+
+        // While mining, the pending queue must not sit and then fire
+        // the instant the block breaks, so drop it on the same tick
+        // we stand down.
+        if (!allowed) ClickScheduler::ClearPending();
 
         // The live figure is the only honest answer to "is this
         // working", so it goes on the collapsed row rather than
@@ -255,6 +324,13 @@ public:
                      "can consume. Lower the CPS.", dropped);
             *text = m_notice;
             return NoticeLevel::Warning;
+        }
+
+        if (m_button == 0 && m_pauseMining && !m_fHittingBlock) {
+            *text = "The mining-state field could not be read, so the clicker "
+                    "cannot tell when you are breaking a block and may reset "
+                    "it. Everything else works.";
+            return NoticeLevel::Info;
         }
 
         if (m_cps > kButterflyCPS) {
