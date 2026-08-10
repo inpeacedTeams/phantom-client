@@ -183,13 +183,41 @@ struct UI {
         return v < lo ? lo : (v > hi ? hi : v);
     }
 
+    // -------------------------------------------------------------
+    // Bring every value back into range.
+    //
+    // Separate from Apply because the config is loaded on the CLIENT
+    // thread at inject time, which is BEFORE the overlay exists.
+    // Anything that touches ImGui state would be dereferencing a
+    // null context, and "the client crashes the game on startup if
+    // you hand-edit a config" is not a thing a finished product
+    // does.
+    // -------------------------------------------------------------
+    static void ClampValues() {
+        scale      = Clamp(scale, 0.85f, 1.35f);
+        animSpeed  = Clamp(animSpeed, 0.40f, 2.00f);
+        roundness  = Clamp(roundness, 0.00f, 1.60f);
+        glowAmount = Clamp(glowAmount, 0.20f, 2.00f);
+        dimAmount  = Clamp(dimAmount, 0.00f, 0.80f);
+
+        if (accent < 0 || accent >= kAccentCount) accent = 0;
+        for (int i = 0; i < 4; i++)
+            accentCustom[i] = Clamp(accentCustom[i], 0.0f, 1.0f);
+
+        // A fully transparent custom accent would make every
+        // interactive element invisible.
+        if (accentCustom[3] < 0.35f) accentCustom[3] = 1.0f;
+    }
+
     // Push the settings into the palette and the metrics. Called
     // once per frame before anything draws; it is a handful of
     // multiplies, so there is no point tracking whether it changed.
+    //
+    // Safe to call with no ImGui context: the numbers are still
+    // clamped and the palette still updates, and only the parts that
+    // need a context are skipped.
     static void Apply() {
-        scale     = Clamp(scale, 0.85f, 1.35f);
-        animSpeed = Clamp(animSpeed, 0.40f, 2.00f);
-        roundness = Clamp(roundness, 0.00f, 1.60f);
+        ClampValues();
 
         Col::Blue     = AccentColor();
         Col::BlueSoft = Col::Alpha(Col::Blue, 0.15f);
@@ -207,6 +235,8 @@ struct UI {
         M::CardRadius = M::BaseCardRadius * r;
         M::SegRadius  = M::BaseSegRadius  * r;
         M::SheetRound = M::BaseSheetRound * r;
+
+        if (!ImGui::GetCurrentContext()) return;
 
         // Text scales with everything else, or a 1.3x menu is just
         // the same small type in roomier boxes.
@@ -227,6 +257,8 @@ struct UI {
         dimAmount = 0.42f;
         openAnimation = hoverInfo = rowNudge = true;
         accent = 0;
+        accentCustom[0] = 0.00f; accentCustom[1] = 0.48f;
+        accentCustom[2] = 1.00f; accentCustom[3] = 1.00f;
     }
 };
 
@@ -335,8 +367,8 @@ struct Fonts {
         const char* uiBold = "C:\\Windows\\Fonts\\segoeuib.ttf";
         const char* mono   = "C:\\Windows\\Fonts\\consola.ttf";
 
-        // Cyrillic too: module names are English but profile text
-        // and anything the user adds may not be.
+        // Cyrillic too: module names are English but a config name
+        // or anything the user types may not be.
         const ImWchar* ranges = io.Fonts->GetGlyphRangesCyrillic();
 
         Body = io.Fonts->AddFontFromFileTTF(ui, 17.0f, &cfg, ranges);
