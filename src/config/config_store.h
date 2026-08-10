@@ -44,6 +44,17 @@
 //     module.AutoClicker.key=82
 //     module.AutoClicker.set.CPS=13.000000
 //
+// A colour setting is the one value made of more than one number.
+// It is stored as four suffixed keys, exactly the way ui.accentCustom
+// already is, rather than packed into a single float: a packed 24-
+// or 32-bit colour prints as 1.67e+07 under the default ostream
+// formatting and reparses to the wrong colour.
+//
+//     module.ESP.set.Box Colour.r=0.000000
+//     module.ESP.set.Box Colour.g=0.480000
+//     module.ESP.set.Box Colour.b=1.000000
+//     module.ESP.set.Box Colour.a=1.000000
+//
 // FORWARD AND BACKWARD COMPATIBILITY, WHICH IS THE WHOLE POINT
 //
 //   Unknown keys are IGNORED, not treated as an error. A config
@@ -271,9 +282,22 @@ public:
                 // which is an int, was being printed as a float read
                 // off an int pointer: garbage in the file and a
                 // random mode on load.
-                for (const auto& s : m->GetSettings())
-                    f << "module." << n << ".set." << s.name << "="
-                      << s.Read() << "\n";
+                //
+                // A colour is the one setting with more than one
+                // number, so it is written as four suffixed keys the
+                // way ui.accentCustom is. Everything else is a single
+                // key, byte-for-byte as before.
+                for (const auto& s : m->GetSettings()) {
+                    if (s.type == Setting::Type::Color) {
+                        static const char* comp[4] = { "r", "g", "b", "a" };
+                        for (int i = 0; i < 4; i++)
+                            f << "module." << n << ".set." << s.name << "."
+                              << comp[i] << "=" << s.ReadComp(i) << "\n";
+                    } else {
+                        f << "module." << n << ".set." << s.name << "="
+                          << s.Read() << "\n";
+                    }
+                }
 
                 f << "\n";
             }
@@ -410,11 +434,30 @@ public:
                 mod->SetKeybind((k > 0 && k < 256) ? k : 0);
                 r.applied++;
             } else if (field == "set") {
+                // A colour persists as <name>.r/.g/.b/.a. Detect that
+                // suffix and route to the channel, but only when the
+                // base name is really a colour, so a scalar setting
+                // that happens to end in .r is left untouched and
+                // still handled by SetValue below.
+                int comp = -1;
+                std::string base = setting;
+                if (setting.size() > 2 && setting[setting.size() - 2] == '.') {
+                    char ch = setting.back();
+                    if      (ch == 'r') comp = 0;
+                    else if (ch == 'g') comp = 1;
+                    else if (ch == 'b') comp = 2;
+                    else if (ch == 'a') comp = 3;
+                    if (comp >= 0) base = setting.substr(0, setting.size() - 2);
+                }
+
+                bool ok = (comp >= 0) && mod->SetColorComponent(base, comp, v);
+                if (!ok) ok = mod->SetValue(setting, v);
+
                 // SetValue clamps to the setting's own range, so a
                 // hand-edited or outdated file cannot push a module
                 // somewhere its interface could never reach.
-                if (mod->SetValue(setting, v)) r.applied++;
-                else r.unknown++;   // a setting that has been renamed
+                if (ok) r.applied++;
+                else    r.unknown++;   // a setting that has been renamed
             } else {
                 r.unknown++;
             }
