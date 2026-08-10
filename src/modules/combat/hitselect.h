@@ -6,6 +6,7 @@
 #include "../../input/click_scheduler.h"
 #include <imgui.h>
 #include <Windows.h>
+#include <cstdio>
 #include <random>
 
 // =================================================================
@@ -25,29 +26,23 @@
 // that and the knockback has already been applied and resolved.
 //
 // WHY IT GOES THROUGH THE SCHEDULER
-// The autoclicker is usually running too. Two sources calling
-// SendInput independently can land microseconds apart, and a
-// sub-20ms interval is the one thing no hand can produce. Every
-// click in the client leaves through ClickScheduler, which holds a
-// shared floor and drops anything that would break it.
-//
-// WHAT CHANGED
-// The old version required the physical mouse button to be held,
-// which meant it never fired for anyone who lets go between
-// swings. It now keys off whether you are actually in a fight,
-// and refuses to fire when nothing is in reach, because a click
-// into empty air on the exact tick you take damage is a pattern
-// rather than a technique.
+// The autoclicker is usually running too. Two sources emitting
+// independently can land microseconds apart, and a sub-20ms
+// interval is the one thing no hand can produce. Every click in
+// the client leaves through ClickScheduler, which holds a shared
+// floor and drops anything that would break it.
 // =================================================================
 
 class HitSelect : public Module {
 private:
-    // ---- Window ----
-    int  m_windowStart = 10;   // fire from this hurtTime
-    int  m_windowEnd   = 8;    // down to this one
-    float m_chance     = 85.0f;
+    // ---- Core ----
+    float m_chance = 85.0f;
 
-    // ---- Gating ----
+    // ---- Advanced: window ----
+    int m_windowStart = 10;   // fire from this hurtTime
+    int m_windowEnd   = 8;    // down to this one
+
+    // ---- Advanced: gating ----
     bool  m_requireTarget = true;
     float m_targetRange   = 3.5f;
     bool  m_requireCombat = true;   // must be an actual exchange
@@ -63,6 +58,7 @@ private:
     int m_dropped = 0;
     int m_skipped = 0;
     const char* m_why = "idle";
+    mutable char m_status[40] = "";
 
     std::mt19937 m_rng{ std::random_device{}() };
 
@@ -151,22 +147,41 @@ public:
         m_lastHurtTime = 0;
     }
 
+    const char* StatusLine() const override {
+        snprintf(m_status, sizeof(m_status), "%d fired", m_fired);
+        return m_status;
+    }
+
+    bool HasAdvanced() const override { return true; }
+
     void RenderSettings() override {
-        ImGui::TextColored(ImVec4(0.55f, 0.55f, 0.6f, 1.f), "%s", m_why);
-        ImGui::TextDisabled("Fired %d | dropped %d | skipped %d",
-            m_fired, m_dropped, m_skipped);
-
-        ImGui::Separator();
-        ImGui::TextColored(ImVec4(1.f, 0.6f, 0.3f, 1.f), "Window");
-        ImGui::SliderInt("Window Start", &m_windowStart, 1, 10);
-        ImGui::SliderInt("Window End", &m_windowEnd, 1, 10);
-        if (m_windowEnd > m_windowStart) m_windowEnd = m_windowStart;
-        ImGui::TextDisabled("hurtTime counts down from 10. Ticks %d to %d.",
-            m_windowStart, m_windowEnd);
         ImGui::SliderFloat("Chance", &m_chance, 10.f, 100.f, "%.0f%%");
+        ImGui::TextDisabled("Fires one click on the tick a hit lands on you, "
+                            "which cancels part of the knockback.");
 
-        ImGui::Separator();
-        ImGui::TextColored(ImVec4(0.5f, 0.8f, 1.f, 1.f), "Gating");
+        if (m_dropped > m_fired && m_fired > 4) {
+            ImGui::TextColored(ImVec4(1.f, 0.7f, 0.3f, 1.f),
+                "Mostly dropped: the autoclicker is saturating the rate");
+        }
+        if (!CombatState::IsUsable()) {
+            ImGui::TextColored(ImVec4(1.f, 0.7f, 0.3f, 1.f),
+                "Swing detection unresolved: the rhythm check is blind");
+        }
+    }
+
+    void RenderAdvanced() override {
+        ImGui::TextDisabled("%s | fired %d, dropped %d, skipped %d",
+            m_why, m_fired, m_dropped, m_skipped);
+
+        ImGui::SeparatorText("Window");
+        ImGui::SliderInt("Start", &m_windowStart, 1, 10);
+        ImGui::SliderInt("End", &m_windowEnd, 1, 10);
+        if (m_windowEnd > m_windowStart) m_windowEnd = m_windowStart;
+        ImGui::TextDisabled("hurtTime counts down from 10, so this is ticks "
+                            "%d to %d after the hit lands.",
+                            10 - m_windowStart, 10 - m_windowEnd);
+
+        ImGui::SeparatorText("Gating");
         ImGui::Checkbox("Require Target", &m_requireTarget);
         if (m_requireTarget)
             ImGui::SliderFloat("Target Range", &m_targetRange, 2.f, 6.f, "%.1f");
@@ -174,17 +189,8 @@ public:
         ImGui::Checkbox("Respect Your Rhythm", &m_respectRhythm);
         if (m_respectRhythm) {
             ImGui::SliderInt("Min Gap (ms)", &m_minGapMs, 40, 200);
-            ImGui::TextDisabled("Never clicks sooner than this after your own swing.");
-        }
-
-        if (m_dropped > m_fired && m_fired > 4) {
-            ImGui::Separator();
-            ImGui::TextColored(ImVec4(1.f, 0.7f, 0.3f, 1.f),
-                "Mostly dropped: the autoclicker is already saturating the rate");
-        }
-        if (!CombatState::IsUsable()) {
-            ImGui::TextColored(ImVec4(1.f, 0.7f, 0.3f, 1.f),
-                "Swing detection unresolved: rhythm check is blind");
+            ImGui::TextDisabled("Never clicks sooner than this after your "
+                                "own swing.");
         }
     }
 };
