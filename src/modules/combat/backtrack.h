@@ -2,10 +2,10 @@
 #include "../module.h"
 #include "../../mc/minecraft.h"
 #include "../../mc/entity_list.h"
+#include "../../mc/combat_state.h"
 #include "../../jni/class_resolver.h"
 #include "../../jni/jvmti_util.h"
 #include <imgui.h>
-#include <Windows.h>
 #include <unordered_map>
 #include <deque>
 #include <vector>
@@ -39,13 +39,23 @@
 // sample closest to your crosshair that is still inside reach. That
 // is where the strength comes from, not from a longer delay.
 //
+// IDENTITY
+// Targets are keyed by entity ID, and entity IDs are recycled. The
+// server hands the same number to a different player after a
+// respawn or a lobby change, and the ID alone will happily match a
+// stale global ref to a brand new entity. Every lookup therefore
+// checks that the ref we kept is still the same object, and starts
+// fresh when it is not. Without that check the restore pass writes
+// one player's position into another.
+//
 // STAYING QUIET
 //   - per-target delay drawn from a band, re-rolled periodically
 //   - pulse mode so the desync appears in bursts, not constantly
 //   - range window, because rewinding a distant player buys nothing
 //   - ping-aware cap keeping ping + delay inside the comp window
 //   - restores on damage, on flag, on GUI, on disable
-//   - swing sync: only rewind around the ticks you are swinging
+//   - swing sync: only rewind around the ticks you are actually
+//     swinging, taken from CombatState rather than the mouse button
 // =================================================================
 
 class Backtrack : public Module {
@@ -112,8 +122,8 @@ private:
     bool  m_pingAware      = true;
     int   m_compensationMs = 220;
     int   m_safetyMarginMs = 35;
-    bool  m_restoreOnDamage   = true;
-    bool  m_onlyWhileClicking = true;
+    bool  m_restoreOnDamage = true;
+    bool  m_onlyInCombat    = true;
     int   m_pauseAfterFlagTicks = 40;
     int   m_rampTicks = 4;
     float m_perTargetJitter = 24.0f;
@@ -136,12 +146,10 @@ private:
     int  m_pulseTarget  = 0;
     int  m_pauseCounter = 0;
     int  m_rampCounter  = 0;
-    int  m_lastHurtTime = 0;
     int  m_activeCount  = 0;
     int  m_measuredPing = 30;
     int  m_swingTicksLeft = 0;
     int  m_holdLeft = 0;
-    bool m_lastLMB = false;
     unsigned long long m_tick = 0;
     double m_maxOffsetSeen = 0.0;
 
@@ -156,6 +164,12 @@ private:
     jfieldID  m_fPosX = nullptr, m_fPosY = nullptr, m_fPosZ = nullptr;
     jfieldID  m_fPrevX = nullptr, m_fPrevY = nullptr, m_fPrevZ = nullptr;
     bool m_resolved = false;
+
+    // Memory bounds. A second of history at 20 TPS is 20 samples;
+    // 40 leaves room for a fast tick loop without ever growing.
+    static constexpr size_t kMaxSamples  = 40;
+    static constexpr long long kMaxAgeMs = 1000;
+    static constexpr unsigned long long kForgetTicks = 40;
 
     std::mt19937 m_rng{ std::random_device{}() };
 
@@ -227,7 +241,15 @@ private:
     }
 
     void DropTarget(JNIEnv* env, Target& t) {
-        if (t.ref) { env->DeleteGlobalRef(t.ref); t.ref = nullptr; }
+        if (t.ref && env) { env->DeleteGlobalRef(t.ref); }
+        t.ref = nullptr;
+        t.rewound = false;
+        t.history.clear();
+    }
+
+    void DropAllTargets(JNIEnv* env) {
+        for (auto& kv : m_targets) DropTarget(env, kv.second);
+        m_targets.clear();
     }
 
     float AngleTo(JNIEnv* env, jobject player, double x, double y, double z,
@@ -362,7 +384,7 @@ public:
         Bind("Compensation Window", &m_compensationMs);
         Bind("Safety Margin", &m_safetyMarginMs);
         Bind("Restore On Damage", &m_restoreOnDamage);
-        Bind("Only While Clicking", &m_onlyWhileClicking);
+        Bind("Only In Combat", &m_onlyInCombat);
         Bind("Pause After Flag", &m_pauseAfterFlagTicks);
         Bind("Ramp Ticks", &m_rampTicks);
         Bind("Per Target Jitter", &m_perTargetJitter);
@@ -370,6 +392,9 @@ public:
         Bind("Vis Style", &m_visStyle);
         Bind("Vis Link", &m_visLink);
         Bind("Vis Ghost", &m_visGhost);
+        Bind("Vis Ghost Alpha", &m_visGhostA);
+        Bind("Vis Show Delay", &m_visShowMs);
+        Bind("Vis Show Offset", &m_visShowDist);
         Bind("Vis Thickness", &m_visThickness);
     }
 
@@ -397,13 +422,40 @@ public:
         m_pauseCounter = 0;
         m_activeCount  = 0;
         m_holdLeft     = 0;
+        m_swingTicksLeft = 0;
         m_maxOffsetSeen = 0.0;
     }
 
     void OnDisable(JNIEnv* env) override {
         RestoreBeforeScan(env);
-        for (auto& kv : m_targets) DropTarget(env, kv.second);
-        m_targets.clear();
+        DropAllTargets(env);
+        std::lock_guard<std::mutex> lock(m_visMutex);
+        m_vis.clear();
+    }
+
+    // -------------------------------------------------------------
+    // World change, respawn, reconnect.
+    //
+    // Every recorded position belongs to a world that no longer
+    // exists, and every global ref points at an entity that is gone.
+    // Restore first, in case we were mid-rewind, then forget all of
+    // it. Keeping the history across a world change is how a rewind
+    // ends up teleporting a freshly spawned player into the last
+    // map's geometry.
+    // -------------------------------------------------------------
+    void OnReset(JNIEnv* env) override {
+        RestoreBeforeScan(env);
+        DropAllTargets(env);
+
+        m_rewinding      = IsEnabled();
+        m_pulseCounter   = 0;
+        m_pulseTarget    = Rand(m_pulseOnMin, m_pulseOnMax);
+        m_pauseCounter   = 0;
+        m_rampCounter    = 0;   // ease back in rather than snapping to full delay
+        m_activeCount    = 0;
+        m_swingTicksLeft = 0;
+        m_holdLeft       = 0;
+
         std::lock_guard<std::mutex> lock(m_visMutex);
         m_vis.clear();
     }
@@ -436,19 +488,20 @@ public:
         }
 
         // ---- Taking a hit: drop the desync immediately ----
-        if (m_restoreOnDamage) {
-            int hurt = Minecraft::GetHurtTime(env, player);
-            bool justHit = (hurt > 0 && m_lastHurtTime == 0);
-            m_lastHurtTime = hurt;
-            if (justHit) { PublishVis(); return; }
+        // CombatState already watches hurtTime for the whole client,
+        // so this is the same edge every other module reacts to
+        // rather than a second private copy of the same tracking.
+        if (m_restoreOnDamage && CombatState::HitTakenThisTick()) {
+            PublishVis();
+            return;
         }
 
         // ---- Swing tracking ----
-        bool lmb = (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0;
-        bool justClicked = lmb && !m_lastLMB;
-        m_lastLMB = lmb;
-
-        if (justClicked) {
+        // The mouse button is not a swing. It is true while you hold
+        // it over a menu, a block or empty air, and it is false for
+        // every click the client generates itself. swingProgressInt
+        // is the animation the server actually receives.
+        if (CombatState::SwungThisTick()) {
             m_swingTicksLeft = m_swingWindow;
             m_holdLeft = m_holdThrough ? m_holdTicks : 0;
         } else {
@@ -478,7 +531,7 @@ public:
                     || m_holdLeft > 0;
 
         bool active = m_rewinding
-                   && (!m_onlyWhileClicking || lmb)
+                   && (!m_onlyInCombat || CombatState::InCombat())
                    && swingOk;
 
         auto now = std::chrono::steady_clock::now();
@@ -502,6 +555,16 @@ public:
             if (env->ExceptionCheck()) { env->ExceptionClear(); continue; }
 
             Target& t = m_targets[(int)id];
+
+            // IDs are recycled. If the ref we are holding is not this
+            // object, the slot belongs to somebody else now and every
+            // sample in it is another player's path.
+            if (t.ref && !env->IsSameObject(t.ref, e.ref)) {
+                DropTarget(env, t);
+                t.delayMs = 0;
+                t.name.clear();
+            }
+
             t.lastSeen = m_tick;
 
             // Global ref so the restore pass can reach this entity
@@ -516,11 +579,11 @@ public:
 
             // A second of history bounds the memory and is far more
             // than any comp window will accept.
-            while (t.history.size() > 40) t.history.pop_front();
+            while (t.history.size() > kMaxSamples) t.history.pop_front();
             while (!t.history.empty()) {
                 auto age = std::chrono::duration_cast<std::chrono::milliseconds>(
                     now - t.history.front().at).count();
-                if (age <= 1000) break;
+                if (age <= kMaxAgeMs) break;
                 t.history.pop_front();
             }
 
@@ -590,7 +653,7 @@ public:
 
         // ---- Forget players who left ----
         for (auto it = m_targets.begin(); it != m_targets.end(); ) {
-            if (m_tick - it->second.lastSeen > 40) {
+            if (m_tick - it->second.lastSeen > kForgetTicks) {
                 DropTarget(env, it->second);
                 it = m_targets.erase(it);
             } else {
@@ -619,7 +682,7 @@ public:
 
     const char* StatusLine() const override {
         if (m_activeCount > 0) {
-            snprintf(m_status, sizeof(m_status), "holding %d  ·  %.2f m peak",
+            snprintf(m_status, sizeof(m_status), "holding %d  \xc2\xb7  %.2f m peak",
                      m_activeCount, m_maxOffsetSeen);
         } else {
             snprintf(m_status, sizeof(m_status), "%s",
@@ -718,7 +781,8 @@ public:
             ImGui::SliderInt("Safety Margin (ms)", &m_safetyMarginMs, 0, 120);
         }
         ImGui::Checkbox("Restore On Damage", &m_restoreOnDamage);
-        ImGui::Checkbox("Only While Clicking", &m_onlyWhileClicking);
+        ImGui::Checkbox("Only In Combat", &m_onlyInCombat);
+        ImGui::TextDisabled("Stays clean until you are actually fighting somebody.");
         ImGui::SliderInt("Pause After Flag", &m_pauseAfterFlagTicks, 0, 100);
 
         if (m_visEnabled) {
