@@ -12,11 +12,12 @@
 #include "ios_theme.h"
 #include "ios_widgets.h"
 #include "ios_hud.h"
+#include "config_panel.h"
+#include "notifications.h"
 #include "../mc/mouse_control.h"
 #include "../input/key_capture.h"
 #include "../modules/module_manager.h"
 #include "../render/backtrack_vis.h"
-#include "../config/profiles.h"
 
 // =================================================================
 // Menu
@@ -25,8 +26,13 @@
 // per row, a segmented control instead of tabs.
 //
 // Runs entirely on the render thread and must never call JNI.
-// Toggles and profile loads are queued to ModuleManager and applied
+// Toggles and config loads are queued to ModuleManager and applied
 // on the client thread where a valid JNIEnv exists.
+//
+// WHAT THIS FILE OWNS
+// The shell, the module list and the key picker. Configs live in
+// ConfigPanel and the HUD owns its own settings, because a class
+// that draws everything is a class nobody wants to open.
 //
 // MOTION
 // Everything that moves is a function of elapsed time, never of
@@ -75,7 +81,7 @@ private:
     inline static std::string s_binding;
     inline static float s_bindClock = 0.0f;
     inline static float s_bindFade  = 0.0f;
-    inline static std::string s_bindResult;   // "AutoClicker  ->  R"
+    inline static std::string s_bindResult;
     inline static float s_bindResultFade = 0.0f;
 
     // Search
@@ -87,19 +93,16 @@ private:
     inline static float s_hoverFade = 0.0f;
     inline static ImVec2 s_hoverAnchor{ 0, 0 };
 
-    static constexpr int kTabCount = 7;
-    inline static const char* s_tabNames[kTabCount] = {
-        "Combat", "Move", "Visual", "Player", "Misc", "Config", "UI"
+    // Player and Misc used to be separate tabs and both were
+    // permanently empty. Two dead tabs out of seven is not a
+    // category system, it is a promise the client does not keep, so
+    // they share one and the space went to the things that exist.
+    enum Tab { TAB_COMBAT = 0, TAB_MOVE, TAB_VISUAL, TAB_MISC,
+               TAB_CONFIG, TAB_UI, TAB_COUNT };
+
+    inline static const char* s_tabNames[TAB_COUNT] = {
+        "Combat", "Move", "Visual", "Misc", "Configs", "UI"
     };
-    inline static ModuleCategory s_tabCats[5] = {
-        ModuleCategory::COMBAT,
-        ModuleCategory::MOVEMENT,
-        ModuleCategory::VISUAL,
-        ModuleCategory::PLAYER,
-        ModuleCategory::MISC
-    };
-    static constexpr int kTabConfig    = 5;
-    static constexpr int kTabInterface = 6;
 
     static ImU32 CategoryColor(ModuleCategory c) {
         switch (c) {
@@ -118,6 +121,17 @@ private:
             case ModuleCategory::VISUAL:   return "Visual";
             case ModuleCategory::PLAYER:   return "Player";
             default:                       return "Misc";
+        }
+    }
+
+    static bool InTab(ModuleCategory c, int tab) {
+        switch (tab) {
+            case TAB_COMBAT: return c == ModuleCategory::COMBAT;
+            case TAB_MOVE:   return c == ModuleCategory::MOVEMENT;
+            case TAB_VISUAL: return c == ModuleCategory::VISUAL;
+            case TAB_MISC:   return c == ModuleCategory::PLAYER
+                                 || c == ModuleCategory::MISC;
+            default:         return false;
         }
     }
 
@@ -158,7 +172,9 @@ private:
 
     static bool Matches(const std::shared_ptr<Module>& m, const char* q) {
         if (!q || !q[0]) return true;
-        return Contains(m->GetName(), q) || Contains(m->GetDescription(), q);
+        return Contains(m->GetName(), q)
+            || Contains(m->GetDescription(), q)
+            || Contains(CategoryName(m->GetCategory()), q);
     }
 
     // The pending value if a toggle is in flight, else the real one
@@ -292,17 +308,21 @@ private:
         // The bind is read on the client thread every tick, so it is
         // set there rather than written from under it.
         ModuleManager::QueueAction([target, newKey](JNIEnv*) {
-            for (auto& m : ModuleManager::GetModules()) {
-                if (m->GetName() != target) continue;
-                // Two modules on one key means one press fires both.
-                if (newKey > 0) {
-                    for (auto& other : ModuleManager::GetModules())
-                        if (other != m && other->GetKeybind() == newKey)
-                            other->SetKeybind(0);
+            Module* mine = ModuleManager::Find(target);
+            if (!mine) return;
+
+            // Two modules on one key means one press fires both.
+            if (newKey > 0) {
+                for (auto& other : ModuleManager::GetModules()) {
+                    if (other.get() == mine) continue;
+                    if (other->GetKeybind() != newKey) continue;
+
+                    other->SetKeybind(0);
+                    iOS::Notify::Info(other->GetName() + " was unbound",
+                        "That key now belongs to " + target + ".");
                 }
-                m->SetKeybind(newKey);
-                break;
             }
+            mine->SetKeybind(newKey);
         });
     }
 
@@ -566,6 +586,13 @@ private:
                         : (showCategory ? CategoryName(mod->GetCategory()) : nullptr);
         ImU32 subCol = (status && status[0]) ? accent : iOS::Col::Label3;
 
+        // The name is clipped rather than allowed to run under the
+        // chip, which is what a long one used to do.
+        float textRoom = (p.x + w - switchZone - 30.0f) - textX;
+        if (textRoom < 40.0f) textRoom = 40.0f;
+        ImGui::PushClipRect(ImVec2(textX, p.y),
+                            ImVec2(textX + textRoom, p.y + h), true);
+
         if (sub) {
             ImVec2 ns = ImGui::CalcTextSize(name.c_str());
             dl->AddText(ImVec2(textX, cy - ns.y + 1.0f),
@@ -580,6 +607,8 @@ private:
             dl->AddText(ImVec2(textX, cy - ts.y * 0.5f),
                         iOS::Col::Alpha(iOS::Col::Label, entry), name.c_str());
         }
+
+        ImGui::PopClipRect();
 
         // ---- Keybind chip ----
         KeybindChip(mod, p.x + w - switchZone - 22.0f, cy, entry);
@@ -672,8 +701,11 @@ private:
         ImGui::Dummy(ImVec2(0, 6));
     }
 
-    static void RenderCategory(ModuleCategory cat) {
-        auto mods = ModuleManager::GetModulesByCategory(cat);
+    static void RenderTab(int tab) {
+        std::vector<std::shared_ptr<Module>> mods;
+        for (auto& m : ModuleManager::GetModules())
+            if (InTab(m->GetCategory(), tab)) mods.push_back(m);
+
         if (mods.empty()) { EmptyState("Nothing here yet"); return; }
 
         int enabled = 0;
@@ -683,7 +715,7 @@ private:
         snprintf(head, sizeof(head), "%d of %d active", enabled, (int)mods.size());
         iOS::SectionHeader(head);
 
-        RenderList(mods, false);
+        RenderList(mods, tab == TAB_MISC);
     }
 
     static void RenderSearch() {
@@ -699,8 +731,8 @@ private:
 
         if (hits.empty()) {
             EmptyState("Nothing matches that");
-            iOS::Footnote("Search looks at both the name and the description, "
-                          "so \"knockback\" finds Velocity.");
+            iOS::Footnote("Search looks at the name, the description and the "
+                          "category, so \"knockback\" finds Velocity.");
             return;
         }
 
@@ -837,93 +869,20 @@ private:
             "fixed-function backend so it cannot disturb the game's GL state. "
             "Faking it with stacked quads costs frames and looks like a smear.");
 
-        iOS::Footnote(
-            "Interface sounds are also left out: there is no asset pipeline "
-            "in a single DLL, and a Windows system beep over a game with its "
-            "own audio is worse than silence.");
-
         ImGui::Dummy(ImVec2(0, 6));
         if (iOS::Button("Reset Interface",
                         ImGui::GetContentRegionAvail().x - iOS::M::RowPadX,
                         iOS::Col::Label2, false)) {
             UI::Reset();
+            iOS::Notify::Info("Interface reset", "Back to the default look.");
         }
-        ImGui::Dummy(ImVec2(0, 10));
-    }
-
-    static void RenderConfigs() {
-        iOS::SectionHeader("Profiles");
-
-        auto profiles = Profiles::All();
-        for (size_t i = 0; i < profiles.size(); i++) {
-            ImGui::PushID((int)i);
-
-            iOS::BeginCard();
-            ImGui::Dummy(ImVec2(0, 10));
-            ImGui::Indent(iOS::M::RowPadX);
-
-            iOS::Fonts::Push(iOS::Fonts::BodyBold);
-            ImGui::TextUnformatted(profiles[i].name);
-            iOS::Fonts::Pop(iOS::Fonts::BodyBold);
-
-            iOS::Fonts::Push(iOS::Fonts::Caption);
-            ImGui::PushStyleColor(ImGuiCol_Text,
-                ImGui::ColorConvertU32ToFloat4(iOS::Col::Label2));
-            ImGui::PushTextWrapPos(ImGui::GetContentRegionAvail().x - 8.0f);
-            ImGui::TextUnformatted(profiles[i].description);
-            ImGui::PopTextWrapPos();
-            ImGui::PopStyleColor();
-            iOS::Fonts::Pop(iOS::Fonts::Caption);
-
-            ImGui::Dummy(ImVec2(0, 8));
-
-            if (iOS::Button("Load",
-                    ImGui::GetContentRegionAvail().x - iOS::M::RowPadX)) {
-                Profile p = profiles[i];
-                s_pending.clear();
-                ModuleManager::QueueAction([p](JNIEnv* env) {
-                    Profiles::Apply(p, env);
-                });
-            }
-
-            ImGui::Dummy(ImVec2(0, 10));
-            ImGui::Unindent(iOS::M::RowPadX);
-            iOS::EndCard();
-
-            ImGui::PopID();
-        }
-
-        const std::string& report = Profiles::LastReport();
-        if (!report.empty()) iOS::Footnote(report.c_str());
-
-        ImGui::Dummy(ImVec2(0, 8));
-        iOS::HUD::RenderSettings();
-
-        iOS::SectionHeader("About");
-        iOS::BeginCard();
-        iOS::ValueRow("Version", "2.7.0");
-        iOS::RowSeparator();
-        iOS::ValueRow("Target", "Lunar 1.8.9");
-        iOS::RowSeparator();
-        {
-            char buf[32];
-            snprintf(buf, sizeof(buf), "%d", ModuleManager::GetModuleCount());
-            iOS::ValueRow("Modules", buf);
-        }
-        iOS::RowSeparator();
-        iOS::ValueRow("Cursor",
-            MouseControl::IsUsable() ? "Released by the game" : "Software fallback");
-        iOS::EndCard();
-
-        iOS::Footnote("Click any key chip to rebind it. INSERT opens this menu, "
-                      "ESC closes it, DELETE ejects.");
         ImGui::Dummy(ImVec2(0, 10));
     }
 
     // ---------------------------------------------------------
     // Header: app mark, title, live count, search, tabs
     // ---------------------------------------------------------
-    static float RenderHeader(float width) {
+    static void RenderHeader(float width) {
         ImVec2 p = ImGui::GetCursorScreenPos();
         ImDrawList* dl = ImGui::GetWindowDrawList();
 
@@ -983,14 +942,13 @@ private:
         bool searching = s_search[0] != '\0';
         ImGui::SetCursorScreenPos(ImVec2(p.x + 16.0f * s, p.y + 96.0f * s));
         if (searching) ImGui::BeginDisabled();
-        iOS::Segmented("tabs", s_tabNames, kTabCount, &s_tab, width - 32.0f * s);
+        iOS::Segmented("tabs", s_tabNames, TAB_COUNT, &s_tab, width - 32.0f * s);
         if (searching) ImGui::EndDisabled();
 
         ImGui::SetCursorScreenPos(ImVec2(p.x, p.y + h));
         dl->AddLine(ImVec2(p.x, p.y + h - 0.5f),
                     ImVec2(p.x + width, p.y + h - 0.5f),
                     iOS::Col::Separator, 1.0f);
-        return h;
     }
 
 public:
@@ -1019,10 +977,15 @@ public:
         }
 
         if (s_fade < 0.004f) {
-            s_tabAge = 0.0f;      // next open replays the entry
+            // Fully closed: forget the transient state, so reopening
+            // is a clean screen rather than wherever you left off
+            // mid-interaction.
+            s_tabAge = 0.0f;
             s_lastTab = -1;
             s_hoverFade = 0.0f;
-            RenderBindOverlay();  // the confirmation may still be fading
+            s_search[0] = '\0';
+            iOS::ConfigPanel::Reset();
+            RenderBindOverlay();   // the confirmation may still be fading
             return;
         }
 
@@ -1034,8 +997,13 @@ public:
         RenderScrim(s_fade);
 
         // Tab transition clock. Reset on a change, then run forward.
-        if (s_tab != s_lastTab) {
+        // A change of search counts: the list is different, so it
+        // should arrive the same way.
+        static int lastSearchLen = -1;
+        int qlen = (int)std::strlen(s_search);
+        if (s_tab != s_lastTab || qlen != lastSearchLen) {
             s_lastTab = s_tab;
+            lastSearchLen = qlen;
             s_tabAge = 0.0f;
         } else if (s_tabAge < 3.0f) {
             s_tabAge += dt;
@@ -1098,10 +1066,10 @@ public:
             ImGui::Indent(16.0f);
             ImGui::PushItemWidth(ImGui::GetContentRegionAvail().x - 32.0f);
 
-            if (s_search[0])                 RenderSearch();
-            else if (s_tab == kTabInterface) RenderInterface();
-            else if (s_tab == kTabConfig)    RenderConfigs();
-            else                             RenderCategory(s_tabCats[s_tab]);
+            if (s_search[0])            RenderSearch();
+            else if (s_tab == TAB_UI)     RenderInterface();
+            else if (s_tab == TAB_CONFIG) iOS::ConfigPanel::Render();
+            else                          RenderTab(s_tab);
 
             ImGui::PopItemWidth();
             ImGui::Unindent(16.0f);
@@ -1121,8 +1089,9 @@ public:
                                        haveHover ? 1.0f : 0.0f, 14.0f);
         if (s_hoverFade > 0.02f) {
             const std::string& title = haveHover ? s_hoverName : prevHover;
-            iOS::HoverCard(s_hoverAnchor, title.c_str(), s_hoverDesc.c_str(),
-                           s_hoverFade * s_fade);
+            if (!title.empty())
+                iOS::HoverCard(s_hoverAnchor, title.c_str(), s_hoverDesc.c_str(),
+                               s_hoverFade * s_fade);
         }
 
         RenderBindOverlay();
