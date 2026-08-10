@@ -74,6 +74,11 @@ private:
     inline static int   s_lastTab = -1;
     inline static float s_tabAge  = 0.0f;
 
+    // Direction of the last view change: +1 moved right, -1 left, 0
+    // no move. Drives the slide of the incoming content so a tab
+    // change reads as travel rather than a cut.
+    inline static float s_slideDir = 0.0f;
+
     inline static std::unordered_map<std::string, bool> s_pending;
     inline static std::unordered_map<std::string, bool> s_expanded;
     inline static std::unordered_map<std::string, bool> s_advanced;
@@ -136,16 +141,11 @@ private:
         }
     }
 
-    static float Clamp01(float v) {
-        return v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v);
-    }
-
-    // Decelerating ease. Fast at the start, settles softly, which is
-    // the curve iOS uses for anything entering the screen.
-    static float EaseOut(float t) {
-        float u = 1.0f - Clamp01(t);
-        return 1.0f - u * u * u;
-    }
+    // Kept as thin names over the shared curves in iOS::Ease, so the
+    // call sites below read the same as they always did while there
+    // is exactly one definition of the curve in the whole client.
+    static float Clamp01(float v) { return iOS::Ease::Clamp01(v); }
+    static float EaseOut(float t) { return iOS::Ease::Out(t); }
 
     // How far along is row `index` in the tab transition?
     static float RowEntry(int index) {
@@ -238,7 +238,7 @@ private:
         }
 
         if (hovered) {
-            ImGui::SetTooltip(key > 0 ? "Click to rebind" : "Click to set a key");
+            iOS::Tooltip(key > 0 ? "Click to rebind" : "Click to set a key");
         }
 
         float hov = iOS::Anim::To(ImGui::GetID("##bindh"),
@@ -667,8 +667,17 @@ private:
         int enabled = 0;
         for (auto& m : mods) if (m->IsEnabled()) enabled++;
 
+        // Roll the count the way the header badge does, so toggling a
+        // module updates both in step instead of one sliding and one
+        // jumping. Keyed per tab so switching tabs does not carry the
+        // previous tab's number across.
+        char key[24];
+        snprintf(key, sizeof(key), "tabActive%d", tab);
+        float shownEnabled = iOS::Anim::ToStr(key, (float)enabled, 12.0f);
+
         char head[64];
-        snprintf(head, sizeof(head), "%d of %d active", enabled, (int)mods.size());
+        snprintf(head, sizeof(head), "%d of %d active",
+                 (int)(shownEnabled + 0.5f), (int)mods.size());
         iOS::SectionHeader(head);
 
         RenderList(mods, tab == TAB_MISC);
@@ -936,13 +945,31 @@ public:
 
         static int lastSearchLen = -1;
         int qlen = (int)std::strlen(s_search);
+
+        // Which top-level view is on screen: a tab, or search. When
+        // it changes we note the direction of travel so the incoming
+        // content slides in from that side rather than cutting.
+        int viewId = s_search[0] ? (int)TAB_COUNT : s_tab;
+        static int s_prevView = -1;
+
         if (s_tab != s_lastTab || qlen != lastSearchLen) {
+            if (s_prevView >= 0 && viewId != s_prevView)
+                s_slideDir = (viewId > s_prevView) ? 1.0f : -1.0f;
+            else
+                s_slideDir = 0.0f;   // same view (a keystroke): no slide
+            s_prevView = viewId;
             s_lastTab = s_tab;
             lastSearchLen = qlen;
             s_tabAge = 0.0f;
         } else if (s_tabAge < 3.0f) {
             s_tabAge += dt;
         }
+
+        // Eases from a small offset to zero over the same window the
+        // rows stagger in. 14px is enough to read as movement and
+        // small enough that the content never leaves the panel: the
+        // base indent is 16, so the total stays positive.
+        float slideOff = s_slideDir * 14.0f * (1.0f - EaseOut(s_tabAge / 0.22f));
 
         if (s_tab != TAB_UI || s_search[0]) iOS::HUD::SetEditing(false);
 
@@ -993,14 +1020,14 @@ public:
             if (iOS::UI::openAnimation)
                 ImGui::Dummy(ImVec2(0, (1.0f - EaseOut(s_fade)) * 14.0f));
 
-            ImGui::Indent(16.0f);
+            ImGui::Indent(16.0f + slideOff);
 
             if (s_search[0])            RenderSearch();
             else if (s_tab == TAB_UI)     RenderInterface();
             else if (s_tab == TAB_CONFIG) iOS::ConfigPanel::Render();
             else                          RenderTab(s_tab);
 
-            ImGui::Unindent(16.0f);
+            ImGui::Unindent(16.0f + slideOff);
             ImGui::Dummy(ImVec2(0, 12));
             ImGui::EndChild();
         }
