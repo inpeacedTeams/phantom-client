@@ -64,16 +64,17 @@
 // TICK ORDER  (all of it is load-bearing)
 //
 //   1. Push the local frame, invalidate the entity cache.
-//   2. Backtrack restores real positions. Everything downstream,
+//   2. Lifecycle: has the world changed under us, did we just die?
+//   3. Backtrack restores real positions. Everything downstream,
 //      including the ESP, must see the world as the server has it.
-//   3. Camera snapshot, taken before any module rotates the player.
-//   4. CombatState, so every module reads the same facts about this
+//   4. Camera snapshot, taken before any module rotates the player.
+//   5. CombatState, so every module reads the same facts about this
 //      tick rather than each deriving its own from the mouse.
-//   5. Mouse grab follows the menu.
-//   6. UI actions, keybinds, then the modules themselves.
-//   7. Queued clicks are handed to the game LAST, so a click fired
+//   6. Mouse grab follows the menu.
+//   7. UI actions, keybinds, then the modules themselves.
+//   8. Queued clicks are handed to the game LAST, so a click fired
 //      by a module this tick goes out on this tick.
-//   8. Key reconciliation, after everything has had its say.
+//   9. Key reconciliation, after everything has had its say.
 //
 // KEY SAFETY
 // Modules hold real keybinds down, and KeyBinding.pressed is edge
@@ -86,6 +87,18 @@
 // and every tick ends with KeyBinds::Reconcile, which puts any key
 // we are no longer driving back in line with the hardware. Worst
 // case a key is wrong for one tick.
+//
+// LIFECYCLE
+// A tick is not the only thing that happens to a module. The world
+// gets swapped when you change servers or take a portal, the player
+// dies and respawns, the connection drops and comes back. In every
+// one of those cases the module is still enabled and still running,
+// but everything it remembers is about a situation that no longer
+// exists: a target that despawned, a timer counting toward a fight
+// that ended, recorded positions from another world.
+//
+// Rather than have fifteen modules each try to notice, the manager
+// watches for it once and calls OnReset on all of them.
 //
 // FAULT ISOLATION
 // A module that throws used to have its stack trace printed to a
@@ -104,6 +117,11 @@ private:
     inline static std::vector<std::shared_ptr<Module>> s_modules;
     inline static bool s_keyStates[256] = {};
 
+    // Hotkeys are suppressed while the menu is open or a bind is
+    // being captured. Coming back from that, a key the player is
+    // still holding must not read as a fresh press.
+    inline static bool s_hotkeysWere = false;
+
     inline static std::vector<std::function<void(JNIEnv*)>> s_actions;
     inline static std::mutex s_actionMutex;
 
@@ -112,6 +130,14 @@ private:
     inline static std::shared_ptr<Backtrack> s_backtrack;
     inline static std::shared_ptr<AutoClicker> s_autoClicker;
     inline static bool s_wasInGame = false;
+
+    // ---- Lifecycle tracking ----
+    // A global ref to the world we last saw. Comparing the object
+    // itself is the only reliable signal: a dimension change and a
+    // server switch both replace WorldClient, and neither announces
+    // itself anywhere we can read.
+    inline static jobject s_lastWorld = nullptr;
+    inline static bool    s_wasDead   = false;
 
     // Consecutive faults per module. Reset by a clean tick, because
     // one bad frame during a world change is not a broken module.
@@ -192,6 +218,75 @@ private:
         iOS::Notify::Error(name + " was disabled",
             std::string("It ") + reason +
             " repeatedly. The rest of the client is unaffected.");
+    }
+
+    // -------------------------------------------------------------
+    // Hand every module a clean slate. Enabled modules stay enabled.
+    // -------------------------------------------------------------
+    static void BroadcastReset(JNIEnv* env) {
+        // Shared state first, so a module's OnReset reads a world
+        // that has already been cleared rather than a half-old one.
+        CombatState::Reset();
+        Rotation::ResetVelocity();
+        Camera::Invalidate();
+        EntityList::BeginTick();
+        ClickScheduler::ClearPending();
+        s_faults.clear();
+
+        for (auto& mod : s_modules) {
+            try {
+                mod->OnReset(env);
+            } catch (...) {}
+            ClearJavaException(env);
+        }
+
+        // Whatever was being held was being held for a situation
+        // that no longer exists.
+        KeyBinds::ReleaseAll(env);
+        KeyBinds::ClearClickQueue(env);
+        ClearJavaException(env);
+    }
+
+    // -------------------------------------------------------------
+    // Watch for the ground moving: world swap, death, respawn.
+    // -------------------------------------------------------------
+    static void UpdateLifecycle(JNIEnv* env) {
+        jobject world = Minecraft::GetWorld(env);
+        ClearJavaException(env);
+
+        bool changed = false;
+
+        if (!world) {
+            // Between worlds. Drop the ref now so coming back into a
+            // world always counts as a change, even in the unlikely
+            // case the JVM hands us the same address again.
+            if (s_lastWorld) {
+                env->DeleteGlobalRef(s_lastWorld);
+                s_lastWorld = nullptr;
+                changed = true;
+            }
+        } else if (!s_lastWorld || !env->IsSameObject(s_lastWorld, world)) {
+            if (s_lastWorld) {
+                env->DeleteGlobalRef(s_lastWorld);
+                changed = true;   // a swap, not the first world we saw
+            }
+            s_lastWorld = env->NewGlobalRef(world);
+            ClearJavaException(env);
+        }
+
+        // Death and respawn both matter. Dying mid-combo leaves
+        // every combat module mid-combo; respawning puts you
+        // somewhere else entirely.
+        jobject player = Minecraft::GetPlayer(env);
+        ClearJavaException(env);
+
+        bool dead = player && Minecraft::IsDead(env, player);
+        if (dead != s_wasDead) {
+            s_wasDead = dead;
+            changed = true;
+        }
+
+        if (changed) BroadcastReset(env);
     }
 
     // -------------------------------------------------------------
@@ -311,8 +406,24 @@ public:
         Rotation::ResetVelocity();  // or the arm keeps drifting in the next game
         MouseControl::Shutdown();   // the next world re-resolves and re-grabs
         s_faults.clear();           // a world change is not a module fault
+        s_wasDead = false;
 
         if (env) {
+            // Modules are still enabled and will run again the
+            // moment the next world loads, so they get the same
+            // clean slate a mid-game world change would give them.
+            for (auto& mod : s_modules) {
+                try {
+                    mod->OnReset(env);
+                } catch (...) {}
+                ClearJavaException(env);
+            }
+
+            if (s_lastWorld) {
+                env->DeleteGlobalRef(s_lastWorld);
+                s_lastWorld = nullptr;
+            }
+
             KeyBinds::ReleaseAll(env);
             KeyBinds::ClearClickQueue(env);
             ClearJavaException(env);
@@ -331,6 +442,11 @@ public:
         // Entity refs belong to the frame we just pushed, so the
         // cache has to be invalidated inside it, not outside.
         EntityList::BeginTick();
+
+        // Did the ground move? Has to come before anything reads an
+        // entity, so nothing this tick works from last world's data.
+        UpdateLifecycle(env);
+        ClearJavaException(env);
 
         // Undo last tick's rewind before anything reads an entity.
         // Runs even while the module is off, so a toggle mid-rewind
@@ -385,6 +501,19 @@ public:
         bool focused = (s_gameWindow == nullptr)
                     || (GetForegroundWindow() == s_gameWindow);
         bool hotkeys = focused && !s_menuOpen.load() && !KeyCapture::IsActive();
+
+        // Coming back from a suppressed spell, adopt the current
+        // hardware state without acting on it. Otherwise a key the
+        // player never let go of reads as a brand new press the
+        // instant the menu closes, and a module toggles itself.
+        if (hotkeys && !s_hotkeysWere) {
+            for (auto& mod : s_modules) {
+                int key = mod->GetKeybind();
+                if (key <= 0 || key > 255) continue;
+                s_keyStates[key] = (GetAsyncKeyState(key) & 0x8000) != 0;
+            }
+        }
+        s_hotkeysWere = hotkeys;
 
         for (auto& mod : s_modules) {
             int key = mod->GetKeybind();
@@ -458,6 +587,11 @@ public:
             KeyBinds::ReleaseAll(env);
             KeyBinds::ClearClickQueue(env);
             ClearJavaException(env);
+
+            if (s_lastWorld) {
+                env->DeleteGlobalRef(s_lastWorld);
+                s_lastWorld = nullptr;
+            }
         }
         MouseControl::Shutdown();
         {
@@ -474,10 +608,23 @@ public:
     static int GetModuleCount() { return (int)s_modules.size(); }
     static std::vector<std::shared_ptr<Module>>& GetModules() { return s_modules; }
 
-    static std::vector<std::shared_ptr<Module>> GetModulesByCategory(ModuleCategory cat) {
-        std::vector<std::shared_ptr<Module>> out;
-        for (auto& m : s_modules)
-            if (m->GetCategory() == cat) out.push_back(m);
-        return out;
+    // -------------------------------------------------------------
+    // Category lists are read once per frame per tab by the menu.
+    // Building a fresh vector for each of those was a few hundred
+    // allocations a second to produce a list that only changes when
+    // the module set does, which is never after startup.
+    // -------------------------------------------------------------
+    static const std::vector<std::shared_ptr<Module>>&
+    GetModulesByCategory(ModuleCategory cat) {
+        static std::unordered_map<int, std::vector<std::shared_ptr<Module>>> cache;
+        static size_t builtFor = (size_t)-1;
+
+        if (builtFor != s_modules.size()) {
+            cache.clear();
+            for (auto& m : s_modules)
+                cache[(int)m->GetCategory()].push_back(m);
+            builtFor = s_modules.size();
+        }
+        return cache[(int)cat];
     }
 };
