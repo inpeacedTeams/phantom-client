@@ -8,6 +8,8 @@
 #include "module.h"
 #include "../mc/keybinds.h"
 #include "../mc/entity_list.h"
+#include "../mc/combat_state.h"
+#include "../mc/rotation.h"
 #include "../input/click_scheduler.h"
 #include "../render/camera.h"
 
@@ -47,13 +49,15 @@
 // Every tick runs inside a JNI local frame. Without it the local
 // reference table fills up within seconds and the JVM aborts.
 //
-// TICK ORDER
-// Backtrack rewrites entity positions. Everything else, including
-// the ESP, has to see the real world, so its restore pass runs
-// before the entity scan rather than as a normal module tick.
+// TICK ORDER  (all of it is load-bearing)
 //
-// The camera snapshot is taken before the modules run, while the
-// player's own position is still untouched.
+//   1. Push the local frame, invalidate the entity cache.
+//   2. Backtrack restores real positions. Everything downstream,
+//      including the ESP, must see the world as the server has it.
+//   3. Camera snapshot, taken before any module rotates the player.
+//   4. CombatState, so every module reads the same facts about this
+//      tick rather than each deriving its own from the mouse.
+//   5. UI actions, keybinds, then the modules themselves.
 //
 // KEY SAFETY
 // Modules hold real keybinds down. If the world goes away or we
@@ -146,8 +150,12 @@ public:
     static void OnLeaveWorld(JNIEnv* env) {
         if (!s_wasInGame) return;
         s_wasInGame = false;
+
         ClickScheduler::SetActive(false);
-        Camera::Invalidate();          // stop the overlays drawing stale geometry
+        Camera::Invalidate();       // overlays stop drawing stale geometry
+        CombatState::Reset();       // swing history from the last server is meaningless
+        Rotation::ResetVelocity();  // or the arm keeps drifting in the next game
+
         if (env) KeyBinds::ReleaseAll(env);
     }
 
@@ -172,10 +180,16 @@ public:
             if (env->ExceptionCheck()) { env->ExceptionDescribe(); env->ExceptionClear(); }
         }
 
-        // Camera first: aim assist and aim lock rotate the player
+        // Camera before the modules: aim assist rotates the player
         // later in the tick, and the overlays should match the frame
         // the game is about to draw.
         Camera::Update(env);
+        if (env->ExceptionCheck()) { env->ExceptionDescribe(); env->ExceptionClear(); }
+
+        // One read of "what happened this tick", shared by every
+        // module. Before this existed each of them polled the mouse
+        // button and called that an attack.
+        CombatState::Update(env);
         if (env->ExceptionCheck()) { env->ExceptionDescribe(); env->ExceptionClear(); }
 
         // ---- Work handed over by the UI ----
@@ -224,6 +238,8 @@ public:
         // callback captures a module pointer.
         ClickScheduler::Stop();
         Camera::Invalidate();
+        CombatState::Reset();
+        Rotation::ResetVelocity();
 
         if (env) {
             // Disable everything so modules release the keybinds they
