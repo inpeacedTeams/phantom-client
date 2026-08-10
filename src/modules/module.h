@@ -34,6 +34,13 @@ enum class ModuleCategory {
 // config key AND the label, so they cannot disagree. The hint is
 // mandatory in spirit: a control nobody can explain should not be
 // exposed at all.
+//
+// It also carries the value it started with. Bind runs in the
+// constructor, after the member initialisers, so the field already
+// holds the module's default at the moment it is registered.
+// Recording it there is free, and it is what lets the config loader
+// start from a known state instead of layering one config on top of
+// the last one.
 // =================================================================
 struct Setting {
     enum class Type { Bool, Int, Float, Mode };
@@ -49,6 +56,9 @@ struct Setting {
 
     const char* const* options = nullptr;   // Mode only
     int optionCount = 0;
+
+    // Captured at Bind time. Never written again.
+    float def = 0.0f;
 
     // Everyday settings are on the panel. Everything else is behind
     // Advanced, which most people will never open and should never
@@ -68,6 +78,12 @@ struct Setting {
     float AsFloat() const { return *(float*)ptr; }
 
     // The value a config file stores, whatever the type underneath.
+    //
+    // EVERY reader must go through this rather than reaching for
+    // AsFloat. A Mode is an int, and reading one as a float
+    // reinterprets the bits: mode 5 comes back as 7e-45, which then
+    // clamps to 0 on the way in. That is how a saved config used to
+    // quietly reset every mode in the client to its first option.
     float Read() const {
         switch (type) {
             case Type::Bool:  return *(bool*)ptr ? 1.0f : 0.0f;
@@ -101,6 +117,13 @@ struct Setting {
                 *(float*)ptr = v < lo ? lo : (v > hi ? hi : v);
                 break;
         }
+    }
+
+    void Restore() { Write(def); }
+
+    bool IsDefault() const {
+        float d = Read() - def;
+        return d < 0.0001f && d > -0.0001f;
     }
 };
 
@@ -157,9 +180,17 @@ protected:
     std::atomic<bool> m_enabled{ false };
     std::atomic<int>  m_keybind{ 0 };
 
+    // The bind this module shipped with, so "put my keys back" is
+    // answerable without hardcoding the list somewhere else.
+    int m_defaultKeybind = 0;
+
     std::vector<Setting> m_settings;
 
     SettingRef Push(Setting s) {
+        // The field holds the module's default right now. This is
+        // the only moment that is true, so it is the only moment to
+        // record it.
+        s.def = s.Read();
         m_settings.push_back(s);
         return SettingRef{ &m_settings, m_settings.size() - 1 };
     }
@@ -212,7 +243,9 @@ public:
            ModuleCategory cat, int key = 0)
         : m_name(name), m_description(desc), m_category(cat)
     {
-        m_keybind.store(key);
+        int k = (key > 0 && key < 256) ? key : 0;
+        m_defaultKeybind = k;
+        m_keybind.store(k);
     }
 
     virtual ~Module() = default;
@@ -294,6 +327,34 @@ public:
         return false;
     }
 
+    bool GetValue(const std::string& setting, float* out) const {
+        for (const auto& s : m_settings) {
+            if (s.name != setting) continue;
+            if (out) *out = s.Read();
+            return true;
+        }
+        return false;
+    }
+
+    // -------------------------------------------------------------
+    // Put every tunable back where it started.
+    //
+    // The config loader calls this before applying a file. Without
+    // it, loading config B after config A leaves A's values in every
+    // field B happens not to mention, so the result depends on what
+    // you had loaded before rather than on what is in the file.
+    // -------------------------------------------------------------
+    void ResetToDefaults() {
+        for (auto& s : m_settings) s.Restore();
+    }
+
+    // Does anything differ from the shipped values? The panel uses
+    // this to decide whether a Reset control is worth offering.
+    bool IsModified() const {
+        for (const auto& s : m_settings) if (!s.IsDefault()) return true;
+        return m_keybind.load() != m_defaultKeybind;
+    }
+
     const std::vector<Setting>& GetSettings() const { return m_settings; }
     std::vector<Setting>&       GetSettings()       { return m_settings; }
 
@@ -301,6 +362,7 @@ public:
     const std::string& GetDescription() const { return m_description; }
     ModuleCategory     GetCategory() const    { return m_category; }
     int  GetKeybind() const                   { return m_keybind.load(); }
-    void SetKeybind(int key)                  { m_keybind.store(key); }
+    int  GetDefaultKeybind() const            { return m_defaultKeybind; }
+    void SetKeybind(int key)                  { m_keybind.store((key > 0 && key < 256) ? key : 0); }
     bool IsEnabled() const                    { return m_enabled.load(); }
 };
