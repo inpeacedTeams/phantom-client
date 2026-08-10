@@ -3,6 +3,7 @@
 #include "../../mc/minecraft.h"
 #include "../../mc/entity_list.h"
 #include "../../render/camera.h"
+#include "../../gui/ios_theme.h"
 #include <imgui.h>
 #include <cmath>
 #include <cstdio>
@@ -41,6 +42,11 @@
 //    and the box never matched the hitbox you were actually aiming
 //    at. Real width and height come from the entity now.
 //
+// 5. IT HAD ITS OWN COLOUR.
+//    A private RGBA picker, so the client could have a green accent
+//    and blue boxes. It draws in the client accent now: one colour
+//    setting, in one place, for the whole product.
+//
 // THREADING
 // OnTick runs on the client thread and publishes plain data under a
 // mutex. RenderESP runs on the render thread and never touches JNI.
@@ -48,8 +54,14 @@
 
 class ESP : public Module {
 private:
+    static constexpr const char* kStyles[]  = { "Corners", "Box", "Rounded" };
+    static constexpr const char* kOrigins[] = { "Bottom", "Crosshair" };
+
+    // Box smoothing rate. Fast enough never to trail a running
+    // player, slow enough to kill the sub-pixel crawl.
+    static constexpr float kBoxSmoothing = 26.0f;
+
     // ---- Core ----
-    // 0 Corners, 1 Full box, 2 Outline only
     int   m_boxStyle   = 0;
     bool  m_showBox    = true;
     bool  m_showHealth = true;
@@ -62,13 +74,12 @@ private:
     int   m_tracerOrigin  = 0;      // 0 bottom, 1 crosshair
     bool  m_healthColor   = false;  // tint the box by health
     bool  m_distanceFade  = true;
+    float m_opacity       = 1.0f;
     float m_lineThickness = 1.4f;
     bool  m_interpolate   = true;
     bool  m_smoothBoxes   = true;
     float m_fadeSpeed     = 12.0f;
     bool  m_shadowText    = true;
-
-    float m_color[4] = { 0.36f, 0.72f, 1.00f, 1.00f };
 
     // ---- Published by the client thread ----
     std::vector<EntitySnapshot> m_shared;
@@ -91,6 +102,7 @@ private:
     std::unordered_map<int, Track> m_tracks;
 
     mutable char m_status[32] = {};
+    mutable char m_notice[160] = {};
 
     static float Clamp01(float v) {
         return v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v);
@@ -102,9 +114,17 @@ private:
         return cur + (target - cur) * (1.0f - std::exp(-speed * dt));
     }
 
-    static ImU32 WithAlpha(const float rgba[4], float a) {
-        return ImGui::ColorConvertFloat4ToU32(
-            ImVec4(rgba[0], rgba[1], rgba[2], rgba[3] * a));
+    // The client accent, so changing it in the UI tab changes the
+    // boxes too.
+    ImVec4 Base() const {
+        ImVec4 c = ImGui::ColorConvertU32ToFloat4(iOS::UI::AccentColor());
+        c.w = m_opacity;
+        return c;
+    }
+
+    ImU32 WithAlpha(float a) const {
+        ImVec4 c = Base();
+        return ImGui::ColorConvertFloat4ToU32(ImVec4(c.x, c.y, c.z, c.w * a));
     }
 
     // Green through yellow to red
@@ -149,21 +169,61 @@ public:
     ESP() : Module("ESP", "Highlight players through walls",
                    ModuleCategory::VISUAL, 'X')
     {
-        Bind("Box Style", &m_boxStyle);
-        Bind("Show Box", &m_showBox);
-        Bind("Show Health", &m_showHealth);
-        Bind("Show Name", &m_showName);
-        Bind("Show Distance", &m_showDistance);
-        Bind("Max Range", &m_maxRange);
-        Bind("Show Tracers", &m_showTracers);
-        Bind("Tracer Origin", &m_tracerOrigin);
-        Bind("Health Color", &m_healthColor);
-        Bind("Distance Fade", &m_distanceFade);
-        Bind("Line Thickness", &m_lineThickness);
-        Bind("Interpolate", &m_interpolate);
-        Bind("Smooth Boxes", &m_smoothBoxes);
-        Bind("Fade Speed", &m_fadeSpeed);
-        Bind("Shadow Text", &m_shadowText);
+        BindMode("Box Style", &m_boxStyle, kStyles, 3,
+                 "Corners read more cleanly against a busy world than a "
+                 "full rectangle does");
+
+        Bind("Box", &m_showBox, "Outline around each player");
+        Bind("Health", &m_showHealth, "Bar down the left of the box");
+        Bind("Name", &m_showName, "Their username above the box");
+        Bind("Distance", &m_showDistance, "Metres, under the box");
+
+        Bind("Range", &m_maxRange, 16.0f, 128.0f, "%.0f",
+             "How far out players are drawn, in metres");
+
+        // ---- Extras ----
+        Bind("Tracers", &m_showTracers,
+             "Line from the screen to each player. Extremely obvious on a "
+             "recording.")
+            .Advanced();
+
+        BindMode("Tracer From", &m_tracerOrigin, kOrigins, 2,
+                 "Where the lines start")
+            .When("Tracers", 1).Advanced();
+
+        Bind("Colour By Health", &m_healthColor,
+             "Tint the box green through red instead of using the accent")
+            .Advanced();
+
+        Bind("Fade With Distance", &m_distanceFade,
+             "Distant players draw fainter, so a crowded map stays readable")
+            .Advanced();
+
+        Bind("Opacity", &m_opacity, 0.25f, 1.0f, "%.2f",
+             "Overall strength of everything this draws")
+            .Advanced();
+
+        Bind("Text Shadow", &m_shadowText,
+             "Keeps names legible against a bright sky")
+            .Advanced();
+
+        // ---- Rendering ----
+        Bind("Line Thickness", &m_lineThickness, 1.0f, 4.0f, "%.1f")
+            .Advanced();
+
+        Bind("Interpolate", &m_interpolate,
+             "Smooths motion between the twenty position updates a second "
+             "the server actually sends")
+            .Advanced();
+
+        Bind("Smooth Boxes", &m_smoothBoxes,
+             "Removes the sub-pixel crawl on a stationary target")
+            .Advanced();
+
+        Bind("Fade Speed", &m_fadeSpeed, 4.0f, 30.0f, "%.0f",
+             "Lower is a softer appear and disappear. This is what stops a "
+             "one-tick gap looking like a flicker.")
+            .Advanced();
     }
 
     void OnDisable(JNIEnv*) override {
@@ -177,6 +237,18 @@ public:
         // Tracks are owned by the render thread and fade themselves
         // out on the next frame, so the boxes dissolve rather than
         // snapping off the instant the switch moves.
+    }
+
+    // Every id in the snapshot belongs to the world that just went
+    // away, and ids are recycled.
+    void OnReset(JNIEnv*) override {
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            m_shared.clear();
+        }
+        m_version.fetch_add(1);
+        m_count.store(0);
+        m_status[0] = '\0';
     }
 
     // ---- Client thread ----
@@ -199,6 +271,24 @@ public:
 
     const char* StatusLine() const override {
         return m_status[0] ? m_status : nullptr;
+    }
+
+    NoticeLevel Notice(const char** text) const override {
+        if (!Camera::Get().valid) {
+            *text = "The camera has not been worked out yet. Join a world and "
+                    "the boxes will appear.";
+            return NoticeLevel::Warning;
+        }
+        if (m_showTracers) {
+            *text = "Tracers are the single most obvious thing in this "
+                    "client on a recording.";
+            return NoticeLevel::Warning;
+        }
+        snprintf(m_notice, sizeof(m_notice),
+                 "Drawing in the client accent, so the UI tab changes these "
+                 "boxes too.");
+        *text = m_notice;
+        return NoticeLevel::Info;
     }
 
     // =============================================================
@@ -299,15 +389,11 @@ private:
             return;
         }
 
-        // Light smoothing removes the sub-pixel crawl that comes
-        // from double to float rounding. Fast enough that it never
-        // trails a moving player.
         if (m_smoothBoxes && t.hasBox) {
-            const float k = 26.0f;
-            box.minX = Approach(t.box.minX, box.minX, k, dt);
-            box.minY = Approach(t.box.minY, box.minY, k, dt);
-            box.maxX = Approach(t.box.maxX, box.maxX, k, dt);
-            box.maxY = Approach(t.box.maxY, box.maxY, k, dt);
+            box.minX = Approach(t.box.minX, box.minX, kBoxSmoothing, dt);
+            box.minY = Approach(t.box.minY, box.minY, kBoxSmoothing, dt);
+            box.maxX = Approach(t.box.maxX, box.maxX, kBoxSmoothing, dt);
+            box.maxY = Approach(t.box.maxY, box.maxY, kBoxSmoothing, dt);
         }
         t.box = box;
         t.hasBox = true;
@@ -322,8 +408,8 @@ private:
 
         float hpPct = (e.maxHealth > 0.f) ? (e.health / e.maxHealth) : 1.0f;
 
-        ImU32 col = m_healthColor ? HealthColor(hpPct, m_color[3] * a)
-                                  : WithAlpha(m_color, a);
+        ImU32 col = m_healthColor ? HealthColor(hpPct, m_opacity * a)
+                                  : WithAlpha(a);
         // Flash white on the tick they take damage: the clearest
         // possible "your hit landed" feedback.
         if (e.hurtTime > 0) col = IM_COL32(255, 255, 255, (int)(235 * a));
@@ -394,64 +480,7 @@ private:
                         ? ImVec2(sw * 0.5f, sh * 0.5f)
                         : ImVec2(sw * 0.5f, sh);
             ImVec2 to(box.CenterX(), box.maxY);
-            dl->AddLine(from, to, WithAlpha(m_color, a * 0.55f), 1.0f);
+            dl->AddLine(from, to, WithAlpha(a * 0.55f), 1.0f);
         }
-    }
-
-public:
-    // =============================================================
-    // Panel
-    // =============================================================
-    void RenderSettings() override {
-        const char* styles[] = { "Corners", "Full Box", "Rounded" };
-        ImGui::Combo("Box Style", &m_boxStyle, styles, 3);
-
-        ImGui::Checkbox("Box", &m_showBox);
-        ImGui::SameLine();
-        ImGui::Checkbox("Health", &m_showHealth);
-        ImGui::Checkbox("Name", &m_showName);
-        ImGui::SameLine();
-        ImGui::Checkbox("Distance", &m_showDistance);
-
-        ImGui::SliderFloat("Range", &m_maxRange, 16.f, 128.f, "%.0f m");
-
-        ImGui::ColorEdit4("Colour", m_color,
-                          ImGuiColorEditFlags_NoInputs |
-                          ImGuiColorEditFlags_AlphaBar);
-
-        if (!Camera::Get().valid) {
-            ImGui::TextColored(ImVec4(1.f, 0.7f, 0.3f, 1.f),
-                "Camera not resolved yet: join a world");
-        }
-    }
-
-    bool HasAdvanced() const override { return true; }
-
-    void RenderAdvanced() override {
-        ImGui::TextDisabled("Tracking %d, drawing %d",
-            m_count.load(), (int)m_tracks.size());
-
-        ImGui::SeparatorText("Extras");
-        ImGui::Checkbox("Tracers", &m_showTracers);
-        if (m_showTracers) {
-            const char* origins[] = { "Screen bottom", "Crosshair" };
-            ImGui::Combo("Tracer From", &m_tracerOrigin, origins, 2);
-            ImGui::TextColored(ImVec4(1.f, 0.7f, 0.3f, 1.f),
-                "Very obvious on a recording");
-        }
-        ImGui::Checkbox("Colour By Health", &m_healthColor);
-        ImGui::Checkbox("Fade With Distance", &m_distanceFade);
-        ImGui::Checkbox("Text Shadow", &m_shadowText);
-
-        ImGui::SeparatorText("Rendering");
-        ImGui::SliderFloat("Line Thickness", &m_lineThickness, 1.f, 4.f, "%.1f");
-        ImGui::Checkbox("Interpolate", &m_interpolate);
-        ImGui::TextDisabled("Smooths motion between the 20 position updates "
-                            "a second the server actually sends.");
-        ImGui::Checkbox("Smooth Boxes", &m_smoothBoxes);
-        ImGui::TextDisabled("Removes sub-pixel crawl on stationary targets.");
-        ImGui::SliderFloat("Fade Speed", &m_fadeSpeed, 4.f, 30.f, "%.0f");
-        ImGui::TextDisabled("Lower is a softer appear and disappear. This is "
-                            "what stops a one-tick gap looking like a flicker.");
     }
 };
