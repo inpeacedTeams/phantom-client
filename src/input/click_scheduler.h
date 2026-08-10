@@ -110,6 +110,14 @@ private:
     inline static std::atomic<bool> s_armed{ false };
     inline static std::atomic<bool> s_holding{ false };
 
+    // The Phantom menu is open. The engine polls the physical mouse
+    // itself, so it cannot rely on a module ticking to stop it:
+    // while the cursor belongs to the UI a held button is aimed at a
+    // switch, not at the game. Gated here so BOTH sources fall
+    // silent at once — the autoclicker through ShouldRun and one-off
+    // callers like Hit Select through RequestClick.
+    inline static std::atomic<bool> s_menuOpen{ false };
+
     inline static HWND s_window = nullptr;
 
     // ---- Config, published by the module ----
@@ -261,6 +269,9 @@ private:
     }
 
     static bool ShouldRun() {
+        // The menu is up: the mouse belongs to the UI, so a held
+        // button is aimed at a control rather than at the game.
+        if (s_menuOpen.load(std::memory_order_relaxed)) return false;
         if (!s_armed.load(std::memory_order_relaxed)) return false;
         if (!s_holding.load(std::memory_order_relaxed)) return false;
         if (s_window && GetForegroundWindow() != s_window) return false;
@@ -413,10 +424,23 @@ public:
         if (was && !on) ClearPending();
     }
 
+    // Follows the Phantom menu. Set from the window/render thread,
+    // which is safe because it only touches an atomic, so the click
+    // stream stops on the same edge the menu opens rather than
+    // waiting for the next 20 TPS tick. Anything already queued is
+    // dropped, or it would fire the instant the menu closes.
+    static void SetMenuOpen(bool on) {
+        bool was = s_menuOpen.exchange(on);
+        if (!was && on) ClearPending();
+    }
+
     static bool IsArmed()    { return s_armed.load(); }
     static bool IsHolding()  { return s_holding.load(); }
     static bool IsRunning()  { return s_running.load(); }
-    static bool IsClicking() { return s_armed.load() && s_holding.load(); }
+    static bool IsMenuOpen() { return s_menuOpen.load(); }
+    static bool IsClicking() {
+        return s_armed.load() && s_holding.load() && !s_menuOpen.load();
+    }
 
     // -------------------------------------------------------------
     // Drained on the client thread, the only one allowed to touch
@@ -434,6 +458,7 @@ public:
     // as Hit Select. Shares the floor, so the two can never stack
     // into an interval no hand could produce.
     static bool RequestClick(bool right = false) {
+        if (s_menuOpen.load(std::memory_order_relaxed)) return false;
         if (s_window && GetForegroundWindow() != s_window) return false;
         return Emit(right);
     }
