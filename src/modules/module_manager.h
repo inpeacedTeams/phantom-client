@@ -9,6 +9,7 @@
 #include "../mc/keybinds.h"
 #include "../mc/entity_list.h"
 #include "../input/click_scheduler.h"
+#include "../render/camera.h"
 
 // Combat
 #include "combat/aim_assist.h"
@@ -50,6 +51,9 @@
 // Backtrack rewrites entity positions. Everything else, including
 // the ESP, has to see the real world, so its restore pass runs
 // before the entity scan rather than as a normal module tick.
+//
+// The camera snapshot is taken before the modules run, while the
+// player's own position is still untouched.
 //
 // KEY SAFETY
 // Modules hold real keybinds down. If the world goes away or we
@@ -113,6 +117,7 @@ public:
     }
 
     static std::shared_ptr<ESP> GetESP() { return s_esp; }
+    static std::shared_ptr<Backtrack> GetBacktrack() { return s_backtrack; }
 
     template <typename T>
     static std::shared_ptr<T> Get() {
@@ -142,6 +147,7 @@ public:
         if (!s_wasInGame) return;
         s_wasInGame = false;
         ClickScheduler::SetActive(false);
+        Camera::Invalidate();          // stop the overlays drawing stale geometry
         if (env) KeyBinds::ReleaseAll(env);
     }
 
@@ -165,6 +171,12 @@ public:
             s_backtrack->RestoreBeforeScan(env);
             if (env->ExceptionCheck()) { env->ExceptionDescribe(); env->ExceptionClear(); }
         }
+
+        // Camera first: aim assist and aim lock rotate the player
+        // later in the tick, and the overlays should match the frame
+        // the game is about to draw.
+        Camera::Update(env);
+        if (env->ExceptionCheck()) { env->ExceptionDescribe(); env->ExceptionClear(); }
 
         // ---- Work handed over by the UI ----
         {
@@ -211,6 +223,7 @@ public:
         // Stop the click thread before the modules go away: its
         // callback captures a module pointer.
         ClickScheduler::Stop();
+        Camera::Invalidate();
 
         if (env) {
             // Disable everything so modules release the keybinds they
