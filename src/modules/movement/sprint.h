@@ -9,13 +9,24 @@
 // =================================================================
 // Keeps you sprinting without holding the key.
 //
-// The old version called entity.setSprinting(true) every tick. That
-// does not work: onLivingUpdate recomputes sprint from the keybind
-// and hunger immediately afterwards, so the write was gone before
-// the movement packet was built.
+// Calling entity.setSprinting(true) every tick does not work:
+// onLivingUpdate recomputes sprint from the keybind and hunger
+// immediately afterwards, so the write is gone before the movement
+// packet is built. Holding keyBindSprint is what the game itself
+// reads, so the result is identical to a player holding ctrl,
+// packets included.
 //
-// Holding keyBindSprint is what the game itself reads, so the result
-// is identical to a player holding ctrl, packets included.
+// WHY THE HOLD IS RE-ASSERTED EVERY TICK
+// It used to press the key only on the rising edge and then trust
+// that it stayed down. It does not. Sprint Reset in Ctrl Spam mode
+// drives the same keybind, and when it hands the key back it
+// restores whatever the hardware says, which is "ctrl is not held"
+// because the player is not holding it. Sprint still believed it
+// owned the key, never wrote it again, and you silently stopped
+// sprinting for the rest of the game.
+//
+// Writing a boolean that is already true costs nothing, so the
+// state is simply re-applied while the conditions hold.
 // =================================================================
 
 class Sprint : public Module {
@@ -35,7 +46,10 @@ public:
         if (!KeyBinds::HasSprint()) return;
 
         jobject player = Minecraft::GetPlayer(env);
-        if (!player) return;
+        if (!player) {
+            if (m_held) { KeyBinds::ReleaseSprint(env); m_held = false; }
+            return;
+        }
 
         if (Minecraft::IsInGui(env)) {
             if (m_held) { KeyBinds::ReleaseSprint(env); m_held = false; }
@@ -49,10 +63,13 @@ public:
             || KeyBinds::GetLeft(env)    || KeyBinds::GetRight(env))
             :  KeyBinds::GetForward(env);
 
-        if (moving && !m_held) {
+        if (moving) {
+            // Re-asserted every tick on purpose: another module may
+            // have handed this key back to the player since our last
+            // write, and the edge-only version never noticed.
             KeyBinds::SetSprint(env, true);
             m_held = true;
-        } else if (!moving && m_held) {
+        } else if (m_held) {
             KeyBinds::ReleaseSprint(env);
             m_held = false;
         }
