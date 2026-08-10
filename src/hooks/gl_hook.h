@@ -24,12 +24,9 @@ typedef BOOL(WINAPI* fnWglSwapBuffers)(HDC);
 //
 // EJECT IS THE DANGEROUS PART
 // The render thread runs this hook while the client thread tears
-// everything down. Previously Remove() just slept 120ms and hoped:
-// if a frame was still inside Menu::Render() when ModuleManager
-// cleared its module list, the render thread walked freed memory
-// and the game crashed on eject.
-//
-// Now there is a shutdown flag plus an in-flight counter. Remove()
+// everything down. A frame still inside Menu::Render() when the
+// module list is freed walks dead memory and crashes the game, so
+// there is a shutdown flag plus an in-flight counter: Remove()
 // raises the flag, waits for the counter to reach zero, and only
 // then destroys anything.
 // =================================================================
@@ -112,6 +109,8 @@ private:
             return false;
         }
 
+        // Loads fonts and the style. Must run before the first frame,
+        // since the OpenGL2 backend builds the font atlas there.
         Menu::ApplyTheme();
 
         oWndProc = (WNDPROC)SetWindowLongPtrA(gameWindow, GWLP_WNDPROC,
@@ -151,13 +150,23 @@ private:
         }
 
         if (wglMakeCurrent(hdc, imguiContext)) {
+            bool open = s_menuOpen.load();
+
+            // Minecraft hides the OS cursor in game, so ImGui has to
+            // draw its own or the menu is unusable.
+            ImGui::GetIO().MouseDrawCursor = open;
+
             ImGui_ImplOpenGL2_NewFrame();
             ImGui_ImplWin32_NewFrame();
             ImGui::NewFrame();
 
-            Menu::RenderOverlays();          // world overlays, every frame
+            Menu::RenderOverlays();   // world overlays, every frame
             Menu::RenderHUD();
-            if (s_menuOpen.load()) Menu::Render();
+
+            // Called every frame rather than only while open: the
+            // menu owns its fade, and skipping the call would cut it
+            // off mid-dissolve.
+            Menu::Render(open);
 
             ImGui::Render();
             ImGui_ImplOpenGL2_RenderDrawData(ImGui::GetDrawData());
@@ -226,6 +235,7 @@ public:
         }
 
         if (s_ready.load()) {
+            ImGui::GetIO().MouseDrawCursor = false;
             ImGui_ImplOpenGL2_Shutdown();
             ImGui_ImplWin32_Shutdown();
             ImGui::DestroyContext();
