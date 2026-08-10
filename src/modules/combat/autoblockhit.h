@@ -3,6 +3,7 @@
 #include "../../mc/minecraft.h"
 #include "../../mc/keybinds.h"
 #include "../../mc/entity_list.h"
+#include "../../mc/combat_state.h"
 #include "../../jni/class_resolver.h"
 #include "../../jni/jvmti_util.h"
 #include <imgui.h>
@@ -24,37 +25,54 @@
 // sprint. Holding it permanently is useless and obvious, so this
 // blocks only around the moment an enemy actually swings.
 //
+// -----------------------------------------------------------------
+// BLOCKING COSTS 80% OF YOUR SPEED
+// -----------------------------------------------------------------
+// EntityPlayer.onLivingUpdate:
+//
+//     if (isBlocking()) {
+//         moveStrafing *= 0.2F;
+//         moveForward  *= 0.2F;
+//     }
+//
+// That is not a small tax. A blocking player moves at a fifth of
+// walking speed, which in a fight feels exactly like being frozen.
+// With Max Hold at 30 ticks the old build could pin you there for a
+// second and a half after each exchange.
+//
+// So there is now a movement budget: a hard cap on how long the
+// block may stay down while you are trying to walk, and a forced
+// gap afterwards. Damage reduction is worth having, but not at the
+// price of being unable to chase or retreat.
+//
+// -----------------------------------------------------------------
+// AND IT USED TO STEAL YOUR RIGHT MOUSE BUTTON
+// -----------------------------------------------------------------
+// Releasing the block called Set(useItem, false), which is not a
+// release: it takes an override and pins the key DOWN in the false
+// position. Nothing ever handed it back, so after the first block
+// the player's own right click was dead. No eating, no placing, no
+// manual blocking. Now it calls Release, which restores whatever
+// the mouse is really doing.
+//
+// -----------------------------------------------------------------
 // THREE THINGS HAVE TO BE TRUE BEFORE THE BLOCK GOES DOWN
 //   1. We are holding something that can block.
 //   2. Someone is close enough to reach us AND facing us.
 //   3. That someone has been swinging recently.
 //
-// Any one of them failing means the key stays up. An enemy standing
-// next to you looking the other way is not a threat, and neither is
-// one who has not thrown a punch in two seconds.
-//
 // THE BLOCK WINDOW
-// EntityLivingBase raises isSwingInProgress the moment a player
-// swings, which the client learns from the animation packet. Timing
-// those rising edges gives their rhythm, usually a steady 100-250ms.
-//
-// From that we open a window:
-//
 //     predicted impact
 //            |
 //   ...------[==========]------...
 //         lead        tail
 //     block down    block up
 //
-// Outside the window the key is released, which is what lets you
-// swing back. Once their hit lands, or the window closes without
-// one arriving because they missed, it opens again.
-//
 // WHY THE ITEM CHECK IS FAIL-CLOSED
-// Right-clicking with a sword blocks. Right-clicking with a block
-// PLACES it, and with a bow it starts drawing. Blocking with the
-// wrong item is worse than not blocking, so an unresolved item
-// check disables the module rather than guessing.
+// Right-clicking with a sword blocks. With a block it PLACES one,
+// with a bow it starts drawing. Blocking with the wrong item is
+// worse than not blocking, so an unresolved item check disables the
+// module rather than guessing.
 // =================================================================
 
 class AutoBlockhit : public Module {
@@ -67,14 +85,12 @@ private:
     }
 
     struct Enemy {
-        // Swing tracking
         bool  wasSwinging = false;
         bool  hasSwung    = false;
         Clock::time_point lastSwing;
         std::deque<long long> intervals;
         long long avgInterval = 0;
 
-        // Threat state, refreshed every tick
         double dist    = 99.0;
         bool   facing  = false;
         bool   inReach = false;
@@ -86,24 +102,31 @@ private:
     int m_mode = 0;
 
     // ---- Threat gate ----
-    float m_blockRange   = 3.6f;   // they can reach us from here
-    float m_detectRange  = 7.0f;   // start watching their rhythm
+    float m_blockRange    = 3.6f;
+    float m_detectRange   = 7.0f;
     bool  m_requireFacing = true;
-    float m_facingFov    = 90.0f;  // cone their look must fall inside
-    bool  m_requireAggro = true;
-    int   m_aggroMs      = 1600;   // silence longer than this means calm
+    float m_facingFov     = 90.0f;
+    bool  m_requireAggro  = true;
+    int   m_aggroMs       = 1600;
 
     // ---- Window ----
-    int m_leadMs   = 140;   // open this long before the predicted impact
-    int m_tailMs   = 120;   // stay down this long after a swing starts
+    int m_leadMs       = 140;
+    int m_tailMs       = 120;
     int m_defaultCycle = 220;
     int m_reactionMin  = 30;
     int m_reactionMax  = 90;
 
     // ---- Release ----
-    int m_swingGap      = 1;    // ticks up so our own swing lands
-    int m_afterHit      = 2;    // ticks up once their hit arrived
-    int m_maxBlockTicks = 30;
+    int m_swingGap      = 1;
+    int m_afterHit      = 2;
+    int m_maxBlockTicks = 12;
+
+    // ---- Movement budget ----
+    // Blocking is a 5x speed penalty, so it gets a leash.
+    bool m_protectMovement = true;
+    int  m_maxMovingTicks  = 6;   // consecutive ticks blocked while walking
+    int  m_movingCooldown  = 4;   // forced open ticks afterwards
+    bool m_neverWhileSprint = false;
 
     // ---- Humanisation ----
     float m_chance      = 95.0f;
@@ -120,8 +143,8 @@ private:
     bool m_blocking       = false;
     int  m_releaseLeft    = 0;
     int  m_blockHeldTicks = 0;
+    int  m_movingHeld     = 0;
     int  m_flagPause      = 0;
-    bool m_lastLMB        = false;
     int  m_lastHurtTime   = 0;
     unsigned long long m_tick = 0;
 
@@ -136,6 +159,7 @@ private:
     int  m_tracked      = 0;
     int  m_ticksBlocked = 0;
     int  m_ticksTotal   = 0;
+    int  m_speedSaves   = 0;
     const char* m_why   = "idle";
 
     // ---- JNI ----
@@ -147,7 +171,7 @@ private:
     jfieldID  m_fYaw        = nullptr;
     jmethodID m_getEntityId = nullptr;
     bool m_resolved   = false;
-    bool m_itemUsable = false;   // can we tell what is in hand at all
+    bool m_itemUsable = false;
 
     std::mt19937 m_rng{ std::random_device{}() };
 
@@ -173,9 +197,7 @@ private:
     //
     // The inventory field is looked up on the LIVE player object's
     // class rather than on ClassResolver::entityPlayer. Lunar's
-    // hierarchy does not always match the vanilla one, and when that
-    // lookup failed the old build silently allowed blocking with
-    // anything, which is exactly the reported behaviour.
+    // hierarchy does not always match the vanilla one.
     // -------------------------------------------------------------
     void Resolve(JNIEnv* env) {
         if (m_resolved) return;
@@ -300,10 +322,16 @@ private:
         return angle <= (m_facingFov * 0.5);
     }
 
+    // Down uses an override. UP must be a RELEASE, not an override
+    // to false, or the player's own right mouse button stays dead
+    // for the rest of the session.
     void SetBlock(JNIEnv* env, bool on, const char* why) {
         m_why = why;
         if (m_blocking == on) return;
-        KeyBinds::SetUseItem(env, on);
+
+        if (on) KeyBinds::SetUseItem(env, true);
+        else    KeyBinds::ReleaseUseItem(env);
+
         m_blocking = on;
         if (!on) m_blockHeldTicks = 0;
     }
@@ -328,6 +356,10 @@ public:
         Bind("Swing Gap", &m_swingGap);
         Bind("After Hit", &m_afterHit);
         Bind("Max Block Ticks", &m_maxBlockTicks);
+        Bind("Protect Movement", &m_protectMovement);
+        Bind("Max Moving Ticks", &m_maxMovingTicks);
+        Bind("Moving Cooldown", &m_movingCooldown);
+        Bind("Never While Sprinting", &m_neverWhileSprint);
         Bind("Chance", &m_chance);
         Bind("Vary Timing", &m_varyTiming);
         Bind("Timing Noise", &m_timingNoise);
@@ -341,7 +373,7 @@ public:
         Resolve(env);
 
         jobject player = Minecraft::GetPlayer(env);
-        if (!player) return;
+        if (!player) { SetBlock(env, false, "no player"); return; }
 
         m_tick++;
 
@@ -354,8 +386,6 @@ public:
         }
 
         // ---- What are we holding ----
-        // Walking the inventory every tick is wasteful and the held
-        // item rarely changes mid-swing.
         if (--m_itemTimer <= 0) {
             m_itemOk = CheckHeldItem(env, player);
             m_itemTimer = 5;
@@ -367,10 +397,9 @@ public:
         if (m_ticksTotal > 400) { m_ticksTotal /= 2; m_ticksBlocked /= 2; }
 
         // ---- Our own swing frees the key ----
-        bool lmb = (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0;
-        bool weSwung = lmb && !m_lastLMB;
-        m_lastLMB = lmb;
-        if (weSwung) {
+        // Driven by the real swing rather than the mouse button, so
+        // it stays in step with the packet the server sees.
+        if (CombatState::SwungThisTick()) {
             SetBlock(env, false, "our swing");
             m_releaseLeft = m_swingGap;
         }
@@ -382,6 +411,34 @@ public:
             m_releaseLeft = m_afterHit;
         }
         m_lastHurtTime = hurt;
+
+        // =========================================================
+        // Movement budget
+        // =========================================================
+        // Blocking multiplies movement by 0.2. Held through an
+        // exchange that reads as being stuck in mud, so the block
+        // gets a leash whenever the player is actually trying to go
+        // somewhere.
+        bool walking = KeyBinds::PhysMoving(env);
+
+        if (m_protectMovement && walking && m_blocking) {
+            m_movingHeld++;
+            if (m_movingHeld > m_maxMovingTicks) {
+                m_speedSaves++;
+                m_movingHeld = 0;
+                SetBlock(env, false, "movement budget");
+                m_releaseLeft = m_movingCooldown;
+                return;
+            }
+        } else if (!m_blocking) {
+            m_movingHeld = 0;
+        }
+
+        if (m_neverWhileSprint && Minecraft::HasSprintCheck()
+            && Minecraft::IsSprinting(env, player)) {
+            SetBlock(env, false, "sprinting");
+            return;
+        }
 
         // ---- Survey everyone nearby ----
         if (!EntityList::Init(env)) return;
@@ -400,10 +457,10 @@ public:
         double px = Minecraft::GetPosX(env, player);
         double pz = Minecraft::GetPosZ(env, player);
 
-        bool swingingNow = false;   // a threat is mid-swing right now
-        bool anyThreat   = false;   // a threat exists at all
-        long long soonest = -1;     // ms until the next predicted impact
-        long long sinceLast = -1;   // ms since a threat last swung
+        bool swingingNow = false;
+        bool anyThreat   = false;
+        long long soonest = -1;
+        long long sinceLast = -1;
 
         for (auto& e : ents) {
             int id;
@@ -412,8 +469,6 @@ public:
                 if (env->ExceptionCheck()) { env->ExceptionClear(); continue; }
                 id = (int)v;
             } else {
-                // No entity id available: names are stable enough to
-                // key rhythm tracking on.
                 id = (int)std::hash<std::string>{}(e.name);
             }
 
@@ -431,8 +486,6 @@ public:
             if (swinging && !en.wasSwinging) {
                 if (en.hasSwung) {
                     long long gap = MsSince(en.lastSwing);
-                    // Discard nonsense: duplicate events, or a pause
-                    // so long it says nothing about their rhythm.
                     if (gap >= 60 && gap <= 1200) {
                         en.intervals.push_back(gap);
                         if (en.intervals.size() > 8) en.intervals.pop_front();
@@ -452,8 +505,6 @@ public:
 
             long long since = en.hasSwung ? MsSince(en.lastSwing) : -1;
 
-            // Someone who has not thrown a punch recently is not
-            // attacking us, whatever else they are doing.
             if (m_requireAggro) {
                 if (!en.hasSwung) continue;
                 if (since > m_aggroMs) continue;
@@ -493,8 +544,7 @@ public:
 
         // ---- No threat means no block, whatever the mode ----
         if (!anyThreat) {
-            SetBlock(env, false,
-                     m_tracked ? "no threat" : "nobody near");
+            SetBlock(env, false, m_tracked ? "no threat" : "nobody near");
             return;
         }
 
@@ -518,8 +568,6 @@ public:
                     want = true;
                     why = "mid-swing";
                 } else if (sinceLast >= 0 && sinceLast <= m_tailMs) {
-                    // Their swing just went out and the hit may still
-                    // be in flight, so stay down a moment longer.
                     want = true;
                     why = "impact window";
                 } else if (soonest >= 0) {
@@ -553,8 +601,12 @@ public:
 
     void OnDisable(JNIEnv* env) override {
         SetBlock(env, false, "off");
+        // Backstop: whatever we thought our state was, the right
+        // mouse button goes back to the player.
+        if (env) KeyBinds::ReleaseUseItem(env);
         m_releaseLeft = 0;
         m_blockHeldTicks = 0;
+        m_movingHeld = 0;
         m_enemies.clear();
         m_predictMs = -1;
     }
@@ -591,6 +643,26 @@ public:
 
         float cov = m_ticksTotal > 0 ? (100.f * m_ticksBlocked / m_ticksTotal) : 0.f;
         ImGui::TextDisabled("Down %.0f%% of the time", cov);
+        if (cov > 55.f) {
+            ImGui::TextColored(ImVec4(1.f, 0.5f, 0.35f, 1.f),
+                "That is most of the fight at 20%% speed. Lower Max Hold.");
+        }
+
+        // ---- Movement ----
+        ImGui::Separator();
+        ImGui::TextColored(ImVec4(0.4f, 1.f, 0.6f, 1.f), "Movement");
+        ImGui::TextDisabled("Blocking cuts your speed to 20%%. This keeps it short.");
+        ImGui::Checkbox("Protect Movement", &m_protectMovement);
+        if (m_protectMovement) {
+            ImGui::SliderInt("Max Ticks While Walking", &m_maxMovingTicks, 2, 20);
+            ImGui::SliderInt("Cooldown After", &m_movingCooldown, 1, 12);
+            if (m_speedSaves > 0)
+                ImGui::TextDisabled("Cut the block short %d time(s)", m_speedSaves);
+        } else {
+            ImGui::TextColored(ImVec4(1.f, 0.5f, 0.35f, 1.f),
+                "Off: the block can pin you at walking pace mid-fight");
+        }
+        ImGui::Checkbox("Never While Sprinting", &m_neverWhileSprint);
 
         // ---- Threat gate ----
         ImGui::Separator();
@@ -622,7 +694,7 @@ public:
         ImGui::TextColored(ImVec4(0.6f, 1.f, 0.7f, 1.f), "Release");
         ImGui::SliderInt("Swing Gap (ticks)", &m_swingGap, 1, 4);
         ImGui::SliderInt("After Hit (ticks)", &m_afterHit, 0, 6);
-        ImGui::SliderInt("Max Hold (ticks)", &m_maxBlockTicks, 8, 80);
+        ImGui::SliderInt("Max Hold (ticks)", &m_maxBlockTicks, 4, 40);
 
         ImGui::Separator();
         ImGui::TextColored(ImVec4(1.f, 0.85f, 0.4f, 1.f), "Humanisation");
