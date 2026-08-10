@@ -9,6 +9,7 @@
 #include <imgui.h>
 #include <Windows.h>
 #include <chrono>
+#include <cstdio>
 #include <random>
 #include <string>
 #include <functional>
@@ -72,6 +73,7 @@ private:
     float m_aimError = 0.0f;
     int   m_hits = 0;
     const char* m_why = "idle";
+    mutable char m_status[80] = "";
 
     jmethodID m_attackEntity = nullptr;
     jmethodID m_swingItem    = nullptr;
@@ -347,37 +349,49 @@ public:
         }
     }
 
+    const char* StatusLine() const override {
+        if (!m_targetName.empty()) {
+            snprintf(m_status, sizeof(m_status), "%s  ·  %s",
+                     m_targetName.c_str(), m_why);
+        } else {
+            snprintf(m_status, sizeof(m_status), "%s  ·  %d hits",
+                     m_why, m_hits);
+        }
+        return m_status;
+    }
+
+    // -------------------------------------------------------------
+    // Everyday panel: who to hit, how far, how fast.
+    // -------------------------------------------------------------
     void RenderSettings() override {
         ImGui::TextColored(ImVec4(1.f, 0.35f, 0.3f, 1.f),
-            "! Detected by Polar, AGC and Grim");
+            "Detected by Polar, AGC and Grim");
 
-        ImGui::Separator();
-        if (!m_targetName.empty()) {
-            ImGui::TextColored(ImVec4(0.2f, 0.8f, 0.4f, 1.f),
-                "%s  (%.1f deg off) | %s",
-                m_targetName.c_str(), m_aimError, m_why);
-        } else {
-            ImGui::TextDisabled("%s", m_why);
-        }
-        ImGui::TextDisabled("Hits %d | grid %.4f deg", m_hits, Rotation::GCD());
-
-        ImGui::Separator();
-        ImGui::TextColored(ImVec4(1.f, 0.6f, 0.3f, 1.f), "Targeting");
-        ImGui::SliderFloat("Range", &m_range, 2.f, 6.f, "%.2f");
-        ImGui::SliderFloat("FOV", &m_fov, 30.f, 360.f, "%.0f");
         const char* modes[] = { "Closest", "Lowest HP", "Crosshair" };
         ImGui::Combo("Priority", &m_targetMode, modes, 3);
-        ImGui::Checkbox("Sticky", &m_sticky);
 
-        ImGui::Separator();
-        ImGui::TextColored(ImVec4(0.5f, 0.8f, 1.f, 1.f), "Rate");
+        ImGui::SliderFloat("Range", &m_range, 2.f, 6.f, "%.2f");
+
         ImGui::SliderInt("Min CPS", &m_minCPS, 1, 20);
         ImGui::SliderInt("Max CPS", &m_maxCPS, 1, 20);
         if (m_minCPS > m_maxCPS) m_minCPS = m_maxCPS;
+
+        if (!m_attackEntity) {
+            ImGui::TextColored(ImVec4(1.f, 0.8f, 0.3f, 1.f),
+                "attackEntity unresolved: join a world first");
+        }
+    }
+
+    bool HasAdvanced() const override { return true; }
+
+    void RenderAdvanced() override {
+        ImGui::TextColored(ImVec4(1.f, 0.6f, 0.3f, 1.f), "Targeting");
+        ImGui::SliderFloat("FOV", &m_fov, 30.f, 360.f, "%.0f");
+        ImGui::Checkbox("Sticky", &m_sticky);
         ImGui::Checkbox("Respect Hurt Cooldown", &m_respectCooldown);
         ImGui::TextDisabled("Skips targets still immune from the last hit.");
 
-        ImGui::Separator();
+        ImGui::Spacing();
         ImGui::TextColored(ImVec4(0.6f, 1.f, 0.7f, 1.f), "Rotation");
         ImGui::Checkbox("Rotate To Target", &m_rotate);
         if (m_rotate) {
@@ -389,7 +403,7 @@ public:
             ImGui::SliderFloat("Wander", &m_wander, 0.f, 0.4f, "%.2f");
         }
 
-        ImGui::Separator();
+        ImGui::Spacing();
         ImGui::Checkbox("Only While Clicking", &m_requireClick);
         ImGui::Checkbox("Multi Target", &m_multiTarget);
         if (m_multiTarget) {
@@ -398,10 +412,8 @@ public:
                 "Multi-target hits things you are not looking at");
         }
 
-        if (!m_attackEntity) {
-            ImGui::Separator();
-            ImGui::TextColored(ImVec4(1.f, 0.8f, 0.3f, 1.f),
-                "attackEntity unresolved: join a world first");
-        }
+        ImGui::Spacing();
+        ImGui::TextDisabled("Hits %d | mouse grid %.4f deg",
+            m_hits, Rotation::GCD());
     }
 };
