@@ -73,14 +73,10 @@ private:
         }
     }
 
-    static float Clamp01(float v) {
-        return v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v);
-    }
-
-    static float EaseOut(float t) {
-        float u = 1.0f - Clamp01(t);
-        return 1.0f - u * u * u;
-    }
+    // Thin names over the shared curves in iOS::Ease, so there is
+    // one definition of each curve in the client.
+    static float Clamp01(float v) { return iOS::Ease::Clamp01(v); }
+    static float EaseOut(float t) { return iOS::Ease::Out(t); }
 
 public:
     // ---- Any thread ----
