@@ -2,10 +2,9 @@
 #include "../module.h"
 #include "../../mc/minecraft.h"
 #include "../../mc/keybinds.h"
+#include "../../mc/movement.h"
 #include "../../mc/entity_list.h"
 #include "../../mc/combat_state.h"
-#include "../../mc/rotation.h"
-#include <imgui.h>
 #include <Windows.h>
 #include <cmath>
 #include <cstdio>
@@ -48,8 +47,13 @@
 
 class Velocity : public Module {
 private:
-    // 0 Reduce, 1 Cancel, 2 Reverse, 3 Jump, 4 Strafe, 5 Combined
-    int m_mode = 5;
+    enum Mode { REDUCE = 0, CANCEL, REVERSE, JUMP, STRAFE, COMBINED };
+
+    static constexpr const char* kModes[] = {
+        "Reduce", "Cancel", "Reverse", "Jump", "Strafe", "Both"
+    };
+
+    int m_mode = COMBINED;
 
     // ---- Direct ----
     float m_horizontal = 85.0f;
@@ -60,7 +64,6 @@ private:
     float m_jumpChance     = 80.0f;
     int   m_jumpDelayMin   = 0;
     int   m_jumpDelayMax   = 2;
-    bool  m_jumpOnlyGround = true;
     int   m_hitsUntilJump  = 1;
     bool  m_jumpOnlyMoving = true;   // a standing jump does nothing useful
 
@@ -87,8 +90,11 @@ private:
     // ---- Readout ----
     int m_jumps   = 0;
     int m_strafes = 0;
-    const char* m_lastSide = "-";
     mutable char m_status[64] = "";
+
+    // How far away something still counts as the thing that hit you.
+    // Reach plus a margin; anything further did not land this hit.
+    static constexpr float kAttackerSearch = 6.0f;
 
     std::mt19937 m_rng{ std::random_device{}() };
 
@@ -103,20 +109,22 @@ private:
     }
     bool CoinFlip() { return (m_rng() % 2) == 0; }
 
-    bool IsLegit() const    { return m_mode >= 3; }
-    bool UsesJump() const   { return m_mode == 3 || m_mode == 5; }
-    bool UsesStrafe() const { return m_mode == 4 || m_mode == 5; }
+    bool IsLegit() const    { return m_mode >= JUMP; }
+    bool UsesJump() const   { return m_mode == JUMP || m_mode == COMBINED; }
+    bool UsesStrafe() const { return m_mode == STRAFE || m_mode == COMBINED; }
 
     void StopStrafe(JNIEnv* env) {
         if (!m_strafeActive) return;
-        if (m_strafeLeft) KeyBinds::ReleaseLeft(env);
-        else              KeyBinds::ReleaseRight(env);
+        if (env) {
+            if (m_strafeLeft) KeyBinds::ReleaseLeft(env);
+            else              KeyBinds::ReleaseRight(env);
+        }
         m_strafeActive = false;
     }
 
     void StopJump(JNIEnv* env) {
         if (!m_jumpHeld) return;
-        KeyBinds::ReleaseJump(env);
+        if (env) KeyBinds::ReleaseJump(env);
         m_jumpHeld = false;
     }
 
@@ -129,7 +137,7 @@ private:
     bool AttackerOnLeft(JNIEnv* env, jobject player) {
         if (!EntityList::Init(env)) return CoinFlip();
 
-        auto ents = EntityList::GetPlayers(env, 6.0f);
+        auto ents = EntityList::GetPlayers(env, kAttackerSearch);
         if (ents.empty()) return CoinFlip();
 
         const EntityInfo* closest = nullptr;
@@ -146,9 +154,8 @@ private:
         double pz = Minecraft::GetPosZ(env, player);
         float yaw = Minecraft::GetYaw(env, player);
 
-        const double DEG = 3.14159265358979 / 180.0;
-        double fx = -std::sin(yaw * DEG);
-        double fz =  std::cos(yaw * DEG);
+        double fx = -std::sin(yaw * Movement::kDegToRad);
+        double fz =  std::cos(yaw * Movement::kDegToRad);
 
         double dx = closest->posX - px;
         double dz = closest->posZ - pz;
@@ -161,21 +168,64 @@ public:
     Velocity() : Module("Velocity", "Reduce incoming knockback",
                         ModuleCategory::COMBAT, 'B')
     {
-        Bind("Mode", &m_mode);
-        Bind("Horizontal", &m_horizontal);
-        Bind("Vertical", &m_vertical);
-        Bind("Direct Chance", &m_directChance);
-        Bind("Jump Chance", &m_jumpChance);
-        Bind("Jump Delay Min", &m_jumpDelayMin);
-        Bind("Jump Delay Max", &m_jumpDelayMax);
-        Bind("Jump Only Ground", &m_jumpOnlyGround);
-        Bind("Jump Only Moving", &m_jumpOnlyMoving);
-        Bind("Hits Until Jump", &m_hitsUntilJump);
-        Bind("Strafe Chance", &m_strafeChance);
-        Bind("Strafe Delay", &m_strafeDelay);
-        Bind("Strafe Ticks", &m_strafeTicks);
-        Bind("Strafe Toward", &m_strafeToward);
-        Bind("Only In Combat", &m_onlyInCombat);
+        BindMode("Mode", &m_mode, kModes, 6,
+                 "Jump, Strafe and Both press real keys, so the server sees a "
+                 "player with good habits. The first three rewrite your "
+                 "motion and every prediction anticheat checks exactly that.");
+
+        Bind("Strength", &m_horizontal, 0.0f, 100.0f, "%.0f%%",
+             "How much of the push you keep")
+            .When("Mode", REDUCE);
+
+        Bind("Chance", &m_directChance, 10.0f, 100.0f, "%.0f%%",
+             "How often it fires at all")
+            .WhenAny("Mode", REDUCE, CANCEL, REVERSE);
+
+        Bind("Jump Chance", &m_jumpChance, 10.0f, 100.0f, "%.0f%%",
+             "How often a hit is answered with a jump")
+            .WhenAny("Mode", JUMP, COMBINED);
+
+        Bind("Strafe Chance", &m_strafeChance, 10.0f, 100.0f, "%.0f%%",
+             "How often a hit is answered with a strafe")
+            .WhenAny("Mode", STRAFE, COMBINED);
+
+        // ---- Advanced ----
+        Bind("Vertical", &m_vertical, 0.0f, 100.0f, "%.0f%%",
+             "How much of the upward push you keep")
+            .When("Mode", REDUCE).Advanced();
+
+        Bind("Jump Delay Min", &m_jumpDelayMin, 0, 5,
+             "Ticks to wait before jumping. Zero is the strongest reset and "
+             "also the most machine-like.")
+            .WhenAny("Mode", JUMP, COMBINED).Advanced();
+
+        Bind("Jump Delay Max", &m_jumpDelayMax, 0, 5)
+            .WhenAny("Mode", JUMP, COMBINED).Advanced();
+
+        Bind("Hits Until Jump", &m_hitsUntilJump, 1, 5,
+             "Answer every Nth hit rather than all of them")
+            .WhenAny("Mode", JUMP, COMBINED).Advanced();
+
+        Bind("Only While Moving", &m_jumpOnlyMoving,
+             "A standing jump gains nothing and looks odd")
+            .WhenAny("Mode", JUMP, COMBINED).Advanced();
+
+        Bind("Strafe Delay", &m_strafeDelay, 0, 5,
+             "Ticks between the hit and the strafe")
+            .WhenAny("Mode", STRAFE, COMBINED).Advanced();
+
+        Bind("Strafe Ticks", &m_strafeTicks, 1, 6,
+             "How long the key is held")
+            .WhenAny("Mode", STRAFE, COMBINED).Advanced();
+
+        Bind("Toward Attacker", &m_strafeToward,
+             "Works out which side they are on. Off picks at random, which "
+             "is often the wrong way.")
+            .WhenAny("Mode", STRAFE, COMBINED).Advanced();
+
+        Bind("Only In Combat", &m_onlyInCombat,
+             "Ignore knockback from fall damage and fire")
+            .Advanced();
     }
 
     void OnEnable(JNIEnv*) override {
@@ -185,9 +235,12 @@ public:
 
     void OnTick(JNIEnv* env) override {
         jobject player = Minecraft::GetPlayer(env);
-        if (!player) return;
+        if (!player) { StopStrafe(env); StopJump(env); return; }
 
         if (IsLegit() && !KeyBinds::Init(env)) return;
+
+        // A hand-edited config can invert these; a slider cannot.
+        if (m_jumpDelayMin > m_jumpDelayMax) m_jumpDelayMin = m_jumpDelayMax;
 
         if (Minecraft::IsInGui(env)) {
             StopStrafe(env);
@@ -216,13 +269,14 @@ public:
             double mz = Minecraft::GetMotionZ(env, player);
 
             switch (m_mode) {
-                case 0:
+                case REDUCE:
                     mx *= (m_horizontal / 100.0);
                     mz *= (m_horizontal / 100.0);
                     my *= (m_vertical   / 100.0);
                     break;
-                case 1: mx = my = mz = 0.0; break;
-                case 2: mx *= -0.5; mz *= -0.5; break;
+                case CANCEL:  mx = my = mz = 0.0; break;
+                case REVERSE: mx *= -0.5; mz *= -0.5; break;
+                default: break;
             }
 
             Minecraft::SetMotionX(env, player, mx);
@@ -249,7 +303,6 @@ public:
                 m_strafeLeft = m_strafeToward
                              ? AttackerOnLeft(env, player)
                              : CoinFlip();
-                m_lastSide = m_strafeLeft ? "left" : "right";
             }
         }
 
@@ -261,10 +314,7 @@ public:
 
         if (m_pendingJump) {
             if (m_jumpCountdown <= 0) {
-                bool moving = KeyBinds::GetForward(env)
-                           || KeyBinds::GetBack(env)
-                           || KeyBinds::GetLeft(env)
-                           || KeyBinds::GetRight(env);
+                bool moving = Movement::Read(env).moving;
 
                 bool ok = (!m_jumpOnlyMoving || moving)
                        && onGround;   // a mid-air jump does nothing
@@ -308,79 +358,45 @@ public:
         StopJump(env);
         m_pendingJump = m_pendingStrafe = false;
         m_hitsTaken = 0;
+        m_status[0] = '\0';
     }
 
-    // Shown on the collapsed row
-    const char* StatusLine() const override {
-        const char* modes[] = { "Reduce", "Cancel", "Reverse",
-                                "Jump", "Strafe", "Combined" };
-        snprintf(m_status, sizeof(m_status), "%s  ·  %d jumps, %d strafes",
-                 modes[m_mode], m_jumps, m_strafes);
-        return m_status;
+    // A respawn must not leave a strafe key held down, and the hit
+    // counter belongs to a fight that is over.
+    void OnReset(JNIEnv* env) override {
+        StopStrafe(env);
+        StopJump(env);
+        m_pendingJump = m_pendingStrafe = false;
+        m_hitsTaken = 0;
+        m_jumps = m_strafes = 0;
     }
 
-    // -------------------------------------------------------------
-    // Everyday panel: pick a mode, set how often it fires. Two
-    // controls, because there are only two decisions that matter.
-    // -------------------------------------------------------------
-    void RenderSettings() override {
-        const char* modes[] = {
-            "Reduce", "Cancel", "Reverse",
-            "Jump Reset", "Strafe", "Combined"
-        };
-        ImGui::Combo("Mode", &m_mode, modes, 6);
-
+    NoticeLevel Notice(const char** text) const override {
         if (!IsLegit()) {
-            ImGui::TextColored(ImVec4(1.f, 0.4f, 0.4f, 1.f),
-                "Detected by Polar, AGC and Grim");
-            if (m_mode == 0)
-                ImGui::SliderFloat("Strength", &m_horizontal, 0.f, 100.f, "%.0f%%");
-            ImGui::SliderFloat("Chance", &m_directChance, 10.f, 100.f, "%.0f%%");
-            return;
+            *text = "Rewrites your motion after a hit, which is the first "
+                    "thing Polar, AGC and Grim check. Unprotected servers "
+                    "only.";
+            return NoticeLevel::Danger;
         }
-
-        if (UsesJump())
-            ImGui::SliderFloat("Jump Chance", &m_jumpChance, 10.f, 100.f, "%.0f%%");
-        if (UsesStrafe())
-            ImGui::SliderFloat("Strafe Chance", &m_strafeChance, 10.f, 100.f, "%.0f%%");
-
         if (!KeyBinds::HasMovement()) {
-            ImGui::TextColored(ImVec4(1.f, 0.8f, 0.3f, 1.f),
-                "Keybinds unresolved: inactive");
+            *text = "The movement keybinds could not be found in this build "
+                    "of the game, so the module cannot do anything.";
+            return NoticeLevel::Warning;
         }
+        return NoticeLevel::None;
     }
 
-    bool HasAdvanced() const override { return true; }
-
-    void RenderAdvanced() override {
-        if (m_mode == 0) {
-            ImGui::SliderFloat("Vertical", &m_vertical, 0.f, 100.f, "%.0f%%");
+    const char* StatusLine() const override {
+        if (!IsLegit()) {
+            snprintf(m_status, sizeof(m_status), "%s", kModes[m_mode]);
+        } else if (m_mode == JUMP) {
+            snprintf(m_status, sizeof(m_status), "%d resets", m_jumps);
+        } else if (m_mode == STRAFE) {
+            snprintf(m_status, sizeof(m_status), "%d strafes", m_strafes);
+        } else {
+            snprintf(m_status, sizeof(m_status), "%d resets, %d strafes",
+                     m_jumps, m_strafes);
         }
-
-        if (UsesJump()) {
-            ImGui::TextColored(ImVec4(0.5f, 0.8f, 1.f, 1.f), "Jump Reset");
-            ImGui::SliderInt("Delay Min", &m_jumpDelayMin, 0, 5);
-            ImGui::SliderInt("Delay Max", &m_jumpDelayMax, 0, 5);
-            if (m_jumpDelayMin > m_jumpDelayMax) m_jumpDelayMin = m_jumpDelayMax;
-            ImGui::SliderInt("Hits Until Jump", &m_hitsUntilJump, 1, 5);
-            ImGui::Checkbox("Only While Moving", &m_jumpOnlyMoving);
-            ImGui::TextDisabled("Always needs ground contact: a mid-air "
-                                "reset does nothing.");
-            ImGui::Spacing();
-        }
-
-        if (UsesStrafe()) {
-            ImGui::TextColored(ImVec4(0.4f, 1.f, 0.6f, 1.f), "Strafe");
-            ImGui::SliderInt("Strafe Delay", &m_strafeDelay, 0, 5);
-            ImGui::SliderInt("Strafe Ticks", &m_strafeTicks, 1, 6);
-            ImGui::Checkbox("Toward Attacker", &m_strafeToward);
-            ImGui::TextDisabled(m_strafeToward
-                ? "Works out which side they are on and closes in."
-                : "Picks a side at random, which often helps them.");
-            ImGui::Spacing();
-        }
-
-        ImGui::Checkbox("Only In Combat", &m_onlyInCombat);
-        ImGui::TextDisabled("Ignores fall damage and fire ticks.");
+        return m_status;
     }
 };
