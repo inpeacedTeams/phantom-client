@@ -8,6 +8,7 @@
 #include <imgui.h>
 #include <Windows.h>
 #include <cmath>
+#include <cstdio>
 #include <random>
 
 // =================================================================
@@ -87,6 +88,7 @@ private:
     int m_jumps   = 0;
     int m_strafes = 0;
     const char* m_lastSide = "-";
+    mutable char m_status[64] = "";
 
     std::mt19937 m_rng{ std::random_device{}() };
 
@@ -308,49 +310,67 @@ public:
         m_hitsTaken = 0;
     }
 
+    // Shown on the collapsed row
+    const char* StatusLine() const override {
+        const char* modes[] = { "Reduce", "Cancel", "Reverse",
+                                "Jump", "Strafe", "Combined" };
+        snprintf(m_status, sizeof(m_status), "%s  ·  %d jumps, %d strafes",
+                 modes[m_mode], m_jumps, m_strafes);
+        return m_status;
+    }
+
+    // -------------------------------------------------------------
+    // Everyday panel: pick a mode, set how often it fires. Two
+    // controls, because there are only two decisions that matter.
+    // -------------------------------------------------------------
     void RenderSettings() override {
         const char* modes[] = {
             "Reduce", "Cancel", "Reverse",
-            "Jump Reset", "Strafe", "Combined (Legit)"
+            "Jump Reset", "Strafe", "Combined"
         };
         ImGui::Combo("Mode", &m_mode, modes, 6);
 
         if (!IsLegit()) {
             ImGui::TextColored(ImVec4(1.f, 0.4f, 0.4f, 1.f),
-                "! Direct modes flag on Polar, AGC and Grim");
+                "Detected by Polar, AGC and Grim");
+            if (m_mode == 0)
+                ImGui::SliderFloat("Strength", &m_horizontal, 0.f, 100.f, "%.0f%%");
+            ImGui::SliderFloat("Chance", &m_directChance, 10.f, 100.f, "%.0f%%");
+            return;
         }
 
-        ImGui::TextDisabled("Jumps %d | strafes %d (last: %s)",
-            m_jumps, m_strafes, m_lastSide);
+        if (UsesJump())
+            ImGui::SliderFloat("Jump Chance", &m_jumpChance, 10.f, 100.f, "%.0f%%");
+        if (UsesStrafe())
+            ImGui::SliderFloat("Strafe Chance", &m_strafeChance, 10.f, 100.f, "%.0f%%");
 
-        ImGui::Separator();
+        if (!KeyBinds::HasMovement()) {
+            ImGui::TextColored(ImVec4(1.f, 0.8f, 0.3f, 1.f),
+                "Keybinds unresolved: inactive");
+        }
+    }
 
-        if (m_mode <= 2) {
-            if (m_mode == 0) {
-                ImGui::SliderFloat("Horizontal", &m_horizontal, 0.f, 100.f, "%.0f%%");
-                ImGui::SliderFloat("Vertical",   &m_vertical,   0.f, 100.f, "%.0f%%");
-            }
-            ImGui::SliderFloat("Chance", &m_directChance, 10.f, 100.f, "%.0f%%");
-            ImGui::TextDisabled("Below 100%% some hits land normally, "
-                                "which is harder to fingerprint.");
+    bool HasAdvanced() const override { return true; }
+
+    void RenderAdvanced() override {
+        if (m_mode == 0) {
+            ImGui::SliderFloat("Vertical", &m_vertical, 0.f, 100.f, "%.0f%%");
         }
 
         if (UsesJump()) {
             ImGui::TextColored(ImVec4(0.5f, 0.8f, 1.f, 1.f), "Jump Reset");
-            ImGui::SliderFloat("Jump Chance", &m_jumpChance, 10.f, 100.f, "%.0f%%");
             ImGui::SliderInt("Delay Min", &m_jumpDelayMin, 0, 5);
             ImGui::SliderInt("Delay Max", &m_jumpDelayMax, 0, 5);
             if (m_jumpDelayMin > m_jumpDelayMax) m_jumpDelayMin = m_jumpDelayMax;
             ImGui::SliderInt("Hits Until Jump", &m_hitsUntilJump, 1, 5);
             ImGui::Checkbox("Only While Moving", &m_jumpOnlyMoving);
-            ImGui::TextDisabled("Always requires ground contact: a mid-air "
+            ImGui::TextDisabled("Always needs ground contact: a mid-air "
                                 "reset does nothing.");
             ImGui::Spacing();
         }
 
         if (UsesStrafe()) {
             ImGui::TextColored(ImVec4(0.4f, 1.f, 0.6f, 1.f), "Strafe");
-            ImGui::SliderFloat("Strafe Chance", &m_strafeChance, 10.f, 100.f, "%.0f%%");
             ImGui::SliderInt("Strafe Delay", &m_strafeDelay, 0, 5);
             ImGui::SliderInt("Strafe Ticks", &m_strafeTicks, 1, 6);
             ImGui::Checkbox("Toward Attacker", &m_strafeToward);
@@ -360,14 +380,7 @@ public:
             ImGui::Spacing();
         }
 
-        ImGui::Separator();
         ImGui::Checkbox("Only In Combat", &m_onlyInCombat);
         ImGui::TextDisabled("Ignores fall damage and fire ticks.");
-
-        if (IsLegit() && !KeyBinds::HasMovement()) {
-            ImGui::Separator();
-            ImGui::TextColored(ImVec4(1.f, 0.8f, 0.3f, 1.f),
-                "Keybinds unresolved: legit modes inactive");
-        }
     }
 };
