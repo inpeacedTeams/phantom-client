@@ -1,8 +1,9 @@
 #pragma once
 #include <imgui.h>
 #include <cstdio>
-#include <cstring>
+#include <cmath>
 #include <string>
+#include <memory>
 #include <unordered_map>
 
 #include "ios_theme.h"
@@ -25,14 +26,13 @@
 // OPTIMISTIC SWITCHES
 // Because a toggle is queued, IsEnabled() still reads the old value
 // for up to one tick. Animating from that would make every switch
-// stutter, so the pending value is held locally and shown
-// immediately, then dropped once the real state agrees.
+// stutter, so the pending value is held locally and shown at once,
+// then dropped when the real state agrees.
 // =================================================================
 
 class Menu {
 private:
-    inline static int  s_tab = 0;
-    inline static bool s_open = false;
+    inline static int   s_tab  = 0;
     inline static float s_fade = 0.0f;
 
     inline static std::unordered_map<std::string, bool> s_pending;
@@ -70,8 +70,7 @@ private:
         else                           out[0] = '\0';
     }
 
-    // Visible switch state: the pending value if one is in flight,
-    // otherwise the module's real state.
+    // The pending value if a toggle is in flight, else the real one
     static bool VisualState(Module* mod) {
         auto it = s_pending.find(mod->GetName());
         if (it == s_pending.end()) return mod->IsEnabled();
@@ -169,10 +168,11 @@ private:
         ImGui::SetCursorScreenPos(ImVec2(p.x, p.y + h));
 
         // ---- Settings, animated open ----
+        // EndCollapsible only balances a Begin that returned true.
         if (iOS::BeginCollapsible("body", expanded)) {
             ImGui::Indent(iOS::M::RowPadX);
             ImGui::PushItemWidth(ImGui::GetContentRegionAvail().x
-                                 - iOS::M::RowPadX - 60.0f);
+                                 - iOS::M::RowPadX - 56.0f);
 
             const std::string& desc = mod->GetDescription();
             if (!desc.empty()) {
@@ -195,8 +195,9 @@ private:
             ImGui::PopItemWidth();
             ImGui::Unindent(iOS::M::RowPadX);
             ImGui::Dummy(ImVec2(0, 6));
+
+            iOS::EndCollapsible();
         }
-        iOS::EndCollapsible();
 
         if (!last) iOS::RowSeparator(iOS::M::RowPadX + 18.0f);
 
@@ -222,8 +223,7 @@ private:
         for (auto& m : mods) if (m->IsEnabled()) enabled++;
 
         char head[64];
-        snprintf(head, sizeof(head), "%d of %d active",
-                 enabled, (int)mods.size());
+        snprintf(head, sizeof(head), "%d of %d active", enabled, (int)mods.size());
         iOS::SectionHeader(head);
 
         iOS::BeginCard();
@@ -260,8 +260,8 @@ private:
 
             ImGui::Dummy(ImVec2(0, 8));
 
-            if (iOS::Button("Load", ImGui::GetContentRegionAvail().x
-                                    - iOS::M::RowPadX)) {
+            if (iOS::Button("Load",
+                    ImGui::GetContentRegionAvail().x - iOS::M::RowPadX)) {
                 Profile p = profiles[i];
                 // Every switch is about to move, so drop the pending
                 // map rather than fight it.
@@ -302,19 +302,17 @@ private:
     }
 
     // ---------------------------------------------------------
-    // Header: large title, then the segmented control
+    // Header: app mark, large title, live count, tabs
     // ---------------------------------------------------------
     static void RenderHeader(float width) {
         ImVec2 p = ImGui::GetCursorScreenPos();
         ImDrawList* dl = ImGui::GetWindowDrawList();
 
-        float h = 96.0f;
+        const float h = 96.0f;
 
         dl->AddRectFilled(p, ImVec2(p.x + width, p.y + h),
-                          iOS::Col::Card,
-                          20.0f, ImDrawFlags_RoundCornersTop);
+                          iOS::Col::Card, 20.0f, ImDrawFlags_RoundCornersTop);
 
-        // App mark
         float ix = p.x + 20.0f, iy = p.y + 18.0f, is = 30.0f;
         dl->AddRectFilled(ImVec2(ix, iy), ImVec2(ix + is, iy + is),
                           iOS::Col::Blue, 8.0f);
@@ -325,10 +323,9 @@ private:
         iOS::Fonts::Pop(iOS::Fonts::BodyBold);
 
         iOS::Fonts::Push(iOS::Fonts::Title);
-        dl->AddText(ImVec2(ix + is + 12.0f, iy - 1.0f), iOS::Col::Label, "Phantom");
+        dl->AddText(ImVec2(ix + is + 12.0f, iy - 2.0f), iOS::Col::Label, "Phantom");
         iOS::Fonts::Pop(iOS::Fonts::Title);
 
-        // Live module count on the right
         int active = 0;
         for (auto& m : ModuleManager::GetModules()) if (m->IsEnabled()) active++;
 
@@ -344,13 +341,12 @@ private:
                     active ? iOS::Col::Blue : iOS::Col::Label2, cnt);
         iOS::Fonts::Pop(iOS::Fonts::Caption);
 
-        // Segmented control
         ImGui::SetCursorScreenPos(ImVec2(p.x + 16.0f, p.y + 56.0f));
         iOS::Segmented("tabs", s_tabNames, kTabCount, &s_tab, width - 32.0f);
 
         ImGui::SetCursorScreenPos(ImVec2(p.x, p.y + h));
-
-        dl->AddLine(ImVec2(p.x, p.y + h - 0.5f), ImVec2(p.x + width, p.y + h - 0.5f),
+        dl->AddLine(ImVec2(p.x, p.y + h - 0.5f),
+                    ImVec2(p.x + width, p.y + h - 0.5f),
                     iOS::Col::Separator, 1.0f);
     }
 
@@ -360,43 +356,43 @@ public:
         iOS::ApplyStyle();
     }
 
-    // Called every frame. Handles its own fade so closing the menu
-    // is a dissolve rather than a cut.
+    // Called every frame. Owns its fade, so closing is a dissolve
+    // rather than a cut.
     static void Render(bool open) {
-        s_open = open;
         s_fade = iOS::Anim::ToStr("menuFade", open ? 1.0f : 0.0f, 16.0f);
-
         if (s_fade < 0.004f) return;
 
-        const float W = 470.0f;
-        const float H = 560.0f;
-
-        ImGui::SetNextWindowSize(ImVec2(W, H), ImGuiCond_FirstUseEver);
+        ImGui::SetNextWindowSize(ImVec2(470, 560), ImGuiCond_FirstUseEver);
         ImGui::SetNextWindowPos(ImVec2(120, 90), ImGuiCond_FirstUseEver);
         ImGui::SetNextWindowSizeConstraints(ImVec2(400, 300), ImVec2(760, 1000));
+        ImGui::SetNextWindowBgAlpha(0.0f);   // the sheet draws its own
 
-        // Scale up slightly as it appears, the standard iOS present
-        float scale = 0.97f + 0.03f * s_fade;
-        ImGui::SetNextWindowBgAlpha(s_fade);
         ImGui::PushStyleVar(ImGuiStyleVar_Alpha, s_fade);
 
         ImGuiWindowFlags flags =
             ImGuiWindowFlags_NoTitleBar |
             ImGuiWindowFlags_NoCollapse |
             ImGuiWindowFlags_NoScrollbar |
-            ImGuiWindowFlags_NoScrollWithMouse;
+            ImGuiWindowFlags_NoScrollWithMouse |
+            ImGuiWindowFlags_NoBackground;
 
-        if (!open) flags |= ImGuiWindowFlags_NoInputs;   // no clicks mid-fade
+        // Mid-fade the menu is on its way out: visible but not
+        // clickable, or a stray click lands on a ghost.
+        if (!open) flags |= ImGuiWindowFlags_NoInputs;
 
         if (ImGui::Begin("##phantom", nullptr, flags)) {
             float width = ImGui::GetWindowWidth();
 
-            // Grey grouped background behind the whole sheet
             ImVec2 wp = ImGui::GetWindowPos();
             ImVec2 ws = ImGui::GetWindowSize();
-            ImGui::GetWindowDrawList()->AddRectFilled(
-                wp, ImVec2(wp.x + ws.x, wp.y + ws.y),
-                iOS::Col::Alpha(iOS::Col::GroupedBg, s_fade), 20.0f);
+            ImDrawList* dl = ImGui::GetWindowDrawList();
+
+            // Sheet: shadow, then the grouped grey ground
+            dl->AddRectFilled(ImVec2(wp.x + 2.0f, wp.y + 6.0f),
+                              ImVec2(wp.x + ws.x + 2.0f, wp.y + ws.y + 8.0f),
+                              IM_COL32(0, 0, 0, (int)(46 * s_fade)), 22.0f);
+            dl->AddRectFilled(wp, ImVec2(wp.x + ws.x, wp.y + ws.y),
+                              iOS::Col::GroupedBg, 20.0f);
 
             RenderHeader(width);
 
@@ -417,7 +413,6 @@ public:
         ImGui::End();
 
         ImGui::PopStyleVar();
-        (void)scale;
 
         iOS::Anim::GarbageCollect();
     }
