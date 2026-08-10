@@ -18,7 +18,6 @@
 #include "../mc/mouse_control.h"
 #include "../input/key_capture.h"
 #include "../modules/module_manager.h"
-#include "../render/backtrack_vis.h"
 
 // =================================================================
 // Menu
@@ -157,7 +156,7 @@ private:
     }
 
     // Case-insensitive substring. Small enough that a real search
-    // library would be a joke, and the module list is fifteen items.
+    // library would be a joke, and the module list is short.
     static bool Contains(const std::string& hay, const char* needle) {
         if (!needle || !needle[0]) return true;
         size_t nl = std::strlen(needle);
@@ -178,8 +177,6 @@ private:
         if (Contains(m->GetDescription(), q)) return true;
         if (Contains(CategoryName(m->GetCategory()), q)) return true;
 
-        // Settings are searchable too, so "fov" finds Aim Assist even
-        // though the word appears nowhere on the module itself.
         for (auto& s : m->GetSettings())
             if (Contains(s.name, q)) return true;
         return false;
@@ -199,10 +196,6 @@ private:
 
     // ---------------------------------------------------------
     // Keybind chip
-    // ---------------------------------------------------------
-    // Submitted AFTER the row's expand button so it wins the hover
-    // test: in ImGui the later item claims the hovered id, which is
-    // exactly the layering wanted here.
     // ---------------------------------------------------------
     static void KeybindChip(const std::shared_ptr<Module>& mod,
                             float rightX, float cy, float entry)
@@ -244,8 +237,6 @@ private:
             }
         }
 
-        // Unbound chips are almost invisible, so the one hint that
-        // they are clickable has to come from the pointer.
         if (hovered) {
             ImGui::SetTooltip(key > 0 ? "Click to rebind" : "Click to set a key");
         }
@@ -269,7 +260,6 @@ private:
             fg = iOS::Col::Alpha(
                 iOS::Col::Mix(iOS::Col::Label2, iOS::Col::Blue, hov), entry);
         } else {
-            // Unbound: nearly invisible until you go looking for it
             bg = iOS::Col::Alpha(iOS::Col::Fill, (0.3f + 0.7f * hov) * entry);
             fg = iOS::Col::Alpha(
                 iOS::Col::Mix(iOS::Col::Label3, iOS::Col::Blue, hov), entry);
@@ -298,8 +288,6 @@ private:
         int key = 0;
         KeyCapture::Result r = KeyCapture::Poll(&key);
         if (r == KeyCapture::None) {
-            // The capture can also be cancelled from the window
-            // procedure, for instance when focus is lost.
             if (!KeyCapture::IsActive()) s_binding.clear();
             return;
         }
@@ -311,21 +299,16 @@ private:
 
         int newKey = (r == KeyCapture::Cleared) ? 0 : key;
 
-        // Confirmation, so you can see what you just did without
-        // hunting for the row again.
         char lbl[40];
         if (newKey > 0) KeyCapture::Label(newKey, lbl, sizeof(lbl));
         else            snprintf(lbl, sizeof(lbl), "None");
         s_bindResult = target + "  \xE2\x86\x92  " + lbl;
         s_bindResultFade = 1.6f;
 
-        // The bind is read on the client thread every tick, so it is
-        // set there rather than written from under it.
         ModuleManager::QueueAction([target, newKey](JNIEnv*) {
             Module* mine = ModuleManager::Find(target);
             if (!mine) return;
 
-            // Two modules on one key means one press fires both.
             if (newKey > 0) {
                 for (auto& other : ModuleManager::GetModules()) {
                     if (other.get() == mine) continue;
@@ -343,10 +326,6 @@ private:
     // ---------------------------------------------------------
     // Bind overlay
     // ---------------------------------------------------------
-    // Full screen, because a picker that is a small chip somewhere
-    // in a list gives you no idea the client is now eating your
-    // keyboard. Drawn on the foreground list, above everything.
-    // ---------------------------------------------------------
     static void RenderBindOverlay() {
         ImGuiIO& io = ImGui::GetIO();
         ImDrawList* dl = ImGui::GetForegroundDrawList();
@@ -354,7 +333,6 @@ private:
 
         float sw = io.DisplaySize.x, sh = io.DisplaySize.y;
 
-        // ---- The confirmation, after a bind lands ----
         if (s_bindResultFade > 0.001f && !s_bindResult.empty()) {
             float a = Clamp01(s_bindResultFade / 0.6f);
             iOS::Fonts::Push(iOS::Fonts::BodyBold);
@@ -375,7 +353,6 @@ private:
         if (s_bindFade < 0.01f) return;
         float a = s_bindFade;
 
-        // Scrim over everything, including the menu
         dl->AddRectFilled(ImVec2(0, 0), ImVec2(sw, sh),
                           IM_COL32(0, 0, 0, (int)(120 * a)));
 
@@ -396,7 +373,6 @@ private:
 
         float y = c0.y + 24.0f * iOS::UI::scale;
 
-        // Which module we are binding
         iOS::Fonts::Push(iOS::Fonts::Caption);
         ImVec2 ns = ImGui::CalcTextSize(s_binding.c_str());
         dl->AddText(ImVec2(c0.x + (cw - ns.x) * 0.5f, y),
@@ -423,13 +399,6 @@ private:
     // ---------------------------------------------------------
     // Dimmed, vignetted world behind the sheet
     // ---------------------------------------------------------
-    // Not a blur. A real gaussian needs the framebuffer in a texture
-    // and a shader pass; this overlay is on the fixed-function GL2
-    // backend precisely so it cannot disturb the game's state.
-    // Faking it with stacked translucent quads costs fill rate and
-    // looks like a smear, so the world is dimmed and pulled in with
-    // a vignette instead, which reads as depth and is free.
-    // ---------------------------------------------------------
     static void RenderScrim(float fade) {
         if (!iOS::UI::dim || fade < 0.01f) return;
 
@@ -446,8 +415,6 @@ private:
 
         if (!iOS::UI::vignette) return;
 
-        // Four edge gradients. Cheaper and cleaner than a radial
-        // texture, and at this strength nobody can tell.
         int edge = (int)(alpha * 0.85f);
         ImU32 dark = IM_COL32(0, 0, 0, edge);
         ImU32 clear = IM_COL32(0, 0, 0, 0);
@@ -488,7 +455,6 @@ private:
 
         float cy = p.y + h * 0.5f;
 
-        // Chevron, pointing right when closed and down when open
         {
             float cx = p.x + 5.0f;
             float ang = rot * 1.5707963f;
@@ -529,7 +495,6 @@ private:
         bool on = VisualState(mod.get());
         bool& expanded = s_expanded[name];
 
-        // Rows slide in from the right as a tab opens
         float slide = (1.0f - entry) * 16.0f;
 
         float w = ImGui::GetContentRegionAvail().x;
@@ -541,15 +506,12 @@ private:
         ImU32 accent = CategoryColor(mod->GetCategory());
         float cy = p.y + h * 0.5f;
 
-        // Everything left of the switch expands the row. Submitted
-        // first so the chip, submitted later, sits on top of it.
         float switchZone = iOS::M::SwitchW + iOS::M::RowPadX * 2.0f;
         ImGui::InvisibleButton("##expand", ImVec2(w - switchZone, h));
         bool expandClicked = ImGui::IsItemClicked();
         bool expandHeld    = ImGui::IsItemActive();
         bool expandHover   = ImGui::IsItemHovered();
 
-        // Hover is a whisper, press is a proper flash
         float hovT = iOS::Anim::To(ImGui::GetID("##rh"),
                                    expandHover ? 1.0f : 0.0f, 18.0f);
         float pressT = iOS::Anim::To(ImGui::GetID("##rp"),
@@ -560,8 +522,6 @@ private:
                               iOS::Col::Alpha(iOS::Col::CardPressed, wash * entry));
         }
 
-        // A hovered row grows a thin accent edge on the left. Cheap,
-        // and it reads instantly as "this is the one you are on".
         if (hovT > 0.01f) {
             float barH = h * 0.55f * hovT;
             dl->AddRectFilled(ImVec2(p.x, cy - barH * 0.5f),
@@ -569,10 +529,8 @@ private:
                               iOS::Col::Alpha(accent, 0.9f * hovT * entry), 2.0f);
         }
 
-        // The whole row nudges right under the pointer
         float nudge = iOS::UI::rowNudge ? hovT * 4.0f * iOS::UI::scale : 0.0f;
 
-        // ---- Description card ----
         if (expandHover && iOS::UI::hoverInfo && !expanded) {
             s_hoverName = name;
             s_hoverDesc = mod->GetDescription();
@@ -580,7 +538,6 @@ private:
             s_hoverAnchor = ImVec2(win->Pos.x + win->Size.x + 12.0f, cy - 30.0f);
         }
 
-        // Category dot brightens with the module
         float onT = iOS::Anim::To(ImGui::GetID("##dot"), on ? 1.0f : 0.0f, 14.0f);
         float dotX = p.x + nudge + iOS::M::RowPadX + 4.0f;
 
@@ -593,15 +550,11 @@ private:
 
         float textX = dotX + 14.0f;
 
-        // A live status line, if the module has one, sits under the
-        // name so you can read what it is doing without opening it.
         const char* status = on ? mod->StatusLine() : nullptr;
         const char* sub = status && status[0] ? status
                         : (showCategory ? CategoryName(mod->GetCategory()) : nullptr);
         ImU32 subCol = (status && status[0]) ? accent : iOS::Col::Label3;
 
-        // The name is clipped rather than allowed to run under the
-        // chip, which is what a long one used to do.
         float textRoom = (p.x + w - switchZone - 30.0f) - textX;
         if (textRoom < 40.0f) textRoom = 40.0f;
         ImGui::PushClipRect(ImVec2(textX, p.y),
@@ -624,10 +577,8 @@ private:
 
         ImGui::PopClipRect();
 
-        // ---- Keybind chip ----
         KeybindChip(mod, p.x + w - switchZone - 22.0f, cy, entry);
 
-        // Chevron rotates as the row opens
         float openT = iOS::Anim::To(ImGui::GetID("##ch"), expanded ? 1.0f : 0.0f, 16.0f);
         {
             float cx = p.x + w - switchZone - 6.0f;
@@ -642,12 +593,8 @@ private:
             dl->AddLine(rot(2.0f, 0.0f), rot(-2.5f, 4.5f), c, 1.8f);
         }
 
-        // The row only expands if the click was not on the chip.
-        // ImGui gives the later item the hover, so this is just a
-        // matter of asking after both have been submitted.
         if (expandClicked && s_binding != name) expanded = !expanded;
 
-        // ---- Switch ----
         ImGui::SetCursorScreenPos(ImVec2(p.x + w - iOS::M::SwitchW - iOS::M::RowPadX,
                                          cy - iOS::M::SwitchH * 0.5f));
         bool before = on;
@@ -658,8 +605,6 @@ private:
 
         ImGui::SetCursorScreenPos(ImVec2(p.x - slide, p.y + h));
 
-        // ---- Settings, animated open ----
-        // EndCollapsible only balances a Begin that returned true.
         if (iOS::BeginCollapsible("body", expanded)) {
             ImGui::Indent(iOS::M::RowPadX);
 
@@ -743,8 +688,7 @@ private:
         if (hits.empty()) {
             EmptyState("Nothing matches that");
             iOS::Footnote("Search looks at the name, the description, the "
-                          "category and every setting, so \"knockback\" finds "
-                          "Velocity and \"fov\" finds Aim Assist.");
+                          "category and every setting.");
             return;
         }
 
@@ -762,8 +706,6 @@ private:
         ImGui::Dummy(ImVec2(0, 10));
         ImGui::Indent(iOS::M::RowPadX);
 
-        // Swatches. Faster to hit than a dropdown and you can see
-        // every option at once, which is the whole point of colour.
         {
             ImDrawList* dl = ImGui::GetWindowDrawList();
             float sz = 26.0f * UI::scale;
@@ -801,8 +743,6 @@ private:
                                   iOS::Col::Alpha(col, selT), 24, 2.0f);
                 }
 
-                // The custom slot gets a slash so it is obviously
-                // not just another blue.
                 if (i == UI::kAccentCount - 1) {
                     dl->AddLine(ImVec2(c.x - r * 0.5f, c.y + r * 0.5f),
                                 ImVec2(c.x + r * 0.5f, c.y - r * 0.5f),
@@ -828,7 +768,6 @@ private:
         ImGui::Unindent(iOS::M::RowPadX);
         iOS::EndCard();
 
-        // ---- Layout ----
         iOS::SectionHeader("Layout");
         iOS::BeginCard();
         iOS::SliderRow("UI Scale", &UI::scale, 0.85f, 1.35f, "%.2fx",
@@ -838,7 +777,6 @@ private:
                        "0 is square, 1 is the iOS radius.");
         iOS::EndCard();
 
-        // ---- Motion ----
         iOS::SectionHeader("Motion");
         iOS::BeginCard();
         iOS::SliderRow("Animation Speed", &UI::animSpeed, 0.4f, 2.0f, "%.2fx",
@@ -854,7 +792,6 @@ private:
                        "Explains a module beside the panel");
         iOS::EndCard();
 
-        // ---- Effects ----
         iOS::SectionHeader("Effects");
         iOS::BeginCard();
         iOS::SwitchRow("Glow", &UI::glow,
@@ -878,12 +815,8 @@ private:
         iOS::Footnote(
             "There is no blur, on purpose. A real one needs the framebuffer "
             "in a texture and a shader pass, and this overlay runs on the "
-            "fixed-function backend so it cannot disturb the game's GL state. "
-            "Faking it with stacked quads costs frames and looks like a smear.");
+            "fixed-function backend so it cannot disturb the game's GL state.");
 
-        // ---- HUD ----
-        // These settings existed for weeks with no screen that showed
-        // them, which is the same as not existing.
         iOS::HUD::RenderSettings();
 
         ImGui::Dummy(ImVec2(0, 6));
@@ -929,8 +862,6 @@ private:
         int active = 0;
         for (auto& m : ModuleManager::GetModules()) if (m->IsEnabled()) active++;
 
-        // The count pill eases between values rather than jumping,
-        // so toggling something reads as one continuous change.
         float shownActive = iOS::Anim::ToStr("activeCount", (float)active, 12.0f);
 
         char cnt[32];
@@ -949,14 +880,9 @@ private:
                     iOS::Col::Mix(iOS::Col::Label2, iOS::Col::Blue, lit), cnt);
         iOS::Fonts::Pop(iOS::Fonts::Caption);
 
-        // ---- Search ----
         ImGui::SetCursorScreenPos(ImVec2(p.x + 16.0f * s, p.y + 56.0f * s));
         iOS::SearchField("search", s_search, sizeof(s_search), width - 32.0f * s);
 
-        // ---- Tabs ----
-        // Greyed while searching, because results deliberately ignore
-        // them and a live-looking control that does nothing is worse
-        // than one that says it is asleep.
         bool searching = s_search[0] != '\0';
         ImGui::SetCursorScreenPos(ImVec2(p.x + 16.0f * s, p.y + 96.0f * s));
         if (searching) ImGui::BeginDisabled();
@@ -981,8 +907,6 @@ public:
         float dt = ImGui::GetIO().DeltaTime;
         if (dt > 0.1f) dt = 0.1f;
 
-        // A capture must resolve even if the menu is closing, or the
-        // client is left listening for a key nobody will press.
         PollBinding(dt);
 
         s_fade = iOS::Anim::ToStr("menuFade",
@@ -995,29 +919,21 @@ public:
         }
 
         if (s_fade < 0.004f) {
-            // Fully closed: forget the transient state, so reopening
-            // is a clean screen rather than wherever you left off
-            // mid-interaction.
             s_tabAge = 0.0f;
             s_lastTab = -1;
             s_hoverFade = 0.0f;
             s_search[0] = '\0';
             iOS::ConfigPanel::Reset();
             iOS::HUD::SetEditing(false);
-            RenderBindOverlay();   // the confirmation may still be fading
+            RenderBindOverlay();
             return;
         }
 
-        // Push the user's look into the palette and the metrics. One
-        // handful of multiplies; not worth tracking whether it moved.
         float savedFontScale = ImGui::GetIO().FontGlobalScale;
         iOS::UI::Apply();
 
         RenderScrim(s_fade);
 
-        // Tab transition clock. Reset on a change, then run forward.
-        // A change of search counts: the list is different, so it
-        // should arrive the same way.
         static int lastSearchLen = -1;
         int qlen = (int)std::strlen(s_search);
         if (s_tab != s_lastTab || qlen != lastSearchLen) {
@@ -1028,12 +944,8 @@ public:
             s_tabAge += dt;
         }
 
-        // Leaving the UI tab puts the HUD back to normal, so the
-        // editor can never be left on with no way to see why the
-        // corner is full of drag handles.
         if (s_tab != TAB_UI || s_search[0]) iOS::HUD::SetEditing(false);
 
-        // Nothing hovered this frame until a row claims it
         std::string prevHover = s_hoverName;
         s_hoverName.clear();
 
@@ -1042,7 +954,7 @@ public:
         ImGui::SetNextWindowPos(ImVec2(120, 90), ImGuiCond_FirstUseEver);
         ImGui::SetNextWindowSizeConstraints(ImVec2(420 * s, 340 * s),
                                             ImVec2(820 * s, 1100 * s));
-        ImGui::SetNextWindowBgAlpha(0.0f);   // the sheet draws its own
+        ImGui::SetNextWindowBgAlpha(0.0f);
 
         ImGui::PushStyleVar(ImGuiStyleVar_Alpha, s_fade);
 
@@ -1053,9 +965,6 @@ public:
             ImGuiWindowFlags_NoScrollWithMouse |
             ImGuiWindowFlags_NoBackground;
 
-        // Mid-fade the menu is on its way out: visible but not
-        // clickable, or a stray click lands on a ghost. The bind
-        // overlay and the HUD editor lock it for the same reason.
         if (!open || !s_binding.empty() || iOS::HUD::IsDragging())
             flags |= ImGuiWindowFlags_NoInputs;
 
@@ -1066,9 +975,6 @@ public:
             ImVec2 ws = ImGui::GetWindowSize();
             ImDrawList* dl = ImGui::GetWindowDrawList();
 
-            // Sheet: shadow, then the grouped grey ground. The shadow
-            // grows with the fade, so the panel reads as lifting off
-            // the game rather than being switched on.
             float lift = s_fade;
             dl->AddRectFilled(ImVec2(wp.x + 2.0f, wp.y + 4.0f + 4.0f * lift),
                               ImVec2(wp.x + ws.x + 2.0f,
@@ -1084,7 +990,6 @@ public:
                               ImGuiChildFlags_None,
                               ImGuiWindowFlags_NoBackground);
 
-            // Content lifts into place behind the header
             if (iOS::UI::openAnimation)
                 ImGui::Dummy(ImVec2(0, (1.0f - EaseOut(s_fade)) * 14.0f));
 
@@ -1103,9 +1008,6 @@ public:
 
         ImGui::PopStyleVar();
 
-        // ---- Hover description ----
-        // Crossfades: moving between rows fades the old one out and
-        // the new one in rather than blinking the text.
         bool haveHover = iOS::UI::hoverInfo && !s_hoverName.empty()
                       && s_binding.empty();
         s_hoverFade = iOS::Anim::ToStr("hoverFade",
@@ -1128,13 +1030,8 @@ public:
     }
 
     // World overlays, every frame regardless of menu state.
-    // Backtrack draws after the ESP so the held position sits on top
-    // of the box marking where the server actually has the player.
     static void RenderOverlays() {
         auto esp = ModuleManager::GetESP();
         if (esp) esp->RenderESP();
-
-        auto bt = ModuleManager::GetBacktrack();
-        if (bt) BacktrackVis::Render(bt.get());
     }
 };
