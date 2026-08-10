@@ -9,6 +9,7 @@
 #include <cstdio>
 
 #include "../gui/menu.h"
+#include "../mc/mouse_control.h"
 #include "../modules/module_manager.h"
 
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND, UINT, WPARAM, LPARAM);
@@ -21,6 +22,16 @@ typedef BOOL(WINAPI* fnWglSwapBuffers)(HDC);
 // Hooks wglSwapBuffers, creates a second GL context that shares the
 // game's objects, draws ImGui into it, then restores the original
 // context before letting the real swap through.
+//
+// THE CURSOR
+// Opening the menu is not just a draw flag. While you are in a
+// world Minecraft GRABS the mouse: the pointer is locked to the
+// centre and its movement is fed to the camera, so no amount of
+// cursor drawing lets you reach a switch.
+//
+// Releasing that grab is a call into Minecraft, and JNI is only
+// legal on the client thread, so this file does not do it. It sets
+// a flag and ModuleManager acts on it next tick, 50ms at worst.
 //
 // EJECT IS THE DANGEROUS PART
 // The render thread runs this hook while the client thread tears
@@ -44,10 +55,31 @@ private:
     inline static std::atomic<int>  s_inFlight{ 0 };
     inline static std::atomic<bool> s_menuOpen{ false };
 
+    // One place that changes menu state, so the mouse grab can never
+    // fall out of step with what is on screen.
+    static void ApplyMenuState(bool open) {
+        s_menuOpen.store(open);
+        ModuleManager::SetMenuOpen(open);
+    }
+
     static LRESULT CALLBACK HookedWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
-        if (msg == WM_KEYDOWN && wParam == VK_INSERT && !s_shuttingDown.load()) {
-            s_menuOpen.store(!s_menuOpen.load());
-            return 0;
+        if (!s_shuttingDown.load() && msg == WM_KEYDOWN) {
+            if (wParam == VK_INSERT) {
+                ApplyMenuState(!s_menuOpen.load());
+                return 0;
+            }
+            // ESC closes the menu rather than falling through to the
+            // game, where it would open the pause screen underneath.
+            if (wParam == VK_ESCAPE && s_menuOpen.load()) {
+                ApplyMenuState(false);
+                return 0;
+            }
+        }
+
+        // The window losing focus with the menu open would leave the
+        // grab released and the player unable to look around.
+        if (msg == WM_KILLFOCUS && s_menuOpen.load()) {
+            ApplyMenuState(false);
         }
 
         // Never touch ImGui once teardown has started: the context
@@ -61,8 +93,11 @@ private:
                 case WM_LBUTTONDOWN: case WM_LBUTTONUP: case WM_LBUTTONDBLCLK:
                 case WM_RBUTTONDOWN: case WM_RBUTTONUP: case WM_RBUTTONDBLCLK:
                 case WM_MBUTTONDOWN: case WM_MBUTTONUP:
-                    if (io.WantCaptureMouse) return 0;
-                    break;
+                    // Swallowed unconditionally while the menu is up.
+                    // Letting a click reach the game would make it
+                    // call setIngameFocus and snatch the cursor back
+                    // mid-click.
+                    return 0;
                 case WM_KEYDOWN: case WM_KEYUP:
                 case WM_SYSKEYDOWN: case WM_SYSKEYUP: case WM_CHAR:
                     if (io.WantCaptureKeyboard) return 0;
@@ -152,9 +187,12 @@ private:
         if (wglMakeCurrent(hdc, imguiContext)) {
             bool open = s_menuOpen.load();
 
-            // Minecraft hides the OS cursor in game, so ImGui has to
-            // draw its own or the menu is unusable.
-            ImGui::GetIO().MouseDrawCursor = open;
+            // Once the game has let go of the mouse the real system
+            // cursor is back on screen, so drawing our own would put
+            // two pointers on top of each other. The software cursor
+            // is only the fallback for when the grab could not be
+            // released.
+            ImGui::GetIO().MouseDrawCursor = open && !MouseControl::IsReleased();
 
             ImGui_ImplOpenGL2_NewFrame();
             ImGui_ImplWin32_NewFrame();
@@ -215,6 +253,10 @@ public:
     // Safe to call from the client thread while the render thread is
     // still drawing. Returns only once no frame is inside the hook.
     static void Remove() {
+        // Closing first means the client thread hands the mouse back
+        // before anything is torn down.
+        ApplyMenuState(false);
+
         s_shuttingDown.store(true);
 
         if (pSwapBuffers) MH_DisableHook(pSwapBuffers);
@@ -251,6 +293,6 @@ public:
     }
 
     static bool IsMenuOpen() { return s_menuOpen.load(); }
-    static void SetMenuOpen(bool v) { s_menuOpen.store(v); }
+    static void SetMenuOpen(bool v) { ApplyMenuState(v); }
     static HWND GetWindow() { return gameWindow; }
 };
